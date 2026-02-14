@@ -1,11 +1,85 @@
 const $ = (id) => document.getElementById(id);
 
+function addOption(select, value, label) {
+  const opt = document.createElement("option");
+  opt.value = value;
+  opt.textContent = label;
+  select.appendChild(opt);
+}
+
+function buildDateSelectOptions() {
+  const month = $("dateMonth");
+  const day = $("dateDay");
+  const time = $("dateTime");
+
+  month.innerHTML = "";
+  day.innerHTML = "";
+  time.innerHTML = "";
+
+  addOption(month, "", "不指定");
+  for (let i = 1; i <= 12; i += 1) {
+    const v = String(i).padStart(2, "0");
+    addOption(month, v, `${v} 月`);
+  }
+
+  addOption(day, "", "不指定");
+  for (let i = 1; i <= 31; i += 1) {
+    const v = String(i).padStart(2, "0");
+    addOption(day, v, `${v} 日`);
+  }
+
+  addOption(time, "", "不指定");
+  for (let h = 0; h < 24; h += 1) {
+    for (const m of [0, 30]) {
+      const mm = String(m).padStart(2, "0");
+      const ampm = h >= 12 ? "PM" : "AM";
+      const h12raw = h % 12 || 12;
+      const label = `${h12raw}:${mm} ${ampm}`;
+      addOption(time, label, label);
+    }
+  }
+}
+
+function normalizeMonthValue(raw) {
+  const nums = String(raw || "").match(/\d+/g);
+  if (!nums?.length) return "";
+  const month = Number(nums[nums.length - 1]);
+  if (!Number.isFinite(month) || month < 1 || month > 12) return "";
+  return String(month).padStart(2, "0");
+}
+
+function normalizeDayValue(raw) {
+  const day = Number(String(raw || "").trim());
+  if (!Number.isFinite(day) || day < 1 || day > 31) return "";
+  return String(day).padStart(2, "0");
+}
+
+function applySelectValue(id, value, transform = (v) => v) {
+  const select = $(id);
+  const normalized = transform(value);
+  if (!normalized) {
+    select.value = "";
+    return;
+  }
+  const exists = Array.from(select.options).some((opt) => opt.value === normalized);
+  if (exists) {
+    select.value = normalized;
+    return;
+  }
+  addOption(select, normalized, normalized);
+  select.value = normalized;
+}
+
 function getFormConfig() {
   return {
     eventUrl: $("eventUrl").value.trim(),
     quantity: Number($("quantity").value || 2),
+    dateMonth: $("dateMonth").value.trim(),
+    dateDay: $("dateDay").value.trim(),
+    dateTime: $("dateTime").value.trim(),
     countryCode: ($("countryCode").value || "86").trim(),
-    phoneNumber: $("phoneNumber").value.trim()
+    phoneNumber: $("phoneNumber").value.trim(),
+    ocrApiUrl: $("ocrApiUrl").value.trim()
   };
 }
 
@@ -16,10 +90,15 @@ function setStatus(text) {
 async function loadState() {
   const response = await chrome.runtime.sendMessage({ type: "GET_STATUS" });
   const config = response?.config || {};
+  buildDateSelectOptions();
   if (config.eventUrl) $("eventUrl").value = config.eventUrl;
   if (config.quantity) $("quantity").value = config.quantity;
+  applySelectValue("dateMonth", config.dateMonth, normalizeMonthValue);
+  applySelectValue("dateDay", config.dateDay, normalizeDayValue);
+  applySelectValue("dateTime", config.dateTime, (v) => String(v || "").trim());
   if (config.countryCode) $("countryCode").value = config.countryCode;
   if (config.phoneNumber) $("phoneNumber").value = config.phoneNumber;
+  if (config.ocrApiUrl) $("ocrApiUrl").value = config.ocrApiUrl;
   const base = config.enabled ? "运行中" : "未启动";
   const ready = response?.contentReady;
   const lastLog = response?.lastLog;
@@ -45,6 +124,20 @@ $("startBtn").addEventListener("click", async () => {
     setStatus("已启动，正在执行流程");
   } catch (err) {
     setStatus(`启动失败: ${String(err?.message || err)}`);
+  }
+});
+
+$("saveBtn").addEventListener("click", async () => {
+  try {
+    const config = getFormConfig();
+    if (!config.eventUrl.startsWith("https://world.nol.com/")) {
+      setStatus("URL 必须是 world.nol.com");
+      return;
+    }
+    await chrome.runtime.sendMessage({ type: "SAVE_CONFIG", config });
+    setStatus("配置已保存");
+  } catch (err) {
+    setStatus(`保存失败: ${String(err?.message || err)}`);
   }
 });
 

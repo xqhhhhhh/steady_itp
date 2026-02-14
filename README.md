@@ -58,3 +58,24 @@ git commit -m "feat: implement <single feature name>"
 - Only set `passes` from `false` to `true` after verification.
 - Do not delete feature items from `feature_list.json`.
 - Keep the repo in a clean, runnable state at handoff.
+
+
+
+
+## OCR backend (uv)
+
+```bash
+cd /Users/xuqihan/Desktop/code_study/抢票
+uv venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+uv run python captcha_api.py
+```
+
+Health check:
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+

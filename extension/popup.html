@@ -21,6 +21,21 @@
       </label>
 
       <label class="field">
+        <span>日期-月 (可选)</span>
+        <select id="dateMonth"></select>
+      </label>
+
+      <label class="field">
+        <span>日期-日 (可选)</span>
+        <select id="dateDay"></select>
+      </label>
+
+      <label class="field">
+        <span>日期-时间 (可选)</span>
+        <select id="dateTime"></select>
+      </label>
+
+      <label class="field">
         <span>国家区号</span>
         <input id="countryCode" type="text" value="86" />
       </label>
@@ -30,12 +45,20 @@
         <input id="phoneNumber" type="text" value="18857560941" />
       </label>
 
+      <label class="field">
+        <span>OCR 后端地址</span>
+        <input id="ocrApiUrl" type="url" value="http://127.0.0.1:8000/ocr/file" />
+      </label>
+
       <div class="actions">
-        <button id="startBtn" class="start">开始</button>
-        <button id="stopBtn" class="stop">停止</button>
+        <button id="startBtn" class="start" type="button">开始</button>
+        <button id="stopBtn" class="stop" type="button">停止</button>
       </div>
       <div class="actions">
-        <button id="diagBtn" class="diag">诊断当前页</button>
+        <button id="saveBtn" class="save" type="button">保存配置</button>
+      </div>
+      <div class="actions">
+        <button id="diagBtn" class="diag" type="button">诊断当前页</button>
       </div>
 
       <p id="status" class="status">未启动</p>

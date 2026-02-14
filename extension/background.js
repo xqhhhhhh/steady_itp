@@ -10,8 +10,32 @@ async function saveConfig(config) {
   await chrome.storage.local.set({
     [STORAGE_KEY]: {
       ...config,
+      dateMonth: String(config?.dateMonth || "").trim(),
+      dateDay: String(config?.dateDay || "").trim(),
+      dateTime: String(config?.dateTime || "").trim(),
+      ocrApiUrl: String(config?.ocrApiUrl || "http://127.0.0.1:8000/ocr/file").trim(),
       enabled: true,
       startedAt: Date.now()
+    }
+  });
+}
+
+async function saveConfigOnly(config) {
+  const current = await getConfig();
+  await chrome.storage.local.set({
+    [STORAGE_KEY]: {
+      ...current,
+      eventUrl: String(config?.eventUrl || "").trim(),
+      quantity: Number(config?.quantity || current.quantity || 2),
+      dateMonth: String(config?.dateMonth || "").trim(),
+      dateDay: String(config?.dateDay || "").trim(),
+      dateTime: String(config?.dateTime || "").trim(),
+      countryCode: String(config?.countryCode || current.countryCode || "86").trim(),
+      phoneNumber: String(config?.phoneNumber || "").trim(),
+      ocrApiUrl: String(
+        config?.ocrApiUrl || current.ocrApiUrl || "http://127.0.0.1:8000/ocr/file"
+      ).trim(),
+      savedAt: Date.now()
     }
   });
 }
@@ -59,6 +83,31 @@ async function getConfig() {
   return all[STORAGE_KEY] || {};
 }
 
+async function requestOcrCode(apiUrl, bytes) {
+  const safeUrl = String(apiUrl || "").trim();
+  if (!safeUrl) throw new Error("OCR apiUrl is empty");
+  if (!Array.isArray(bytes) || bytes.length === 0) throw new Error("OCR image bytes are empty");
+
+  const u8 = new Uint8Array(bytes);
+  const formData = new FormData();
+  formData.append("file", new Blob([u8], { type: "image/png" }), "captcha.png");
+
+  const resp = await fetch(safeUrl, {
+    method: "POST",
+    body: formData
+  });
+  if (!resp.ok) {
+    throw new Error(`OCR HTTP ${resp.status}`);
+  }
+  const data = await resp.json();
+  const code = String(data?.code || "").trim();
+  if (!code) throw new Error("OCR code is empty");
+  const candidates = Array.isArray(data?.candidates)
+    ? data.candidates.map((x) => String(x || "").trim()).filter(Boolean)
+    : [];
+  return { code, candidates };
+}
+
 async function forceInjectAndKick(tabId) {
   if (!tabId) return;
   try {
@@ -80,8 +129,12 @@ chrome.runtime.onInstalled.addListener(async () => {
         enabled: false,
         eventUrl: "",
         quantity: 2,
+        dateMonth: "",
+        dateDay: "",
+        dateTime: "",
         countryCode: "86",
-        phoneNumber: ""
+        phoneNumber: "",
+        ocrApiUrl: "http://127.0.0.1:8000/ocr/file"
       }
     });
   }
@@ -116,6 +169,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         pendingKickTabs.add(tabId);
       }
       await forceInjectAndKick(tabId);
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (message?.type === "SAVE_CONFIG") {
+      const config = message.config || {};
+      await saveConfigOnly(config);
       sendResponse({ ok: true });
       return;
     }
@@ -169,6 +229,29 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }
       });
       sendResponse({ ok: true });
+      return;
+    }
+
+    if (message?.type === "OCR_REQUEST") {
+      try {
+        await chrome.storage.local.set({
+          nolBotLastLog: {
+            text: `OCR_REQUEST bytes=${Array.isArray(message.bytes) ? message.bytes.length : 0}`,
+            ts: Date.now()
+          }
+        });
+        const result = await requestOcrCode(message.apiUrl, message.bytes);
+        sendResponse({ ok: true, code: result.code, candidates: result.candidates || [] });
+      } catch (err) {
+        await chrome.storage.local.set({
+          nolBotLastLog: {
+            text: `OCR_REQUEST failed: ${String(err?.message || err)}`,
+            ts: Date.now()
+          }
+        });
+        sendResponse({ ok: false, error: String(err?.message || err) });
+      }
+      return;
     }
   })();
   return true;

@@ -31,7 +31,8 @@ h1 {
   color: #555;
 }
 
-.field input {
+.field input,
+.field select {
   width: 100%;
   border: 1px solid #d5d8e0;
   border-radius: 8px;
@@ -48,6 +49,10 @@ h1 {
 }
 
 .actions:has(.diag) {
+  grid-template-columns: 1fr;
+}
+
+.actions:has(.save) {
   grid-template-columns: 1fr;
 }
 
@@ -71,6 +76,11 @@ button {
 
 .diag {
   background: #111827;
+  color: #fff;
+}
+
+.save {
+  background: #2563eb;
   color: #fff;
 }
 
