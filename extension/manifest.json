@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "NOL Ticket Fast Helper",
+  "version": "0.1.0",
+  "description": "Request-first and click-fallback helper for NOL ticket purchase flow.",
+  "permissions": ["storage", "tabs", "scripting", "activeTab"],
+  "host_permissions": [
+    "https://world.nol.com/*",
+    "https://tickets.interpark.com/*",
+    "https://secureapi.ext.eximbay.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "NOL Ticket Helper",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://world.nol.com/*",
+        "https://tickets.interpark.com/*",
+        "https://secureapi.ext.eximbay.com/*"
+      ],
+      "js": ["content-script.js"],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["page-hook.js"],
+      "matches": ["https://world.nol.com/*", "https://tickets.interpark.com/*"]
+    }
+  ]
+}
