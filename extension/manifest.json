@@ -3,11 +3,13 @@
   "name": "NOL Ticket Fast Helper",
   "version": "0.1.0",
   "description": "Request-first and click-fallback helper for NOL ticket purchase flow.",
-  "permissions": ["storage", "tabs", "scripting", "activeTab"],
+  "permissions": ["storage", "tabs", "scripting", "activeTab", "alarms"],
   "host_permissions": [
     "https://world.nol.com/*",
     "https://tickets.interpark.com/*",
     "https://secureapi.ext.eximbay.com/*",
+    "https://oapi.dingtalk.com/*",
+    "https://*.dingtalk.com/*",
     "http://127.0.0.1/*",
     "http://localhost/*"
   ],

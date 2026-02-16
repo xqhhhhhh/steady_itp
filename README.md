@@ -78,4 +78,14 @@ Health check:
 curl http://127.0.0.1:8000/health
 ```
 
+VPN auto-switch config (backend):
+
+- Preferred: edit `/Users/xuqihan/Desktop/code_study/抢票/vpn_switch.yaml`
+- Optional override file path:
+
+```bash
+export VPN_SWITCH_CONFIG="/absolute/path/to/vpn_switch.yaml"
+```
+
+- Fallback: if config file is missing/invalid, backend uses `VPN_SWITCH_COMMANDS`.
 

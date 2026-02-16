@@ -16,6 +16,31 @@
       </label>
 
       <label class="field">
+        <span>开抢时间 (可选)</span>
+        <input id="saleStartTime" type="datetime-local" />
+      </label>
+
+      <label class="field">
+        <span>提前进场秒数</span>
+        <input id="preEnterSeconds" type="number" min="5" max="300" value="30" />
+      </label>
+
+      <label class="field">
+        <span>临界前置秒数</span>
+        <input id="criticalPreSeconds" type="number" min="0.5" max="10" step="0.1" value="2.5" />
+      </label>
+
+      <label class="field">
+        <span>临界后置秒数</span>
+        <input id="criticalPostSeconds" type="number" min="1" max="20" step="0.1" value="8" />
+      </label>
+
+      <label class="field">
+        <span>临界轮询毫秒</span>
+        <input id="criticalTickMs" type="number" min="40" max="180" step="1" value="65" />
+      </label>
+
+      <label class="field">
         <span>票数</span>
         <input id="quantity" type="number" min="1" max="4" value="2" />
       </label>
@@ -48,6 +73,31 @@
       <label class="field">
         <span>OCR 后端地址</span>
         <input id="ocrApiUrl" type="url" value="http://127.0.0.1:8000/ocr/file" />
+      </label>
+
+      <label class="field">
+        <span>钉钉 Webhook (可选)</span>
+        <input id="dingTalkWebhookUrl" type="url" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..." />
+      </label>
+
+      <label class="field">
+        <span>钉钉加签 Secret (可选)</span>
+        <input id="dingTalkSecret" type="text" placeholder="SEC..." />
+      </label>
+
+      <label class="field">
+        <span>VPN 切换 API 地址</span>
+        <input id="vpnApiUrl" type="url" value="http://127.0.0.1:8000" />
+      </label>
+
+      <label class="toggle-row" for="vpnAutoSwitchEnabled">
+        <span>队列异常时自动切换 VPN</span>
+        <input id="vpnAutoSwitchEnabled" type="checkbox" checked />
+      </label>
+
+      <label class="toggle-row" for="fullFlowEnabled">
+        <span>执行全部流程（到信息提交）</span>
+        <input id="fullFlowEnabled" type="checkbox" checked />
       </label>
 
       <div class="actions">

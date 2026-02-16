@@ -70,16 +70,37 @@ function applySelectValue(id, value, transform = (v) => v) {
   select.value = normalized;
 }
 
+function normalizeNumber(raw, min, max, fallback, integer = false) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  const clamped = Math.min(max, Math.max(min, n));
+  return integer ? Math.round(clamped) : Math.round(clamped * 10) / 10;
+}
+
 function getFormConfig() {
+  const preEnter = normalizeNumber($("preEnterSeconds").value || 30, 5, 300, 30, true);
+  const criticalPre = normalizeNumber($("criticalPreSeconds").value || 2.5, 0.5, 10, 2.5, false);
+  const criticalPost = normalizeNumber($("criticalPostSeconds").value || 8, 1, 20, 8, false);
+  const criticalTick = normalizeNumber($("criticalTickMs").value || 65, 40, 180, 65, true);
   return {
     eventUrl: $("eventUrl").value.trim(),
+    saleStartTime: $("saleStartTime").value.trim(),
+    preEnterSeconds: preEnter,
+    criticalPreSeconds: criticalPre,
+    criticalPostSeconds: criticalPost,
+    criticalTickMs: criticalTick,
     quantity: Number($("quantity").value || 2),
     dateMonth: $("dateMonth").value.trim(),
     dateDay: $("dateDay").value.trim(),
     dateTime: $("dateTime").value.trim(),
     countryCode: ($("countryCode").value || "86").trim(),
     phoneNumber: $("phoneNumber").value.trim(),
-    ocrApiUrl: $("ocrApiUrl").value.trim()
+    ocrApiUrl: $("ocrApiUrl").value.trim(),
+    vpnApiUrl: $("vpnApiUrl").value.trim(),
+    vpnAutoSwitchEnabled: $("vpnAutoSwitchEnabled").checked,
+    dingTalkWebhookUrl: $("dingTalkWebhookUrl").value.trim(),
+    dingTalkSecret: $("dingTalkSecret").value.trim(),
+    fullFlowEnabled: $("fullFlowEnabled").checked
   };
 }
 
@@ -92,6 +113,17 @@ async function loadState() {
   const config = response?.config || {};
   buildDateSelectOptions();
   if (config.eventUrl) $("eventUrl").value = config.eventUrl;
+  if (config.saleStartTime) $("saleStartTime").value = String(config.saleStartTime).trim();
+  if (config.preEnterSeconds) $("preEnterSeconds").value = config.preEnterSeconds;
+  $("criticalPreSeconds").value = String(
+    normalizeNumber(config.criticalPreSeconds ?? 2.5, 0.5, 10, 2.5, false)
+  );
+  $("criticalPostSeconds").value = String(
+    normalizeNumber(config.criticalPostSeconds ?? 8, 1, 20, 8, false)
+  );
+  $("criticalTickMs").value = String(
+    normalizeNumber(config.criticalTickMs ?? 65, 40, 180, 65, true)
+  );
   if (config.quantity) $("quantity").value = config.quantity;
   applySelectValue("dateMonth", config.dateMonth, normalizeMonthValue);
   applySelectValue("dateDay", config.dateDay, normalizeDayValue);
@@ -99,6 +131,11 @@ async function loadState() {
   if (config.countryCode) $("countryCode").value = config.countryCode;
   if (config.phoneNumber) $("phoneNumber").value = config.phoneNumber;
   if (config.ocrApiUrl) $("ocrApiUrl").value = config.ocrApiUrl;
+  if (config.vpnApiUrl) $("vpnApiUrl").value = config.vpnApiUrl;
+  $("vpnAutoSwitchEnabled").checked = config.vpnAutoSwitchEnabled !== false;
+  if (config.dingTalkWebhookUrl) $("dingTalkWebhookUrl").value = config.dingTalkWebhookUrl;
+  if (config.dingTalkSecret) $("dingTalkSecret").value = config.dingTalkSecret;
+  $("fullFlowEnabled").checked = config.fullFlowEnabled !== false;
   const base = config.enabled ? "运行中" : "未启动";
   const ready = response?.contentReady;
   const lastLog = response?.lastLog;
@@ -120,7 +157,16 @@ $("startBtn").addEventListener("click", async () => {
       setStatus("URL 必须是 world.nol.com");
       return;
     }
-    await chrome.runtime.sendMessage({ type: "START_BOT", config });
+    if (config.saleStartTime && Number.isNaN(new Date(config.saleStartTime).getTime())) {
+      setStatus("开抢时间格式无效");
+      return;
+    }
+    const resp = await chrome.runtime.sendMessage({ type: "START_BOT", config });
+    if (resp?.scheduled) {
+      const at = resp.preEnterAt ? new Date(resp.preEnterAt).toLocaleString() : "T-30s";
+      setStatus(`已启动，定时进场: ${at}`);
+      return;
+    }
     setStatus("已启动，正在执行流程");
   } catch (err) {
     setStatus(`启动失败: ${String(err?.message || err)}`);
@@ -132,6 +178,10 @@ $("saveBtn").addEventListener("click", async () => {
     const config = getFormConfig();
     if (!config.eventUrl.startsWith("https://world.nol.com/")) {
       setStatus("URL 必须是 world.nol.com");
+      return;
+    }
+    if (config.saleStartTime && Number.isNaN(new Date(config.saleStartTime).getTime())) {
+      setStatus("开抢时间格式无效");
       return;
     }
     await chrome.runtime.sendMessage({ type: "SAVE_CONFIG", config });

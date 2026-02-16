@@ -41,6 +41,27 @@ h1 {
   background: #fff;
 }
 
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border: 1px solid #d5d8e0;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.toggle-row span {
+  font-size: 12px;
+  color: #39435f;
+}
+
+.toggle-row input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+}
+
 .actions {
   display: grid;
   grid-template-columns: 1fr 1fr;

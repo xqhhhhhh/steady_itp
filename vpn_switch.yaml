@@ -1,0 +1,13 @@
+flclash:
+  selector: "🔰 选择节点"
+  switch_script: "/Users/xuqihan/Desktop/code_study/抢票/scripts/flclash_switch.sh"
+  nodes:
+    - "🇭🇰 香港Y01"
+    - "🇯🇵 日本Y01 | IEPL"
+    - "🇭🇰 香港Y02 | IEPL"
+    - "🇯🇵 日本Y02 | IEPL"
+    - "🇭🇰 香港Y03 | IEPL"
+    - "🇯🇵 日本Y03 | IEPL"
+    - "🇭🇰 香港Y04 | IEPL"
+    - "🇯🇵 日本Y04 | IEPL"
+
