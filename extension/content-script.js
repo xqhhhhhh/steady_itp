@@ -11,7 +11,7 @@ const state = {
     criticalPreSeconds: 2.5,
     criticalPostSeconds: 8,
     criticalTickMs: 65,
-    quantity: 2,
+    quantity: 1,
     dateMonth: "",
     dateDay: "",
     dateTime: "",
@@ -67,8 +67,8 @@ const state = {
     switching: false,
     lastSwitchResultAt: 0
   },
-  startFastestSwitchDone: false,
   queueTop50FastestSwitchDone: false,
+  queueLastRemaining: null,
   tickMode: "fast",
   tickIntervalMs: 180,
   priceLockedSlow: false,
@@ -362,6 +362,7 @@ async function requestVpnHealthCheck(targetUrl) {
 }
 
 async function triggerVpnAutoSwitch(reason, currentQueue, options = {}) {
+  if (window.top !== window) return { ok: false, skipped: "not_top_frame" };
   if (!state.config.vpnAutoSwitchEnabled) return { ok: false, skipped: "disabled" };
   if (state.queueHealth.switching) return { ok: false, skipped: "switching" };
   const strategy = String(options.strategy || "round_robin").trim().toLowerCase();
@@ -389,20 +390,6 @@ async function triggerVpnAutoSwitch(reason, currentQueue, options = {}) {
     return { ok: true, data: resp.data || {} };
   } finally {
     state.queueHealth.switching = false;
-  }
-}
-
-async function triggerFastestNodeOnStartIfNeeded() {
-  if (state.startFastestSwitchDone) return;
-  state.startFastestSwitchDone = true;
-  const switched = await triggerVpnAutoSwitch("bot_start_fastest", 0, {
-    strategy: "fastest",
-    bypassCooldown: true
-  });
-  if (switched.ok) {
-    log("启动时已切换到最快节点");
-  } else {
-    log(`启动时最快节点切换未执行: ${switched.skipped || switched.error || "unknown"}`);
   }
 }
 
@@ -496,7 +483,11 @@ async function maybeNotifyQueueThresholds() {
     }
   }
 
-  if (remaining <= 50 && !state.queueTop50FastestSwitchDone) {
+  const prev = Number.isFinite(state.queueLastRemaining) ? state.queueLastRemaining : null;
+  const crossed50 = prev !== null && prev > 50 && remaining <= 50;
+  state.queueLastRemaining = remaining;
+
+  if (crossed50 && !state.queueTop50FastestSwitchDone) {
     state.queueTop50FastestSwitchDone = true;
     const switched = await triggerVpnAutoSwitch("queue_top50_fastest", remaining, {
       strategy: "fastest",
@@ -1363,7 +1354,8 @@ async function chooseSeatsByClick(quantity) {
       tried.add(seat);
       attempts += 1;
       if (!clickSeatCandidate(seat)) continue;
-      await sleep(95);
+      // 选座计数在部分场馆页面会有渲染延迟，等待更久避免超点
+      await sleep(220);
 
       const after = detectSelectedSeatCount();
       if (after > before) {
@@ -1377,17 +1369,108 @@ async function chooseSeatsByClick(quantity) {
   return detectSelectedSeatCount() >= target;
 }
 
+function getSelectedSeatCandidates() {
+  return Array.from(
+    document.querySelectorAll(
+      "svg [class*='selected'], svg [aria-selected='true'], svg [data-selected='true']"
+    )
+  )
+    .filter((el) => visibleForSeat(el))
+    .filter((el) => !hasDisabledSeatMarker(el))
+    .filter((el) => {
+      const cls = normalizeText(getClassBag(el));
+      const id = normalizeText(el.id || "");
+      const attrs = normalizeText(
+        [
+          el.getAttribute("aria-label"),
+          el.getAttribute("data-seat"),
+          el.getAttribute("data-seat-id"),
+          el.getAttribute("data-status")
+        ]
+          .filter(Boolean)
+          .join(" ")
+      );
+      const bag = `${cls} ${id} ${attrs}`;
+      return (
+        hasSeatMapClassPrefix(el, "seatmap_selected__") ||
+        hasSeatMapClassPrefix(el, "seatmap_seatsvg__") ||
+        bag.includes("seat") ||
+        bag.includes("좌석") ||
+        bag.includes("席")
+      );
+    });
+}
+
+async function trimSelectedSeatsToTarget(target) {
+  let current = detectSelectedSeatCount();
+  if (current <= target) return false;
+
+  let changed = false;
+  for (let i = 0; i < 6 && current > target; i += 1) {
+    const selected = getSelectedSeatCandidates();
+    if (!selected.length) break;
+    // 从较靠后的已选座开始取消，尽量保留靠前座位
+    selected.sort((a, b) => {
+      const ar = a.getBoundingClientRect();
+      const br = b.getBoundingClientRect();
+      if (Math.abs(ar.top - br.top) > 2) return br.top - ar.top;
+      return Math.abs(br.left - window.innerWidth / 2) - Math.abs(ar.left - window.innerWidth / 2);
+    });
+
+    const needDrop = Math.max(1, current - target);
+    for (let k = 0; k < Math.min(needDrop, selected.length); k += 1) {
+      if (!clickSeatCandidate(selected[k])) continue;
+      changed = true;
+      await sleep(180);
+    }
+    current = detectSelectedSeatCount();
+  }
+
+  if (changed) {
+    log(`已回退多选座位，当前: ${detectSelectedSeatCount()}/${target}`);
+  }
+  return changed;
+}
+
+function closeSeatUnlockNoticeIfPresent() {
+  const text = getWholeText();
+  const hit =
+    text.includes("其他客户已选定的座位将被解除锁定") ||
+    text.includes("其他客戶已選定的座位將被解除鎖定") ||
+    text.includes("selected by another customer") ||
+    text.includes("will be unlocked");
+  if (!hit) return false;
+
+  const okWords = ["確認", "确认", "ok", "confirm"];
+  if (clickBottomRightPrimaryButton(okWords) || clickByKeywords(okWords)) {
+    log("已处理座位锁定提示弹窗(確認)");
+    return true;
+  }
+  return false;
+}
+
 async function runSeatStep() {
   log("开始执行选座步骤");
-  const target = normalizeQuantity(state.config.quantity, 2);
+  const target = normalizeQuantity(state.config.quantity, 1);
+  if (closeSeatUnlockNoticeIfPresent()) {
+    await sleep(140);
+    return;
+  }
   const selected = detectSelectedSeatCount();
   if (selected < target) {
     log(`选座目标: ${target}, 当前已选: ${selected}`);
     await chooseSeatsByClick(target);
+  } else if (selected > target) {
+    log(`已选座位超过目标: ${selected}/${target}，开始回退`);
+    await trimSelectedSeatsToTarget(target);
   }
   const finalCount = detectSelectedSeatCount();
   if (finalCount <= 0) {
     log("未检测到已选座位，跳过 完成选择");
+    return;
+  }
+  if (finalCount > target) {
+    log(`回退后仍超目标(${finalCount}/${target})，本轮不点完成选择`);
     return;
   }
   if (clickByKeywords(STEP_TEXT.completeSeat)) {
@@ -1698,11 +1781,13 @@ async function runPriceStep() {
     await sleep(120);
   }
 
-  const nowQty = getCurrentPriceQuantity();
-  const quantityReady = Number.isFinite(nowQty) ? nowQty >= target : state.pricePlusClickCount >= target;
+  const qtyAfterAdjust = getCurrentPriceQuantity();
+  const quantityReady = Number.isFinite(qtyAfterAdjust)
+    ? qtyAfterAdjust >= target
+    : state.pricePlusClickCount >= target;
   if (!quantityReady) {
     log(
-      `数量未达到目标，暂不点击訂購: 当前 ${Number.isFinite(nowQty) ? nowQty : "?"}/${target}`
+      `数量未达到目标，暂不点击訂購: 当前 ${Number.isFinite(qtyAfterAdjust) ? qtyAfterAdjust : "?"}/${target}`
     );
     return;
   }
@@ -2812,6 +2897,7 @@ function getCachedOrFindBuyNowButton() {
 
 function findReserveEntryButtonStrict() {
   const words = STEP_TEXT.reserveEntry.map((w) => normalizeText(w));
+  const buyWords = STEP_TEXT.buyNow.map((w) => normalizeText(w));
   const nodes = Array.from(
     document.querySelectorAll("button, a, [role='button'], div, span")
   ).filter(visible);
@@ -2819,6 +2905,8 @@ function findReserveEntryButtonStrict() {
     .map((el) => {
       const text = normalizeText(el.textContent || "");
       if (!text || !words.some((w) => text.includes(w))) return null;
+      // 排除“立即购买”类按钮，避免韩文 예매/예매하기 重叠误判
+      if (buyWords.some((w) => text.includes(w))) return null;
       // 避免误点价格页“预购”
       if (text.includes("预购") || text.includes("預購")) return null;
       const cls = normalizeText(el.className?.toString() || "");
@@ -2931,15 +3019,15 @@ async function runProductStep() {
     setTickMode("fast");
   }
 
-  if (clickReserveEntryAggressive()) {
-    log("已点击 预约");
-    await sleep(state.tickMode === "critical" ? 40 : 160);
-    return;
-  }
-
   if (clickBuyNowAggressive()) {
     log("已点击 立即购买");
     await sleep(state.tickMode === "critical" ? 35 : 140);
+    return;
+  }
+
+  if (clickReserveEntryAggressive()) {
+    log("已点击 预约");
+    await sleep(state.tickMode === "critical" ? 40 : 160);
   }
 }
 
@@ -3530,8 +3618,10 @@ async function runCaptchaStep() {
         (x) => String(x) === String(code)
       );
       state.captcha.candidateIndex = exactIndex >= 0 ? exactIndex : 0;
+      const currentTry =
+        state.captcha.candidates[state.captcha.candidateIndex] || "(empty)";
       log(
-        `后端候选数: ${state.captcha.candidates.length}, 当前尝试: ${state.captcha.candidates[state.captcha.candidateIndex]}`
+        `后端候选数: ${state.captcha.candidates.length}, 当前尝试: ${currentTry}`
       );
       code = state.captcha.candidates[state.captcha.candidateIndex] || code;
     }
@@ -3540,6 +3630,9 @@ async function runCaptchaStep() {
     if (!/^[A-Z]{6}$/.test(code)) {
       log(`OCR结果非6位字母，当前值: ${String(code || "") || "(empty)"}，刷新验证码重试`);
       clickCaptchaRefresh(imageEl);
+      // 刷新后立即允许下一轮重识别，避免被“同图节流”卡住。
+      state.captcha.lastImageSig = "";
+      state.captcha.lastAttemptAt = 0;
       return true;
     }
 
@@ -3572,6 +3665,8 @@ async function runCaptchaStep() {
       }
       if (state.captcha.submitCount >= 3) {
         clickCaptchaRefresh(imageEl);
+        state.captcha.lastImageSig = "";
+        state.captcha.lastAttemptAt = 0;
         state.captcha.submitCount = 0;
         log("连续验证码提交后触发刷新");
       }
@@ -3802,6 +3897,7 @@ async function tick() {
         if (!state.queueActive) {
           state.queueActive = true;
           state.queueKeepAliveCount = 0;
+          state.queueLastRemaining = null;
           scheduleNextQueueKeepAlive(true);
           if (state.firstBuyNowClickAt) {
             const cost = Date.now() - state.firstBuyNowClickAt;
@@ -3832,6 +3928,7 @@ async function tick() {
         state.queueActive = false;
         state.queueNextKeepAliveAt = 0;
         state.queueKeepAliveCount = 0;
+        state.queueLastRemaining = null;
         state.queueHealth.consecutiveFail = 0;
         state.queueHealth.alertActive = false;
         if (!state.priceLockedSlow) setTickMode("critical");
@@ -3923,7 +4020,7 @@ async function loadConfig() {
     criticalPreSeconds: normalizeCriticalSeconds(config.criticalPreSeconds, 2.5, 0.5, 10),
     criticalPostSeconds: normalizeCriticalSeconds(config.criticalPostSeconds, 8, 1, 20),
     criticalTickMs: normalizeCriticalTickMs(config.criticalTickMs, TICK_MS_CRITICAL_DEFAULT),
-    quantity: normalizeQuantity(config.quantity, 2),
+    quantity: normalizeQuantity(config.quantity, 1),
     dateMonth: String(config.dateMonth || "").trim(),
     dateDay: String(config.dateDay || "").trim(),
     dateTime: String(config.dateTime || "").trim(),
@@ -3953,15 +4050,14 @@ async function loadConfig() {
   state.notifySale3mSent = false;
   state.notifyPriceEnteredSent = false;
   state.notifyQueueThresholdSent = { 1000: false, 100: false, 10: false };
-  state.startFastestSwitchDone = false;
   state.queueTop50FastestSwitchDone = false;
+  state.queueLastRemaining = null;
   if (state.config.enabled) {
     if (state.intervalId) {
       clearInterval(state.intervalId);
       state.intervalId = null;
     }
     ensureLoop();
-    await triggerFastestNodeOnStartIfNeeded();
   } else {
     stopLoop();
   }

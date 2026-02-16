@@ -89,7 +89,7 @@ function getFormConfig() {
     criticalPreSeconds: criticalPre,
     criticalPostSeconds: criticalPost,
     criticalTickMs: criticalTick,
-    quantity: Number($("quantity").value || 2),
+    quantity: Number($("quantity").value || 1),
     dateMonth: $("dateMonth").value.trim(),
     dateDay: $("dateDay").value.trim(),
     dateTime: $("dateTime").value.trim(),

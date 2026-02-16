@@ -2,6 +2,7 @@ const STORAGE_KEY = "nolBotConfig";
 const pendingKickTabs = new Set();
 const PRE_ENTER_ALARM = "nolBotPreEnterAlarm";
 const DING_NOTIFY_SENT_KEY = "nolBotDingNotifySent";
+const DING_DEDUP_TTL_MS = 5 * 60 * 1000;
 
 async function getActiveTab() {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -59,7 +60,7 @@ async function saveConfigOnly(config) {
         config?.criticalTickMs,
         current.criticalTickMs || 65
       ),
-      quantity: Number(config?.quantity || current.quantity || 2),
+      quantity: Number(config?.quantity || current.quantity || 1),
       dateMonth: String(config?.dateMonth || "").trim(),
       dateDay: String(config?.dateDay || "").trim(),
       dateTime: String(config?.dateTime || "").trim(),
@@ -255,7 +256,7 @@ async function buildDingTalkSignedUrl(webhookUrl, secret) {
   return url.toString();
 }
 
-async function hasSentDingEvent(eventKey, ttlMs = 12 * 60 * 60 * 1000) {
+async function hasSentDingEvent(eventKey, ttlMs = DING_DEDUP_TTL_MS) {
   const key = String(eventKey || "").trim();
   if (!key) return false;
   const now = Date.now();
@@ -323,7 +324,7 @@ chrome.runtime.onInstalled.addListener(async () => {
       [STORAGE_KEY]: {
         enabled: false,
         eventUrl: "",
-        quantity: 2,
+        quantity: 1,
         dateMonth: "",
         dateDay: "",
         dateTime: "",
