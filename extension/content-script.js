@@ -67,6 +67,8 @@ const state = {
     switching: false,
     lastSwitchResultAt: 0
   },
+  startFastestSwitchDone: false,
+  queueTop50FastestSwitchDone: false,
   tickMode: "fast",
   tickIntervalMs: 180,
   priceLockedSlow: false,
@@ -359,12 +361,14 @@ async function requestVpnHealthCheck(targetUrl) {
   }
 }
 
-async function triggerVpnAutoSwitch(reason, currentQueue) {
+async function triggerVpnAutoSwitch(reason, currentQueue, options = {}) {
   if (!state.config.vpnAutoSwitchEnabled) return { ok: false, skipped: "disabled" };
   if (state.queueHealth.switching) return { ok: false, skipped: "switching" };
+  const strategy = String(options.strategy || "round_robin").trim().toLowerCase();
+  const bypassCooldown = options.bypassCooldown === true;
   const now = Date.now();
   // 冷却 10 分钟，避免来回切换
-  if (now - state.queueHealth.lastSwitchAt < 10 * 60 * 1000) {
+  if (!bypassCooldown && now - state.queueHealth.lastSwitchAt < 10 * 60 * 1000) {
     return { ok: false, skipped: "cooldown" };
   }
   state.queueHealth.switching = true;
@@ -375,7 +379,8 @@ async function triggerVpnAutoSwitch(reason, currentQueue) {
       apiUrl: getVpnApiUrl(),
       reason: String(reason || "queue_unhealthy"),
       currentQueue: Number.isFinite(currentQueue) ? currentQueue : 0,
-      sourceUrl: location.href
+      sourceUrl: location.href,
+      strategy
     });
     state.queueHealth.lastSwitchResultAt = Date.now();
     if (!resp?.ok) {
@@ -384,6 +389,20 @@ async function triggerVpnAutoSwitch(reason, currentQueue) {
     return { ok: true, data: resp.data || {} };
   } finally {
     state.queueHealth.switching = false;
+  }
+}
+
+async function triggerFastestNodeOnStartIfNeeded() {
+  if (state.startFastestSwitchDone) return;
+  state.startFastestSwitchDone = true;
+  const switched = await triggerVpnAutoSwitch("bot_start_fastest", 0, {
+    strategy: "fastest",
+    bypassCooldown: true
+  });
+  if (switched.ok) {
+    log("启动时已切换到最快节点");
+  } else {
+    log(`启动时最快节点切换未执行: ${switched.skipped || switched.error || "unknown"}`);
   }
 }
 
@@ -474,6 +493,19 @@ async function maybeNotifyQueueThresholds() {
         `排队剩余 <= ${threshold}`,
         `当前排队顺位约 ${remaining}，请准备关注页面放行。`
       );
+    }
+  }
+
+  if (remaining <= 50 && !state.queueTop50FastestSwitchDone) {
+    state.queueTop50FastestSwitchDone = true;
+    const switched = await triggerVpnAutoSwitch("queue_top50_fastest", remaining, {
+      strategy: "fastest",
+      bypassCooldown: true
+    });
+    if (switched.ok) {
+      log("排队<=50，已切换到最快节点");
+    } else {
+      log(`排队<=50 最快节点切换未执行: ${switched.skipped || switched.error || "unknown"}`);
     }
   }
 }
@@ -3921,12 +3953,15 @@ async function loadConfig() {
   state.notifySale3mSent = false;
   state.notifyPriceEnteredSent = false;
   state.notifyQueueThresholdSent = { 1000: false, 100: false, 10: false };
+  state.startFastestSwitchDone = false;
+  state.queueTop50FastestSwitchDone = false;
   if (state.config.enabled) {
     if (state.intervalId) {
       clearInterval(state.intervalId);
       state.intervalId = null;
     }
     ensureLoop();
+    await triggerFastestNodeOnStartIfNeeded();
   } else {
     stopLoop();
   }

@@ -551,7 +551,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         const data = await requestVpnApi(apiUrl, "/vpn/switch", {
           reason: String(message?.reason || "queue_unhealthy"),
           current_queue: Number(message?.currentQueue || 0),
-          source_url: String(message?.sourceUrl || "")
+          source_url: String(message?.sourceUrl || ""),
+          strategy: String(message?.strategy || "round_robin")
         });
         sendResponse({ ok: true, data });
       } catch (err) {

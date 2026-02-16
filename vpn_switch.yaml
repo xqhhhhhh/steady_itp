@@ -1,6 +1,10 @@
 flclash:
   selector: "🔰 选择节点"
   switch_script: "/Users/xuqihan/Desktop/code_study/抢票/scripts/flclash_switch.sh"
+  controller: "http://127.0.0.1:9090"
+  secret: ""
+  delay_url: "https://tickets.interpark.com/"
+  delay_timeout_ms: 3500
   nodes:
     - "🇭🇰 香港Y01"
     - "🇯🇵 日本Y01 | IEPL"
@@ -10,4 +14,3 @@ flclash:
     - "🇯🇵 日本Y03 | IEPL"
     - "🇭🇰 香港Y04 | IEPL"
     - "🇯🇵 日本Y04 | IEPL"
-
