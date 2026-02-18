@@ -317,6 +317,145 @@ async function forceInjectAndKick(tabId) {
   } catch (_) {}
 }
 
+async function runLegacyNextInMainWorld(tabId, frameId, reason = "") {
+  if (!tabId) return { ok: false, error: "no_tab_id" };
+  try {
+    const target = Number.isInteger(frameId)
+      ? { tabId, frameIds: [frameId] }
+      : { tabId };
+    const results = await chrome.scripting.executeScript({
+      target,
+      world: "MAIN",
+      func: (why) => {
+        const out = {
+          ok: false,
+          reason: String(why || ""),
+          hasFnNextStep: typeof window.fnNextStep === "function",
+          fnInvoked: false,
+          target: "",
+          clicked: false,
+          stepBefore: typeof window.nNowBookStep !== "undefined" ? window.nNowBookStep : null,
+          stepAfter: null,
+          seatSrc: "",
+          error: ""
+        };
+        try {
+          const shown = (el) => {
+            if (!el) return false;
+            try {
+              const s = window.getComputedStyle(el);
+              return s.display !== "none" && s.visibility !== "hidden";
+            } catch (_) {
+              return false;
+            }
+          };
+
+          if (typeof window.fnNextStep === "function") {
+            window.fnNextStep("P");
+            out.fnInvoked = true;
+            out.ok = true;
+          } else {
+            const largeWrap = document.getElementById("LargeNextBtn");
+            const smallWrap = document.getElementById("SmallNextBtn");
+            const large = document.getElementById("LargeNextBtnLink");
+            const small = document.getElementById("SmallNextBtnLink");
+            const targetEl =
+              (shown(largeWrap) && large) ||
+              (shown(smallWrap) && small) ||
+              large ||
+              small ||
+              document.querySelector("a[href*='fnNextStep']");
+            if (targetEl) {
+              out.target = String(targetEl.id || targetEl.tagName || "");
+              targetEl.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+              targetEl.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+              targetEl.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+              out.clicked = true;
+              out.ok = true;
+            }
+          }
+        } catch (err) {
+          out.error = String(err?.message || err);
+        }
+        out.stepAfter = typeof window.nNowBookStep !== "undefined" ? window.nNowBookStep : null;
+        out.seatSrc = String(document.querySelector("#ifrmSeat")?.getAttribute("src") || "");
+        return out;
+      },
+      args: [String(reason || "")]
+    });
+    return results?.[0]?.result || { ok: false, error: "no_result" };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+}
+
+async function runLegacyCaptchaActionInMainWorld(tabId, frameId, action = "") {
+  if (!tabId) return { ok: false, error: "no_tab_id" };
+  try {
+    const target = Number.isInteger(frameId)
+      ? { tabId, frameIds: [frameId] }
+      : { tabId };
+    const results = await chrome.scripting.executeScript({
+      target,
+      world: "MAIN",
+      func: (act) => {
+        const out = { ok: false, action: String(act || ""), error: "" };
+        try {
+          const input = document.querySelector("#txtCaptcha");
+          if (act === "refresh") {
+            if (typeof window.fnCapchaRefresh === "function") {
+              window.fnCapchaRefresh();
+              out.ok = true;
+              return out;
+            }
+            const btn = document.querySelector(".capchaLayer .refreshBtn");
+            if (btn && typeof btn.click === "function") {
+              btn.click();
+              out.ok = true;
+              return out;
+            }
+          }
+          if (act === "submit") {
+            if (typeof window.fnCheck === "function") {
+              window.fnCheck();
+              out.ok = true;
+              return out;
+            }
+            const btn = document.querySelector(".capchaLayer a[onclick*='fnCheck']");
+            if (btn && typeof btn.click === "function") {
+              btn.click();
+              out.ok = true;
+              return out;
+            }
+          }
+          if (act === "enter" && input) {
+            input.dispatchEvent(
+              new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true })
+            );
+            input.dispatchEvent(
+              new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true })
+            );
+            if (typeof window.IsEnterGo === "function") {
+              window.IsEnterGo();
+            }
+            out.ok = true;
+            return out;
+          }
+          out.error = "action_not_handled";
+          return out;
+        } catch (err) {
+          out.error = String(err?.message || err);
+          return out;
+        }
+      },
+      args: [String(action || "")]
+    });
+    return results?.[0]?.result || { ok: false, error: "no_result" };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+}
+
 chrome.runtime.onInstalled.addListener(async () => {
   const all = await chrome.storage.local.get(STORAGE_KEY);
   if (!all[STORAGE_KEY]) {
@@ -474,6 +613,30 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return;
     }
 
+    if (message?.type === "LEGACY_NEXT_MAIN") {
+      const tabId = _sender?.tab?.id;
+      const frameId = _sender?.frameId;
+      const result = await runLegacyNextInMainWorld(
+        tabId,
+        Number.isInteger(frameId) ? frameId : undefined,
+        String(message?.reason || "")
+      );
+      sendResponse({ ok: Boolean(result?.ok), result });
+      return;
+    }
+
+    if (message?.type === "LEGACY_CAPTCHA_ACTION") {
+      const tabId = _sender?.tab?.id;
+      const frameId = _sender?.frameId;
+      const result = await runLegacyCaptchaActionInMainWorld(
+        tabId,
+        Number.isInteger(frameId) ? frameId : undefined,
+        String(message?.action || "")
+      );
+      sendResponse({ ok: Boolean(result?.ok), result });
+      return;
+    }
+
     if (message?.type === "OCR_REQUEST") {
       try {
         await chrome.storage.local.set({
@@ -491,6 +654,30 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             ts: Date.now()
           }
         });
+        sendResponse({ ok: false, error: String(err?.message || err) });
+      }
+      return;
+    }
+
+    if (message?.type === "FETCH_IMAGE_BYTES") {
+      try {
+        const targetUrl = String(message?.url || "").trim();
+        if (!targetUrl) {
+          sendResponse({ ok: false, error: "empty_url" });
+          return;
+        }
+        const resp = await fetch(targetUrl, {
+          method: "GET",
+          credentials: "include",
+          cache: "no-store"
+        });
+        if (!resp.ok) {
+          sendResponse({ ok: false, error: `HTTP ${resp.status}` });
+          return;
+        }
+        const buf = await resp.arrayBuffer();
+        sendResponse({ ok: true, bytes: Array.from(new Uint8Array(buf)) });
+      } catch (err) {
         sendResponse({ ok: false, error: String(err?.message || err) });
       }
       return;

@@ -49,6 +49,8 @@ const state = {
   dateLastDayClickAt: 0,
   dateLastSlotClickAt: 0,
   dateLastNextAt: 0,
+  legacyNextPendingUntil: 0,
+  legacyNextWaitLogAt: 0,
   productFlowKey: "",
   productBuyClickedAt: 0,
   productLastCountdownLogAt: 0,
@@ -77,6 +79,7 @@ const state = {
   humanVerifyLastClickAt: 0,
   humanVerifyLastLogAt: 0,
   lastStage: "unknown",
+  lastBookingPageVariant: "unknown",
   notifySale3mSent: false,
   notifyPriceEnteredSent: false,
   notifyQueueThresholdSent: {
@@ -84,6 +87,16 @@ const state = {
     100: false,
     10: false
   },
+  legacySeatFlowKey: "",
+  legacySeatAreaIndex: 0,
+  legacySeatCurrentAreaCode: "",
+  legacySeatLastAreaSwitchAt: 0,
+  legacySeatLastSeatClickAt: 0,
+  legacySeatLastNextAt: 0,
+  legacySeatSelectedAssumed: 0,
+  legacySeatClickedKeys: [],
+  legacySeatNoSeatCycles: 0,
+  legacySeatLastLogAt: 0,
   selectedSeatCountCache: {
     ts: 0,
     count: 0
@@ -93,6 +106,7 @@ const state = {
     lastAttemptAt: 0,
     submitCount: 0,
     solvedAt: 0,
+    lastPassLogAt: 0,
     candidates: [],
     candidateIndex: 0
   }
@@ -113,14 +127,22 @@ const TICK_MS_NORMAL = 480;
 const TICK_MS_CRITICAL_DEFAULT = 65;
 const QUEUE_KEEP_ALIVE_MIN_MS = 2.2 * 60 * 1000;
 const QUEUE_KEEP_ALIVE_MAX_MS = 4.8 * 60 * 1000;
+const IS_TOP_FRAME = window.top === window;
+const BOT_OWNER_KEY = "__nolBotTopOwner";
+const BOT_INSTANCE_ID = `nol_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
 function normalizeText(text) {
   return (text || "").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+function isDomElement(el) {
+  return Boolean(el && el.nodeType === 1 && typeof el.getBoundingClientRect === "function");
+}
+
 function visible(el) {
-  if (!el || !(el instanceof Element)) return false;
-  const style = window.getComputedStyle(el);
+  if (!isDomElement(el)) return false;
+  const view = el.ownerDocument?.defaultView || window;
+  const style = view.getComputedStyle(el);
   const rect = el.getBoundingClientRect();
   return (
     style.visibility !== "hidden" &&
@@ -132,8 +154,9 @@ function visible(el) {
 }
 
 function visibleForSeat(el) {
-  if (!el || !(el instanceof Element)) return false;
-  const style = window.getComputedStyle(el);
+  if (!isDomElement(el)) return false;
+  const view = el.ownerDocument?.defaultView || window;
+  const style = view.getComputedStyle(el);
   const rect = el.getBoundingClientRect();
   return (
     style.visibility !== "hidden" &&
@@ -171,7 +194,11 @@ function clickAtCenter(el) {
   const rect = el.getBoundingClientRect();
   const x = rect.left + rect.width / 2;
   const y = rect.top + rect.height / 2;
-  const topEl = document.elementFromPoint(x, y) || el;
+  const doc = el.ownerDocument || document;
+  let topEl = doc.elementFromPoint(x, y) || el;
+  if (topEl?.closest?.("#nol-ticket-bot-log-panel, #nol-ticket-bot-badge")) {
+    topEl = el;
+  }
   try {
     topEl.dispatchEvent(
       new MouseEvent("mousedown", { bubbles: true, clientX: x, clientY: y })
@@ -196,6 +223,26 @@ function randomInt(min, max) {
   const lo = Math.ceil(min);
   const hi = Math.floor(max);
   return Math.floor(Math.random() * (hi - lo + 1)) + lo;
+}
+
+function tryClaimBotOwner(staleMs = 2500) {
+  if (!IS_TOP_FRAME) return false;
+  const now = Date.now();
+  const owner = window[BOT_OWNER_KEY];
+  if (!owner || owner.id === BOT_INSTANCE_ID || now - Number(owner.hb || 0) > staleMs) {
+    window[BOT_OWNER_KEY] = { id: BOT_INSTANCE_ID, hb: now };
+    return true;
+  }
+  return false;
+}
+
+function isBotOwner() {
+  return Boolean(IS_TOP_FRAME && window[BOT_OWNER_KEY]?.id === BOT_INSTANCE_ID);
+}
+
+function touchBotOwner() {
+  if (!isBotOwner()) return;
+  window[BOT_OWNER_KEY].hb = Date.now();
 }
 
 function scheduleNextQueueKeepAlive(initial = false) {
@@ -547,8 +594,9 @@ function log(text) {
 }
 
 function isElementShown(el) {
-  if (!el || !(el instanceof Element)) return false;
-  const style = window.getComputedStyle(el);
+  if (!isDomElement(el)) return false;
+  const view = el.ownerDocument?.defaultView || window;
+  const style = view.getComputedStyle(el);
   if (style.display === "none" || style.visibility === "hidden") return false;
   const rect = el.getBoundingClientRect();
   return rect.width > 1 && rect.height > 1;
@@ -643,7 +691,14 @@ async function runHumanVerifyStep() {
 }
 
 function ensureLogPanel() {
+  if (!IS_TOP_FRAME) return;
   if (state.logPanelEl || !document.body) return;
+  const existing = document.getElementById("nol-ticket-bot-log-panel");
+  if (existing) {
+    state.logPanelEl = existing;
+    state.logListEl = existing.querySelector("div:last-child");
+    return;
+  }
   const panel = document.createElement("div");
   panel.id = "nol-ticket-bot-log-panel";
   Object.assign(panel.style, {
@@ -744,6 +799,7 @@ async function isEximbayFlowLikelyActive() {
 }
 
 function ensureBadge() {
+  if (!IS_TOP_FRAME) return;
   if (state.badgeEl || !document.body) return;
   const badge = document.createElement("div");
   badge.id = "nol-ticket-bot-badge";
@@ -2846,7 +2902,7 @@ async function runInfoStep() {
       }
     });
     log("信息步骤完成，已停止自动化（不再点击总计/支付）");
-    stopLoop();
+    stopLoop("信息步骤完成");
   }
 }
 // ======================================================================
@@ -2881,7 +2937,7 @@ function findBuyNowButtonStrict() {
 }
 
 function isBuyNowElement(el) {
-  if (!el || !(el instanceof Element) || !visible(el)) return false;
+  if (!isDomElement(el) || !visible(el)) return false;
   const text = normalizeText(el.textContent || "");
   if (!text) return false;
   return STEP_TEXT.buyNow.some((w) => text.includes(normalizeText(w)));
@@ -3221,13 +3277,253 @@ function getOcrApiUrl() {
   return raw || "http://127.0.0.1:8000/ocr/file";
 }
 
-function findCaptchaImageElement() {
-  const modalCaptchaImg = document.querySelector(
-    ".ModalCaptchaText_captchaImage__Mitgq img"
-  );
-  if (modalCaptchaImg && visible(modalCaptchaImg)) return modalCaptchaImg;
+function getCaptchaSearchDocuments(preferredDoc = null) {
+  const out = [];
+  const seen = new Set();
 
-  const canvases = Array.from(document.querySelectorAll("canvas")).filter(visible);
+  const isDocVisibleFromTop = (doc) => {
+    if (!doc) return false;
+    try {
+      let win = doc.defaultView;
+      while (win && win !== window) {
+        const frameEl = win.frameElement;
+        if (!isDomElement(frameEl) || !visible(frameEl)) return false;
+        win = frameEl.ownerDocument?.defaultView || null;
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  };
+
+  const pushDoc = (doc) => {
+    if (!doc || seen.has(doc)) return;
+    if (!isDocVisibleFromTop(doc)) return;
+    seen.add(doc);
+    out.push(doc);
+  };
+
+  const collectFromRoot = (rootDoc, depth = 0, maxDepth = 2) => {
+    if (!rootDoc || depth > maxDepth) return;
+    pushDoc(rootDoc);
+    if (depth === maxDepth) return;
+    const frames = Array.from(rootDoc.querySelectorAll("iframe, frame"));
+    for (const frame of frames) {
+      try {
+        const subDoc = frame.contentDocument || frame.contentWindow?.document || null;
+        if (!subDoc) continue;
+        collectFromRoot(subDoc, depth + 1, maxDepth);
+      } catch (_) {}
+    }
+  };
+
+  const seatFrame = document.querySelector("#ifrmSeat");
+  if (seatFrame) {
+    try {
+      const seatDoc = seatFrame.contentDocument || seatFrame.contentWindow?.document || null;
+      if (seatDoc) collectFromRoot(seatDoc, 0, 2);
+    } catch (_) {}
+  }
+
+  if (preferredDoc) {
+    collectFromRoot(preferredDoc, 0, 2);
+    // 旧版主要运行在 iframe 内；当已定位到具体文档时，优先只在该文档树里判定，
+    // 避免混入顶层 document 的残留文案/节点导致误判。
+    if (preferredDoc !== document && out.length > 0) {
+      return out;
+    }
+  }
+  collectFromRoot(document, 0, 2);
+  return out;
+}
+
+function isLegacyCaptchaLayerVisible(preferredDoc = null) {
+  const inViewport = (el) => {
+    if (!isDomElement(el)) return false;
+    const view = el.ownerDocument?.defaultView || window;
+    const rect = el.getBoundingClientRect();
+    const vw = Math.max(320, view.innerWidth || window.innerWidth || 0);
+    const vh = Math.max(240, view.innerHeight || window.innerHeight || 0);
+    return rect.right > 4 && rect.bottom > 4 && rect.left < vw - 4 && rect.top < vh - 4;
+  };
+  const isBlockingLayer = (layer) => {
+    if (!isDomElement(layer) || !visible(layer) || !inViewport(layer)) return false;
+    const view = layer.ownerDocument?.defaultView || window;
+    const style = view.getComputedStyle(layer);
+    const opacity = Number(style.opacity || "1");
+    const ariaHidden = normalizeText(layer.getAttribute("aria-hidden") || "");
+    if (style.pointerEvents === "none") return false;
+    if (Number.isFinite(opacity) && opacity <= 0.05) return false;
+    if (ariaHidden === "true") return false;
+    return true;
+  };
+
+  const docs = getCaptchaSearchDocuments(preferredDoc);
+  return docs.some((doc) => {
+    const layer = doc.querySelector(".capchaLayer");
+    return Boolean(layer && isBlockingLayer(layer));
+  });
+}
+
+function isLegacyCaptchaImage(el) {
+  if (!isDomElement(el)) return false;
+  if (el.id === "imgCaptcha") return true;
+  if (el.closest?.(".capchaLayer")) return true;
+  return false;
+}
+
+async function triggerLegacyCaptchaAction(action) {
+  try {
+    const resp = await chrome.runtime.sendMessage({
+      type: "LEGACY_CAPTCHA_ACTION",
+      action: String(action || "").trim()
+    });
+    return Boolean(resp?.ok && resp?.result?.ok);
+  } catch (_) {
+    return false;
+  }
+}
+
+function runLegacyCaptchaActionInDoc(action, doc) {
+  const targetDoc = doc || document;
+  if (!targetDoc) return false;
+  const view = targetDoc.defaultView;
+  if (!view) return false;
+  const act = String(action || "").trim();
+  try {
+    const input = targetDoc.querySelector("#txtCaptcha");
+    if (act === "refresh") {
+      if (typeof view.fnCapchaRefresh === "function") {
+        view.fnCapchaRefresh();
+        return true;
+      }
+      const refreshBtn = targetDoc.querySelector(".capchaLayer .refreshBtn");
+      if (refreshBtn && clickElement(refreshBtn)) return true;
+    }
+    if (act === "submit") {
+      if (typeof view.fnCheck === "function") {
+        view.fnCheck();
+        return true;
+      }
+      const submitBtn =
+        targetDoc.querySelector(".capchaLayer a[onclick*='fnCheck']") ||
+        targetDoc.querySelector(".capchaLayer .capchaBtns a:last-child");
+      if (submitBtn) {
+        if (!hasJavascriptHref(submitBtn) && clickElement(submitBtn)) return true;
+        if (runLegacyHandlerScript(submitBtn, ["fncheck"])) return true;
+      }
+    }
+    if (act === "enter" && input) {
+      input.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true })
+      );
+      input.dispatchEvent(
+        new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true })
+      );
+      if (typeof view.IsEnterGo === "function") {
+        view.IsEnterGo();
+      }
+      return true;
+    }
+  } catch (_) {}
+  return false;
+}
+
+function findCaptchaImageElement() {
+  const docs = getCaptchaSearchDocuments();
+  const inViewport = (el) => {
+    if (!isDomElement(el)) return false;
+    const view = el.ownerDocument?.defaultView || window;
+    const rect = el.getBoundingClientRect();
+    const vw = Math.max(320, view.innerWidth || window.innerWidth || 0);
+    const vh = Math.max(240, view.innerHeight || window.innerHeight || 0);
+    return rect.right > 4 && rect.bottom > 4 && rect.left < vw - 4 && rect.top < vh - 4;
+  };
+  const isLikelyLegacyCaptchaAsset = (el) => {
+    if (!isDomElement(el)) return false;
+    const tag = String(el.tagName || "").toLowerCase();
+    if (tag === "canvas") return true;
+    if (tag !== "img") return false;
+    const src = String(el.currentSrc || el.src || "").toLowerCase();
+    const id = String(el.id || "").toLowerCase();
+    const cls = String(el.className || "").toLowerCase();
+    const bag = `${src} ${id} ${cls}`;
+    if (bag.includes("imgcaptcha")) return true;
+    if (bag.includes("captcha") || bag.includes("capcha") || bag.includes("kaptcha") || bag.includes("verify")) {
+      return true;
+    }
+    if (src.includes("btn_") || src.includes("theater") || src.includes("icon") || src.includes("seat")) {
+      return false;
+    }
+    const r = el.getBoundingClientRect();
+    return r.width >= 80 && r.width <= 360 && r.height >= 24 && r.height <= 120;
+  };
+
+  for (const doc of docs) {
+    const legacyImg = doc.querySelector("#imgCaptcha");
+    if (!legacyImg) continue;
+    const layer = legacyImg.closest(".capchaLayer") || doc.querySelector(".capchaLayer");
+    // 旧版以 capchaLayer 是否可见作为是否阻塞的主判定，避免成功后残留 DOM 误判。
+    if (layer && !visible(layer)) continue;
+    if (!inViewport(legacyImg)) continue;
+    if (visible(legacyImg)) return legacyImg;
+  }
+
+  // 旧版兜底：仅在 capchaLayer 内挑选“最像验证码”的 img/canvas，避免误选页面普通图片。
+  for (const doc of docs) {
+    const layer = doc.querySelector(".capchaLayer");
+    if (!layer || !visible(layer)) continue;
+    const input =
+      layer.querySelector("#txtCaptcha") ||
+      layer.querySelector("input[name='txtCaptcha']") ||
+      layer.querySelector("input[type='text']");
+    const inputRect = input?.getBoundingClientRect?.() || null;
+    const candidates = Array.from(layer.querySelectorAll("img, canvas"))
+      .filter((el) => visible(el) && inViewport(el))
+      .filter((el) => isLikelyLegacyCaptchaAsset(el))
+      .map((el) => {
+        const r = el.getBoundingClientRect();
+        let score = 0;
+        const src = String(el.currentSrc || el.src || "").toLowerCase();
+        if (src.includes("imgcaptcha") || src.includes("captcha") || src.includes("capcha")) score += 10;
+        if ((el.tagName || "").toLowerCase() === "canvas") score += 4;
+        if (r.width >= 90 && r.width <= 300) score += 3;
+        if (r.height >= 24 && r.height <= 90) score += 3;
+        if (inputRect) {
+          const dy = Math.abs((r.top + r.height / 2) - (inputRect.top + inputRect.height / 2));
+          const dx = Math.abs((r.left + r.width / 2) - (inputRect.left + inputRect.width / 2));
+          if (dy < 160) score += 4;
+          if (dx < 240) score += 3;
+          if (r.bottom <= inputRect.top + 24) score += 2;
+        }
+        return { el, score };
+      })
+      .sort((a, b) => b.score - a.score);
+    if (candidates[0]?.el) return candidates[0].el;
+  }
+
+  for (const doc of docs) {
+    const modalCaptchaImg = doc.querySelector(
+      ".ModalCaptchaText_captchaImage__Mitgq img"
+    );
+    if (modalCaptchaImg && visible(modalCaptchaImg)) return modalCaptchaImg;
+  }
+
+  const legacyContextLikely =
+    location.host === "gpoticket.globalinterpark.com" ||
+    isLegacyBookingUrl() ||
+    Boolean(document.querySelector("#ifrmSeat, #ifrmBookStep, #divBookMain"));
+  if (legacyContextLikely) {
+    const hasBlockingLegacyLayer = docs.some((doc) => {
+      const layer = doc.querySelector(".capchaLayer");
+      return Boolean(layer && visible(layer));
+    });
+    if (!hasBlockingLegacyLayer) {
+      return null;
+    }
+  }
+
+  const canvases = docs.flatMap((doc) => Array.from(doc.querySelectorAll("canvas"))).filter(visible);
   const canvasScored = canvases
     .map((cv) => {
       const nearby = normalizeText(
@@ -3248,10 +3544,11 @@ function findCaptchaImageElement() {
     .sort((a, b) => b.score - a.score);
   if (canvasScored[0]?.el) return canvasScored[0].el;
 
-  const imgs = Array.from(document.querySelectorAll("img")).filter(visible);
+  const imgs = docs.flatMap((doc) => Array.from(doc.querySelectorAll("img"))).filter(visible);
   const scored = imgs
     .map((img) => {
       const src = String(img.currentSrc || img.src || "").toLowerCase();
+      if (src.includes("btn_theater.gif")) return null;
       const alt = String(img.alt || "").toLowerCase();
       const nearby = normalizeText(
         (img.closest("div, section, form, td, li")?.innerText || "").slice(0, 240)
@@ -3269,40 +3566,74 @@ function findCaptchaImageElement() {
       if (img.naturalWidth > 0 && img.naturalHeight > 0) score += 1;
       return { img, score };
     })
+    .filter(Boolean)
     .filter((x) => x.score >= 7)
     .sort((a, b) => b.score - a.score);
   return scored[0]?.img || null;
 }
 
 function findCaptchaInput(imageEl) {
-  const byStableClass = document.querySelector(
-    "input[class*='ModalCaptchaText_captchaInput']"
-  );
-  if (byStableClass && visible(byStableClass)) return byStableClass;
+  const ownerDoc = imageEl?.ownerDocument || null;
+  const docs = getCaptchaSearchDocuments(ownerDoc);
+  const legacyDoc = ownerDoc || document;
+  const legacyContext =
+    isLegacyCaptchaImage(imageEl) || Boolean(legacyDoc.querySelector(".capchaLayer"));
 
-  const hardMatch = Array.from(document.querySelectorAll("input")).find((input) => {
-    if (!visible(input)) return false;
-    const p = normalizeText(input.getAttribute("placeholder") || "");
-    return (
-      p.includes("請輸入畫面的文字") ||
-      p.includes("请输入画面的文字") ||
-      p.includes("不區分大小寫")
+  // 旧版验证码优先：固定 ID/name，不依赖 visible，避免被样式判定误杀。
+  if (legacyContext) {
+    const strictLegacy =
+      legacyDoc.querySelector("#txtCaptcha") ||
+      legacyDoc.querySelector("input[name='txtCaptcha']") ||
+      legacyDoc.querySelector(".capchaLayer input[type='text']");
+    if (strictLegacy) return strictLegacy;
+  }
+
+  for (const doc of docs) {
+    const legacyInput = doc.querySelector("#txtCaptcha");
+    if (legacyInput && visible(legacyInput)) return legacyInput;
+  }
+
+  for (const doc of docs) {
+    const byStableClass = doc.querySelector(
+      "input[class*='ModalCaptchaText_captchaInput']"
     );
-  });
-  if (hardMatch) return hardMatch;
+    if (byStableClass && visible(byStableClass)) return byStableClass;
+  }
+
+  for (const doc of docs) {
+    const hardMatch = Array.from(doc.querySelectorAll("input")).find((input) => {
+      if (!visible(input)) return false;
+      const p = normalizeText(input.getAttribute("placeholder") || "");
+      return (
+        p.includes("請輸入畫面的文字") ||
+        p.includes("请输入画面的文字") ||
+        p.includes("不區分大小寫")
+      );
+    });
+    if (hardMatch) return hardMatch;
+  }
 
   const modalScope =
     imageEl?.closest(
       "[class*='ModalCaptchaText'], [role='dialog'], [class*='modal'], [class*='Modal']"
     ) || null;
+  if (legacyContext) {
+    const layer = imageEl?.closest?.(".capchaLayer") || legacyDoc.querySelector(".capchaLayer");
+    if (layer) {
+      const layerInput = layer.querySelector("input[type='text'], input:not([type]), input[type='search']");
+      if (layerInput) return layerInput;
+    }
+  }
   const scopedCandidates = modalScope
     ? Array.from(
         modalScope.querySelectorAll("input[type='text'], input:not([type]), input[type='search']")
       ).filter(visible)
     : [];
-  const globalCandidates = Array.from(
-    document.querySelectorAll("input[type='text'], input:not([type]), input[type='search']")
-  ).filter(visible);
+  const globalCandidates = docs
+    .flatMap((doc) =>
+      Array.from(doc.querySelectorAll("input[type='text'], input:not([type]), input[type='search']"))
+    )
+    .filter(visible);
   const candidates = scopedCandidates.length ? scopedCandidates : globalCandidates;
   const scored = candidates
     .map((input) => {
@@ -3348,10 +3679,16 @@ function findCaptchaInput(imageEl) {
 }
 
 function findCaptchaSubmitButton(imageEl, inputEl) {
+  const doc = inputEl?.ownerDocument || imageEl?.ownerDocument || document;
+  const legacySubmit =
+    doc.querySelector(".capchaLayer a[onclick*='fnCheck']") ||
+    doc.querySelector(".capchaLayer .capchaBtns a:last-child");
+  if (legacySubmit && visible(legacySubmit)) return legacySubmit;
+
   const scope =
     inputEl?.closest("form, section, div, li, td") ||
     imageEl?.closest("form, section, div, li, td") ||
-    document;
+    doc;
   const words = [
     "验证",
     "驗證",
@@ -3430,14 +3767,30 @@ async function loadCaptchaBytes(imageEl) {
     return out;
   }
   log("验证码源: 普通图片 URL，开始 fetch");
-  const resp = await fetch(src, {
-    method: "GET",
-    credentials: "include",
-    cache: "no-store"
-  });
-  if (!resp.ok) return null;
-  const buf = await resp.arrayBuffer();
-  return new Uint8Array(buf);
+  try {
+    const resp = await fetch(src, {
+      method: "GET",
+      credentials: "include",
+      cache: "no-store"
+    });
+    if (resp.ok) {
+      const buf = await resp.arrayBuffer();
+      return new Uint8Array(buf);
+    }
+  } catch (_) {}
+
+  // 页面上下文可能被 CORS 拦截，改走 extension background 拉取图片字节。
+  log("页面 fetch 失败，尝试通过 background 拉取验证码图片");
+  try {
+    const viaBg = await chrome.runtime.sendMessage({
+      type: "FETCH_IMAGE_BYTES",
+      url: src
+    });
+    if (viaBg?.ok && Array.isArray(viaBg.bytes) && viaBg.bytes.length > 0) {
+      return new Uint8Array(viaBg.bytes);
+    }
+  } catch (_) {}
+  return null;
 }
 
 async function requestCaptchaOcr(imageBytes) {
@@ -3459,103 +3812,39 @@ async function requestCaptchaOcr(imageBytes) {
   return { code, candidates };
 }
 
-function hasCaptchaRetryErrorText() {
-  const text = getWholeText();
-  return (
+function hasCaptchaRetryErrorText(preferredDoc = null) {
+  const docs = getCaptchaSearchDocuments(preferredDoc);
+  const isRetryText = (text) =>
     text.includes("請再次確認輸入的文字") ||
     text.includes("请再次确认输入的文字") ||
-    text.includes("incorrect captcha")
-  );
-}
+    text.includes("請重新輸入") ||
+    text.includes("请重新输入") ||
+    text.includes("incorrect captcha");
 
-function isLettersOnlyCaptchaContext() {
-  const text = getWholeText();
-  return text.includes("只能包含字母") || text.includes("only letters");
-}
-
-function normalizeCaptchaToSixLetters(raw) {
-  const digitToLetter = {
-    0: "O",
-    1: "I",
-    2: "Z",
-    3: "B",
-    4: "A",
-    5: "S",
-    6: "G",
-    7: "T",
-    8: "B",
-    9: "P"
-  };
-  const src = String(raw || "").trim().toUpperCase();
-  if (!src) return "";
-  const letters = [];
-  for (const ch of src) {
-    if (/[A-Z]/.test(ch)) {
-      letters.push(ch);
-      continue;
+  return docs.some((doc) => {
+    const layer = doc.querySelector(".capchaLayer");
+    if (layer && visible(layer)) {
+      const alertText = normalizeText(layer.querySelector(".alertNotice")?.innerText || "");
+      if (isRetryText(alertText)) return true;
+      const layerText = normalizeText(layer.innerText || "");
+      return isRetryText(layerText);
     }
-    if (digitToLetter[ch]) letters.push(digitToLetter[ch]);
-  }
-  if (letters.length < 6) return "";
-  return letters.slice(0, 6).join("");
+    const text = normalizeText(doc.body?.innerText || "");
+    return isRetryText(text);
+  });
 }
 
-function expandLetterCaptchaVariants(text, maxVariants = 12) {
-  const src = String(text || "").trim();
-  if (!/^[A-Z]{6}$/.test(src)) return [];
-
-  const swapMap = {
-    O: ["Q"],
-    Q: ["O"],
-    G: ["B", "C"],
-    B: ["G"],
-    C: ["G"]
-  };
-  const chars = src.split("");
-  const out = [];
-  const seen = new Set([src]);
-  for (let i = 0; i < chars.length; i += 1) {
-    const swaps = swapMap[chars[i]] || [];
-    for (const s of swaps) {
-      const cand = chars.slice();
-      cand[i] = s;
-      const next = cand.join("");
-      if (seen.has(next)) continue;
-      seen.add(next);
-      out.push(next);
-      if (out.length >= maxVariants) return out;
-    }
+async function clickCaptchaRefresh(imageEl) {
+  const doc = imageEl?.ownerDocument || document;
+  if (isLegacyCaptchaImage(imageEl) || isLegacyCaptchaLayerVisible(doc)) {
+    if (runLegacyCaptchaActionInDoc("refresh", doc)) return true;
+    const viaMain = await triggerLegacyCaptchaAction("refresh");
+    if (viaMain) return true;
+    const legacyRefresh = doc.querySelector(".capchaLayer .refreshBtn");
+    if (legacyRefresh && visible(legacyRefresh) && clickElement(legacyRefresh)) return true;
   }
-  return out.slice(0, maxVariants);
-}
 
-function buildCaptchaAttemptList(primary, candidates) {
-  const rawList = [primary, ...(Array.isArray(candidates) ? candidates : [])]
-    .map((x) => String(x || "").trim())
-    .filter(Boolean);
-
-  const out = [];
-  const seen = new Set();
-  const pushUnique = (cand) => {
-    if (!cand) return;
-    const key = String(cand);
-    if (seen.has(key)) return;
-    seen.add(key);
-    out.push(key);
-  };
-
-  for (const item of rawList) {
-    const normalized = normalizeCaptchaToSixLetters(item);
-    if (!/^[A-Z]{6}$/.test(normalized)) continue;
-    pushUnique(normalized);
-    const variants = expandLetterCaptchaVariants(normalized, 12);
-    variants.forEach(pushUnique);
-  }
-  return out.slice(0, 24);
-}
-
-function clickCaptchaRefresh(imageEl) {
-  const scope = imageEl?.closest("form, section, div, li, td") || document;
+  const scope = imageEl?.closest("form, section, div, li, td") || doc;
   const words = ["刷新", "换一张", "重新", "refresh", "reload"];
   const nodes = Array.from(
     scope.querySelectorAll("button, [role='button'], a, span, div")
@@ -3569,125 +3858,42 @@ function clickCaptchaRefresh(imageEl) {
   return clickElement(imageEl);
 }
 
+let captchaEngine = null;
+
+function getCaptchaEngine() {
+  if (captchaEngine) return captchaEngine;
+  if (typeof window.createCaptchaEngine !== "function") {
+    log("验证码引擎未加载，跳过本轮验证码处理");
+    return null;
+  }
+  captchaEngine = window.createCaptchaEngine({
+    state,
+    log,
+    sleep,
+    findCaptchaImageElement,
+    isLegacyCaptchaLayerVisible,
+    isLegacyCaptchaImage,
+    findCaptchaInput,
+    makeCaptchaSignature,
+    hasCaptchaRetryErrorText,
+    loadCaptchaBytes,
+    requestCaptchaOcr,
+    typeInInput,
+    runLegacyCaptchaActionInDoc,
+    triggerLegacyCaptchaAction,
+    findCaptchaSubmitButton,
+    hasJavascriptHref,
+    clickElement,
+    runLegacyHandlerScript,
+    clickCaptchaRefresh
+  });
+  return captchaEngine;
+}
+
 async function runCaptchaStep() {
-  const imageEl = findCaptchaImageElement();
-  if (!imageEl) return false;
-  log(`检测到验证码元素: ${imageEl.tagName.toLowerCase()}`);
-  const inputEl = findCaptchaInput(imageEl);
-  if (!inputEl) {
-    log("检测到验证码图，但未找到输入框");
-    // 验证码弹窗出现时，阻断后续流程点击，避免误点“完成选择”
-    return true;
-  }
-  log("已定位验证码输入框");
-
-  const now = Date.now();
-  const sig = makeCaptchaSignature(imageEl);
-  const sameImage = sig === state.captcha.lastImageSig;
-  if (!sameImage) {
-    state.captcha.lastImageSig = sig;
-    state.captcha.candidates = [];
-    state.captcha.candidateIndex = 0;
-  }
-  const retryByError = sameImage && hasCaptchaRetryErrorText();
-  if (sameImage && !retryByError && now - state.captcha.lastAttemptAt < 1200) {
-    log("验证码图未变化，跳过重复识别");
-    return true;
-  }
-  state.captcha.lastAttemptAt = now;
-
-  try {
-    let code = "";
-
-    if (retryByError && state.captcha.candidateIndex + 1 < state.captcha.candidates.length) {
-      state.captcha.candidateIndex += 1;
-      code = state.captcha.candidates[state.captcha.candidateIndex];
-      log(`验证码错误，切换候选(${state.captcha.candidateIndex + 1}/${state.captcha.candidates.length}): ${code}`);
-    } else {
-      const imageBytes = await loadCaptchaBytes(imageEl);
-      if (!imageBytes?.length) {
-        log("验证码图片读取失败");
-        return true;
-      }
-      log(`验证码字节长度: ${imageBytes.length}`);
-      const ocrResult = await requestCaptchaOcr(imageBytes);
-      code = normalizeCaptchaToSixLetters(ocrResult.code);
-      state.captcha.candidates = buildCaptchaAttemptList(code, ocrResult.candidates);
-      if (!state.captcha.candidates.length && /^[A-Z]{6}$/.test(code)) state.captcha.candidates = [code];
-      const exactIndex = state.captcha.candidates.findIndex(
-        (x) => String(x) === String(code)
-      );
-      state.captcha.candidateIndex = exactIndex >= 0 ? exactIndex : 0;
-      const currentTry =
-        state.captcha.candidates[state.captcha.candidateIndex] || "(empty)";
-      log(
-        `后端候选数: ${state.captcha.candidates.length}, 当前尝试: ${currentTry}`
-      );
-      code = state.captcha.candidates[state.captcha.candidateIndex] || code;
-    }
-
-    code = normalizeCaptchaToSixLetters(code);
-    if (!/^[A-Z]{6}$/.test(code)) {
-      log(`OCR结果非6位字母，当前值: ${String(code || "") || "(empty)"}，刷新验证码重试`);
-      clickCaptchaRefresh(imageEl);
-      // 刷新后立即允许下一轮重识别，避免被“同图节流”卡住。
-      state.captcha.lastImageSig = "";
-      state.captcha.lastAttemptAt = 0;
-      return true;
-    }
-
-    typeInInput(inputEl, code);
-    log(`验证码已填写: ${code}`);
-
-    // 该页面回车可直接提交，优先按真实交互走
-    inputEl.focus();
-    inputEl.dispatchEvent(
-      new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true })
-    );
-    inputEl.dispatchEvent(
-      new KeyboardEvent("keypress", { key: "Enter", code: "Enter", bubbles: true })
-    );
-    inputEl.dispatchEvent(
-      new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true })
-    );
-    log("已尝试回车提交验证码");
-
-    await sleep(180);
-    const stillHasCaptcha = Boolean(findCaptchaImageElement());
-    if (stillHasCaptcha) {
-      state.captcha.submitCount += 1;
-      const submitEl = findCaptchaSubmitButton(imageEl, inputEl);
-      if (submitEl) {
-        clickElement(submitEl);
-        log("回车后验证码仍存在，已补点确认按钮");
-      } else {
-        log("回车后验证码仍存在，未命中确认按钮");
-      }
-      if (state.captcha.submitCount >= 3) {
-        clickCaptchaRefresh(imageEl);
-        state.captcha.lastImageSig = "";
-        state.captcha.lastAttemptAt = 0;
-        state.captcha.submitCount = 0;
-        log("连续验证码提交后触发刷新");
-      }
-      return true;
-    }
-
-    state.captcha.solvedAt = Date.now();
-    state.captcha.submitCount = 0;
-    log("验证码已通过，继续选座流程");
-    return false;
-  } catch (err) {
-    const msg = String(err?.message || err);
-    log(`验证码处理失败: ${msg}`);
-    if (msg.includes("OCR code is empty")) {
-      clickCaptchaRefresh(imageEl);
-      state.captcha.lastImageSig = "";
-      state.captcha.lastAttemptAt = 0;
-      log("OCR空结果，已刷新验证码重试");
-    }
-  }
-  return true;
+  const engine = getCaptchaEngine();
+  if (!engine) return false;
+  return await engine.runStep();
 }
 
 function isSeatPage() {
@@ -3819,6 +4025,42 @@ function detectCurrentStage() {
   return "unknown";
 }
 
+function isLegacyBookingUrl() {
+  const href = String(location.href || "").toLowerCase();
+  const path = String(location.pathname || "").toLowerCase();
+  return (
+    href.includes("/global/play/book/bookmain.asp") ||
+    path.includes("/global/play/book/bookmain.asp")
+  );
+}
+
+function detectInterparkBookingVariant() {
+  const host = String(location.host || "").toLowerCase();
+  const path = String(location.pathname || "").toLowerCase();
+
+  if (host === "gpoticket.globalinterpark.com") return "legacy";
+  if (isLegacyBookingUrl()) return "legacy";
+
+  if (host === "tickets.interpark.com") {
+    if (path.includes("/onestop/seat")) return "new";
+    return "new";
+  }
+
+  return "unknown";
+}
+
+function rememberBookingVariant(variant) {
+  if (!variant || variant === state.lastBookingPageVariant) return;
+  state.lastBookingPageVariant = variant;
+  if (variant === "new") {
+    log("识别到 Interpark 新版订票页面 (onestop/seat)，进入新版流程");
+    return;
+  }
+  if (variant === "legacy") {
+    log("识别到 Interpark 旧版订票页面 (BookMain.asp)，进入旧版流程分支");
+  }
+}
+
 async function stopAtPriceByConfigIfNeeded() {
   if (state.config.fullFlowEnabled !== false) return false;
   await chrome.storage.local.set({
@@ -3829,7 +4071,7 @@ async function stopAtPriceByConfigIfNeeded() {
     }
   });
   log("已进入价格页，按配置停止自动化");
-  stopLoop();
+  stopLoop("按配置在价格页停止");
   return true;
 }
 
@@ -3840,28 +4082,1476 @@ async function runImmediatePostQueueBurst() {
     if (captchaHandled) return;
 
     const stage = detectCurrentStage();
-    if (stage === "seat") {
-      await runSeatStep();
-    } else if (stage === "price") {
-      await maybeNotifyEnteredPrice();
-      if (await stopAtPriceByConfigIfNeeded()) return;
-      state.priceLockedSlow = true;
-      setTickMode("normal");
-      await runPriceStep();
-      return;
-    } else if (stage === "info") {
-      state.priceLockedSlow = true;
-      setTickMode("normal");
-      await runInfoStep();
-      return;
-    } else if (stage === "date") {
-      await runDateStep();
-    }
+    const done = await runBookingStageByType(stage, {
+      updateLastStage: false,
+      notifyPriceEntered: true,
+      enablePriceStopByConfig: true,
+      enableUnknownReserveClick: false
+    });
+    if (done) return;
     await sleep(60);
   }
 }
 
+function clearQueueRuntimeState() {
+  state.queueActive = false;
+  state.queueNextKeepAliveAt = 0;
+  state.queueKeepAliveCount = 0;
+  state.queueLastRemaining = null;
+  state.queueHealth.consecutiveFail = 0;
+  state.queueHealth.alertActive = false;
+}
+
+async function runBookingStageByType(stage, options = {}) {
+  const {
+    updateLastStage = true,
+    notifyPriceEntered = false,
+    enablePriceStopByConfig = false,
+    enableUnknownReserveClick = true
+  } = options;
+
+  if (stage === "seat") {
+    if (updateLastStage) state.lastStage = "seat";
+    if (!state.priceLockedSlow) setTickMode("fast");
+    await runSeatStep();
+    return false;
+  }
+
+  if (stage === "price") {
+    if (notifyPriceEntered || state.lastStage !== "price") {
+      await maybeNotifyEnteredPrice();
+    }
+    if (updateLastStage) state.lastStage = "price";
+    if (enablePriceStopByConfig && (await stopAtPriceByConfigIfNeeded())) return true;
+    if (!state.priceLockedSlow) {
+      state.priceLockedSlow = true;
+      setTickMode("normal");
+    }
+    await runPriceStep();
+    return true;
+  }
+
+  if (stage === "info") {
+    if (updateLastStage) state.lastStage = "info";
+    if (!state.priceLockedSlow) {
+      state.priceLockedSlow = true;
+      setTickMode("normal");
+    }
+    await runInfoStep();
+    return true;
+  }
+
+  if (stage === "date") {
+    if (updateLastStage) state.lastStage = "date";
+    if (!state.priceLockedSlow) setTickMode("fast");
+    await runDateStep();
+    return false;
+  }
+
+  if (updateLastStage) state.lastStage = "unknown";
+  if (enableUnknownReserveClick && clickReserveEntryAggressive()) {
+    log("未知阶段命中预约入口，已点击 预约");
+    await sleep(180);
+    return true;
+  }
+  log("未命中页面阶段，等待下一轮识别");
+  return false;
+}
+
+async function runNewInterparkTick() {
+  if (isQueuePage()) {
+    state.lastStage = "queue";
+    if (!state.priceLockedSlow) setTickMode("fast");
+    if (!state.queueActive) {
+      state.queueActive = true;
+      state.queueKeepAliveCount = 0;
+      state.queueLastRemaining = null;
+      scheduleNextQueueKeepAlive(true);
+      if (state.firstBuyNowClickAt) {
+        const cost = Date.now() - state.firstBuyNowClickAt;
+        log(`检测到排队页，进入等待(点击到入队 ${cost}ms)`);
+      } else {
+        log("检测到排队页，进入等待");
+      }
+      state.queueHealth.lastProbeAt = 0;
+      state.queueHealth.consecutiveFail = 0;
+      state.queueHealth.lastSuccessAt = Date.now();
+      state.queueHealth.alertActive = false;
+      state.queueHealth.lastAlertAt = 0;
+    }
+    if (state.queueNextKeepAliveAt && Date.now() >= state.queueNextKeepAliveAt) {
+      runQueueKeepAliveAction();
+      scheduleNextQueueKeepAlive(false);
+    }
+    await runQueueHealthGuard();
+    await maybeNotifyQueueThresholds();
+    if (Date.now() - state.queueLastLogAt > 5000) {
+      log("排队中，等待放行...");
+      state.queueLastLogAt = Date.now();
+    }
+    return;
+  }
+
+  if (state.queueActive) {
+    clearQueueRuntimeState();
+    if (!state.priceLockedSlow) setTickMode("critical");
+    log("排队已放行，立即开始点击选取");
+    await runImmediatePostQueueBurst();
+    return;
+  }
+
+  const captchaHandled = await runCaptchaStep();
+  if (captchaHandled) {
+    if (!state.priceLockedSlow) setTickMode("fast");
+    await sleep(260);
+    return;
+  }
+  const stage = detectCurrentStage();
+  await runBookingStageByType(stage, {
+    updateLastStage: true,
+    notifyPriceEntered: false,
+    enablePriceStopByConfig: true,
+    enableUnknownReserveClick: true
+  });
+}
+
+function getLegacyBookFrameDocument() {
+  const frame = document.querySelector("iframe#ifrmBookStep");
+  if (!frame) return null;
+  try {
+    return frame.contentDocument || frame.contentWindow?.document || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function getLegacyCandidateDocs(frameDoc) {
+  if (!frameDoc) return [];
+  const docs = [frameDoc];
+  const innerFrames = Array.from(frameDoc.querySelectorAll("iframe, frame"));
+  for (const fr of innerFrames) {
+    try {
+      const doc = fr.contentDocument || fr.contentWindow?.document || null;
+      if (doc) docs.push(doc);
+    } catch (_) {}
+  }
+  return docs;
+}
+
+function getLegacyHandlerCode(el) {
+  if (!el) return "";
+  const raw = getLegacyRawHandlerSnippets(el).join(" ");
+  return normalizeText(
+    [
+      raw,
+      el.id,
+      el.className?.toString()
+    ]
+      .filter(Boolean)
+      .join(" ")
+  );
+}
+
+function getLegacyRawHandlerSnippets(el) {
+  if (!el) return [];
+  return [
+    el.getAttribute?.("href"),
+    el.getAttribute?.("onclick"),
+    el.getAttribute?.("onmouseup"),
+    el.getAttribute?.("onmousedown"),
+    el.getAttribute?.("onchange")
+  ]
+    .map((x) => String(x || "").trim())
+    .filter(Boolean);
+}
+
+function runLegacyHandlerScript(el, keywords = []) {
+  if (!isDomElement(el)) return false;
+  const view = el.ownerDocument?.defaultView;
+  if (!view) return false;
+  const checks = Array.isArray(keywords)
+    ? keywords.map((x) => normalizeText(String(x || ""))).filter(Boolean)
+    : [];
+  const snippets = getLegacyRawHandlerSnippets(el);
+  for (const raw of snippets) {
+    const bag = normalizeText(raw);
+    if (checks.length && !checks.some((k) => bag.includes(k))) continue;
+    let code = String(raw || "").trim();
+    code = code.replace(/^javascript:\s*/i, "");
+    if (!code) continue;
+    code = code.replace(/\breturn\s+false\b\s*;?/gi, "");
+    if (!code.trim()) continue;
+    try {
+      const fn = view.Function(code);
+      fn.call(el);
+      return true;
+    } catch (_) {
+      try {
+        view.eval(code);
+        return true;
+      } catch (_) {}
+    }
+  }
+  return false;
+}
+
+function extractLegacyDayFromHandler(code) {
+  const raw = String(code || "");
+  if (!raw) return null;
+  const yyyymmdd = raw.match(/(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])/);
+  if (yyyymmdd) {
+    const day = Number(yyyymmdd[3]);
+    if (Number.isFinite(day) && day >= 1 && day <= 31) return day;
+  }
+  return null;
+}
+
+function extractLegacyTimeTextFromHandler(code) {
+  const raw = String(code || "");
+  if (!raw) return "";
+  const hhmm = raw.match(/\b([01]?\d|2[0-3])[:.]?([0-5]\d)\b/);
+  if (!hhmm) return "";
+  const hh = String(Number(hhmm[1])).padStart(2, "0");
+  const mm = String(Number(hhmm[2])).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+function getLegacyActiveStepNumber() {
+  const imgs = Array.from(document.querySelectorAll(".step img"));
+  for (const img of imgs) {
+    const src = String(img.getAttribute("src") || "");
+    const m = src.match(/step_0?(\d+)_on/i);
+    if (m) return Number(m[1]);
+  }
+  return null;
+}
+
+function getLegacyDateMonthParts(frameDoc) {
+  if (!frameDoc) return null;
+  const nodes = Array.from(frameDoc.querySelectorAll("strong, b, h3, h4, div, p, span"));
+  for (const el of nodes) {
+    const text = String(el.textContent || "").trim();
+    const m = text.match(/(20\d{2})\s*[/.-]\s*(1[0-2]|0?[1-9])/);
+    if (m) {
+      const year = Number(m[1]);
+      const month = Number(m[2]);
+      if (Number.isFinite(year) && Number.isFinite(month)) return { year, month };
+    }
+  }
+  return null;
+}
+
+function clickLegacyMonthNav(frameDoc, direction = 1) {
+  if (!frameDoc) return false;
+  const words = direction > 0 ? ["next", "다음", "下个月", ">", "＞", "›", "»"] : ["prev", "previous", "이전", "上个月", "<", "＜", "‹", "«"];
+  const nodes = Array.from(
+    frameDoc.querySelectorAll("a, button, span, div, td")
+  ).filter((el) => visible(el));
+
+  const cands = nodes
+    .map((el) => {
+      const text = normalizeText(
+        [
+          el.textContent,
+          el.getAttribute("title"),
+          el.getAttribute("aria-label"),
+          el.className?.toString(),
+          el.id
+        ]
+          .filter(Boolean)
+          .join(" ")
+      );
+      if (!words.some((w) => text.includes(normalizeText(w)))) return null;
+      const r = el.getBoundingClientRect();
+      if (r.width > 120 || r.height > 120) return null;
+      return { el, score: r.top < 260 ? 4 : 1 };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+
+  const target = cands[0]?.el;
+  if (!target) return false;
+  forceClick(target);
+  clickAtCenter(target);
+  clickElement(target);
+  return true;
+}
+
+function getLegacyDayCandidates(frameDoc) {
+  if (!frameDoc) return [];
+  const docs = getLegacyCandidateDocs(frameDoc);
+  const fnOut = [];
+  const textOut = [];
+
+  for (const doc of docs) {
+    // 旧版常见：点击事件挂在 fnSelectPlayDate(...) 上，优先走函数特征。
+    const eventNodes = Array.from(
+      doc.querySelectorAll(
+        "a[href*='fnSelectPlayDate'], a[onclick*='fnSelectPlayDate'], [onclick*='fnSelectPlayDate'], [href*='SelectPlayDate']"
+      )
+    );
+    for (const el of eventNodes) {
+      if (!isDomElement(el)) continue;
+      const code = getLegacyHandlerCode(el);
+      const text = String(el.textContent || "").trim();
+      const textDay = /^\d{1,2}$/.test(text) ? Number(text) : null;
+      const codeDay = extractLegacyDayFromHandler(code);
+      const day = Number.isFinite(textDay) ? textDay : codeDay;
+      if (!Number.isFinite(day) || day < 1 || day > 31) continue;
+      const classBag = normalizeText(el.className?.toString() || "");
+      const bag = normalizeText(
+        [classBag, el.id, el.getAttribute("aria-disabled"), el.getAttribute("style"), el.getAttribute("title")]
+          .filter(Boolean)
+          .join(" ")
+      );
+      if (
+        el.disabled ||
+        bag.includes("disabled") ||
+        bag.includes("unavailable") ||
+        bag.includes("sold")
+      ) {
+        continue;
+      }
+      const r = el.getBoundingClientRect();
+      const selected =
+        classBag.includes("selected") ||
+        classBag.includes("choice") ||
+        classBag.includes("active") ||
+        classBag.includes("picked") ||
+        classBag.includes("on") ||
+        bag.includes("selected") ||
+        bag.includes("choice") ||
+        el.getAttribute("aria-selected") === "true";
+      fnOut.push({ el, day, selected, top: r.top, left: r.left, from: "fn" });
+    }
+
+    const nodes = Array.from(doc.querySelectorAll("a, button, td, span, div")).filter(visible);
+    for (const el of nodes) {
+      const text = String(el.textContent || "").trim();
+      if (!/^\d{1,2}$/.test(text)) continue;
+      const day = Number(text);
+      if (!Number.isFinite(day) || day < 1 || day > 31) continue;
+      const code = getLegacyHandlerCode(el);
+      const classBag = normalizeText(el.className?.toString() || "");
+      const bag = normalizeText(
+        [classBag, el.id, code, el.getAttribute("aria-disabled"), el.getAttribute("style")]
+          .filter(Boolean)
+          .join(" ")
+      );
+      if (
+        el.disabled ||
+        bag.includes("disabled") ||
+        bag.includes("unavailable") ||
+        bag.includes("sold")
+      ) {
+        continue;
+      }
+      const r = el.getBoundingClientRect();
+      if (r.width < 8 || r.height < 8) continue;
+      const selected =
+        classBag.includes("selected") ||
+        classBag.includes("choice") ||
+        classBag.includes("active") ||
+        classBag.includes("picked") ||
+        classBag.includes("on") ||
+        bag.includes("selected") ||
+        bag.includes("choice") ||
+        el.getAttribute("aria-selected") === "true";
+      textOut.push({ el, day, selected, top: r.top, left: r.left, from: "text" });
+    }
+  }
+
+  const out = fnOut.length ? fnOut : textOut;
+  const byDay = new Map();
+  for (const item of out) {
+    const prev = byDay.get(item.day);
+    if (!prev || (item.selected && !prev.selected)) byDay.set(item.day, item);
+  }
+  return Array.from(byDay.values()).sort((a, b) => a.day - b.day || a.top - b.top || a.left - b.left);
+}
+
+function clickLegacyDayCandidate(candidate) {
+  if (!candidate?.el) return false;
+  runLegacyHandlerScript(candidate.el, ["fnselectplaydate", "selectplaydate"]);
+  forceClick(candidate.el);
+  clickAtCenter(candidate.el);
+  clickElement(candidate.el);
+  state.dateLastDayClickAt = Date.now();
+  log(`旧版已选择日期: ${candidate.day}`);
+  return true;
+}
+
+function getLegacyTimeCandidates(frameDoc) {
+  if (!frameDoc) return [];
+  const docs = getLegacyCandidateDocs(frameDoc);
+  const timePattern = /\b\d{1,2}\s*:\s*\d{2}\s*(?:am|pm)?\b/i;
+  const fnOut = [];
+  const textOut = [];
+
+  for (const doc of docs) {
+    const eventNodes = Array.from(
+      doc.querySelectorAll(
+        "a[href*='fnSelectPlaySeq'], a[onclick*='fnSelectPlaySeq'], [onclick*='fnSelectPlaySeq'], [href*='SelectPlaySeq']"
+      )
+    );
+    for (const el of eventNodes) {
+      if (!isDomElement(el)) continue;
+      const code = getLegacyHandlerCode(el);
+      const textRaw = String(el.textContent || "").trim();
+      const text = timePattern.test(textRaw) ? textRaw : extractLegacyTimeTextFromHandler(code);
+      if (!text || !timePattern.test(text)) continue;
+      const classBag = normalizeText(el.className?.toString() || "");
+      const bag = normalizeText(
+        [classBag, el.id, el.getAttribute("aria-disabled"), el.getAttribute("style"), el.getAttribute("title")]
+          .filter(Boolean)
+          .join(" ")
+      );
+      if (
+        el.disabled ||
+        bag.includes("disabled") ||
+        bag.includes("unavailable") ||
+        bag.includes("sold")
+      ) {
+        continue;
+      }
+      const selected =
+        classBag.includes("selected") ||
+        classBag.includes("choice") ||
+        classBag.includes("active") ||
+        classBag.includes("picked") ||
+        classBag.includes("on") ||
+        bag.includes("selected") ||
+        bag.includes("choice") ||
+        el.getAttribute("aria-selected") === "true";
+      fnOut.push({ el, text, selected, minutes: parseTimeMinutes(text), from: "fn" });
+    }
+
+    const nodes = Array.from(doc.querySelectorAll("a, button, li, td, div, span")).filter(visible);
+    for (const el of nodes) {
+      const text = String(el.textContent || "").trim();
+      if (!timePattern.test(text)) continue;
+      const code = getLegacyHandlerCode(el);
+      const classBag = normalizeText(el.className?.toString() || "");
+      const bag = normalizeText(
+        [classBag, el.id, code, el.getAttribute("aria-disabled"), el.getAttribute("style")]
+          .filter(Boolean)
+          .join(" ")
+      );
+      if (
+        el.disabled ||
+        bag.includes("disabled") ||
+        bag.includes("unavailable") ||
+        bag.includes("sold")
+      ) {
+        continue;
+      }
+      const selected =
+        classBag.includes("selected") ||
+        classBag.includes("choice") ||
+        classBag.includes("active") ||
+        classBag.includes("picked") ||
+        classBag.includes("on") ||
+        bag.includes("selected") ||
+        bag.includes("choice") ||
+        el.getAttribute("aria-selected") === "true";
+      textOut.push({ el, text, selected, minutes: parseTimeMinutes(text), from: "text" });
+    }
+  }
+
+  const out = fnOut.length ? fnOut : textOut;
+  out.sort((a, b) => a.minutes - b.minutes);
+  return out;
+}
+
+function clickLegacyTimeCandidate(candidate) {
+  if (!candidate?.el) return false;
+  runLegacyHandlerScript(candidate.el, ["fnselectplayseq", "selectplayseq"]);
+  forceClick(candidate.el);
+  clickAtCenter(candidate.el);
+  clickElement(candidate.el);
+  state.dateLastSlotClickAt = Date.now();
+  log(`旧版已选择场次: ${candidate.text}`);
+  return true;
+}
+
+function getLegacyBookingFormState() {
+  return {
+    playDate: String(document.querySelector("#PlayDate")?.value || "").trim(),
+    playSeq: String(document.querySelector("#PlaySeq")?.value || "").trim(),
+    playTime: String(document.querySelector("#PlayTime")?.value || "").trim(),
+    myPlayDate: String(document.querySelector("#MyPlayDate")?.textContent || "").trim(),
+    myCancelableDate: String(document.querySelector("#MyCancelableDate")?.textContent || "").trim()
+  };
+}
+
+function isLegacyMyPlayDateReady(stateObj) {
+  const s = stateObj || getLegacyBookingFormState();
+  const myDate = String(s.myPlayDate || "").trim();
+  if (!myDate) return false;
+  const cancelText = normalizeText(s.myCancelableDate || "");
+  if (
+    cancelText.includes("首先") &&
+    (cancelText.includes("选择观赏日期") || cancelText.includes("請選擇觀賞日期"))
+  ) {
+    return false;
+  }
+  return /\d{4}.*\d{1,2}.*\d{1,2}/.test(myDate);
+}
+
+function hasJavascriptHref(el) {
+  const anchor =
+    String(el?.tagName || "").toLowerCase() === "a" ? el : el?.closest?.("a");
+  const href = String(anchor?.getAttribute?.("href") || "").trim();
+  return /^javascript\s*:/i.test(href);
+}
+
+async function runLegacyNextInPageContext(reason = "") {
+  try {
+    const resp = await chrome.runtime.sendMessage({
+      type: "LEGACY_NEXT_MAIN",
+      reason: String(reason || "")
+    });
+    const data = resp?.result || {};
+    if (resp?.ok && data?.ok) {
+      log(
+        `旧版Next主世界触发: fn=${data.fnInvoked ? "Y" : "N"}, target=${data.target || "-"}, step ${data.stepBefore ?? "-"}->${data.stepAfter ?? "-"}, seatSrc=${data.seatSrc || "-"}`
+      );
+      return true;
+    }
+    if (data?.error) {
+      log(`旧版Next主世界触发失败: ${data.error}`);
+    }
+  } catch (_) {}
+
+  const shown = (el) => {
+    if (!isDomElement(el)) return false;
+    try {
+      const s = window.getComputedStyle(el);
+      return s.display !== "none" && s.visibility !== "hidden";
+    } catch (_) {
+      return false;
+    }
+  };
+
+  const largeWrap = document.getElementById("LargeNextBtn");
+  const smallWrap = document.getElementById("SmallNextBtn");
+  const large = document.getElementById("LargeNextBtnLink");
+  const small = document.getElementById("SmallNextBtnLink");
+  const target =
+    (shown(largeWrap) && isDomElement(large) ? large : null) ||
+    (shown(smallWrap) && isDomElement(small) ? small : null) ||
+    (isDomElement(large) ? large : null) ||
+    (isDomElement(small) ? small : null);
+  if (!target) return false;
+
+  if (hasJavascriptHref(target)) {
+    // 避免触发 javascript: URL 导航（会被 CSP 拦截并刷报错）。
+    return false;
+  }
+
+  const anchor =
+    String(target.tagName || "").toLowerCase() === "a" ? target : target.closest?.("a");
+  let hit = false;
+  hit = forceClick(target) || hit;
+  hit = clickAtCenter(target) || hit;
+  hit = clickElement(target) || hit;
+  if (anchor && isDomElement(anchor)) {
+    hit = forceClick(anchor) || hit;
+    hit = clickAtCenter(anchor) || hit;
+    hit = clickElement(anchor) || hit;
+    hit = runLegacyHandlerScript(anchor, ["fnnextstep"]) || hit;
+  }
+  if (hit) {
+    log(`旧版Next兜底点击已触发 (${reason || "direct"})`);
+  }
+  return hit;
+}
+
+async function clickLegacyNextByVisibleArea() {
+  if (await runLegacyNextInPageContext("visible_area")) {
+    state.dateLastNextAt = Date.now();
+    log("旧版日期页已点击 Next (visible-area/main-world)");
+    return true;
+  }
+
+  const root =
+    document.querySelector("#divBookMain .contR .buy_info") ||
+    document.querySelector("#divBookMain") ||
+    document.body;
+  if (!root) return false;
+
+  const words = ["next", "下一步", "다음"];
+  const nodes = Array.from(
+    root.querySelectorAll("a, button, [role='button'], div, span, p, img")
+  ).filter((el) => {
+    if (!visible(el)) return false;
+    if (el.closest("#nol-ticket-bot-log-panel, #nol-ticket-bot-badge")) return false;
+    return true;
+  });
+
+  const candidates = nodes
+    .map((el) => {
+      const text = normalizeText(el.textContent || "");
+      const id = normalizeText(el.id || "");
+      const cls = normalizeText(el.className?.toString() || "");
+      const href = normalizeText(el.getAttribute?.("href") || "");
+      const src = normalizeText(el.getAttribute?.("src") || "");
+      const bag = `${text} ${id} ${cls} ${href} ${src}`;
+
+      const looksLikeNext =
+        bag.includes("largenextbtn") ||
+        bag.includes("smallnextbtn") ||
+        bag.includes("btn_next") ||
+        bag.includes("fnnextstep") ||
+        words.some((w) => text.includes(normalizeText(w)));
+      if (!looksLikeNext) return null;
+      if (
+        bag.includes("smallprevbtn") ||
+        text.includes("prev") ||
+        text.includes("previous") ||
+        text.includes("上一") ||
+        text.includes("이전")
+      ) {
+        return null;
+      }
+
+      const r = el.getBoundingClientRect();
+      let score = 0;
+      if (bag.includes("largenextbtnlink") || bag.includes("smallnextbtnlink")) score += 14;
+      if (bag.includes("largenextbtnimage") || bag.includes("smallnextbtnimage")) score += 12;
+      if (bag.includes("fnnextstep")) score += 10;
+      if (bag.includes("btn_next")) score += 8;
+      if (r.left > window.innerWidth * 0.55) score += 4;
+      if (r.top > window.innerHeight * 0.62) score += 4;
+      if (r.width > 60 && r.height > 20) score += 2;
+      if (text.startsWith("next") || text.startsWith("下一")) score += 2;
+      return { el, score };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+
+  const target = candidates[0]?.el;
+  if (!target || candidates[0].score < 8) return false;
+
+  let actionEl = target;
+  const targetTag = String(target.tagName || "").toLowerCase();
+  if (!["a", "button", "img"].includes(targetTag)) {
+    const inner =
+      target.querySelector?.(
+        "#LargeNextBtnLink, #SmallNextBtnLink, #LargeNextBtnImage, #SmallNextBtnImage, a[href*='fnNextStep']"
+      ) || null;
+    if (inner) actionEl = inner;
+  }
+  const anchor =
+    String(actionEl.tagName || "").toLowerCase() === "a"
+      ? actionEl
+      : actionEl.closest?.("a");
+
+  if (hasJavascriptHref(actionEl) || hasJavascriptHref(anchor)) {
+    return false;
+  }
+
+  forceClick(actionEl);
+  clickAtCenter(actionEl);
+  clickElement(actionEl);
+  if (anchor && anchor !== actionEl) {
+    forceClick(anchor);
+    clickAtCenter(anchor);
+    clickElement(anchor);
+    runLegacyHandlerScript(anchor, ["fnnextstep"]);
+  }
+  await runLegacyNextInPageContext("visible_area_fallback");
+  state.dateLastNextAt = Date.now();
+  log("旧版日期页已点击 Next (visible-area)");
+  return true;
+}
+
+async function clickLegacyNextButton() {
+  if (await runLegacyNextInPageContext("button_entry")) {
+    state.dateLastNextAt = Date.now();
+    log("旧版日期页已点击 Next (main-world)");
+    return true;
+  }
+
+  if (await clickLegacyNextByVisibleArea()) return true;
+
+  const selectors = [
+    "#LargeNextBtnLink",
+    "#LargeNextBtnImage",
+    "#SmallNextBtnLink",
+    "#SmallNextBtnImage",
+    "#LargeNextBtn a",
+    "#SmallNextBtn a",
+    "a[href*=\"fnNextStep('P')\"]",
+    "a[href*=\"fnNextStep\"]"
+  ];
+  for (const selector of selectors) {
+    const node = document.querySelector(selector);
+    if (!isDomElement(node)) continue;
+    const anchor =
+      String(node.tagName || "").toLowerCase() === "img"
+        ? node.closest("a")
+        : String(node.tagName || "").toLowerCase() === "a"
+          ? node
+          : node.closest?.("a");
+    if (anchor && !isDomElement(anchor)) continue;
+
+    const container = (anchor || node).closest?.("#LargeNextBtn, #SmallNextBtn, p.btn");
+    const styleText = normalizeText(container?.getAttribute?.("style") || "");
+    if (styleText.includes("display:none")) continue;
+    if (hasJavascriptHref(node) || hasJavascriptHref(anchor)) continue;
+
+    forceClick(node);
+    clickAtCenter(node);
+    clickElement(node);
+    if (anchor && anchor !== node) {
+      forceClick(anchor);
+      clickAtCenter(anchor);
+      clickElement(anchor);
+    }
+    // 旧版常见是 href="javascript:fnNextStep('P');"，点击后再直接执行一次同源脚本，避免事件链被拦截。
+    if (anchor && runLegacyHandlerScript(anchor, ["fnnextstep"])) {
+      log(`旧版日期页已执行 Next 脚本 (${selector})`);
+    }
+    await runLegacyNextInPageContext(`selector:${selector}`);
+
+    state.dateLastNextAt = Date.now();
+    log(`旧版日期页已点击 Next (${selector})`);
+    return true;
+  }
+  return false;
+}
+
+function getLegacyNextUiState() {
+  const large = document.querySelector("#LargeNextBtn");
+  const small = document.querySelector("#SmallNextBtn");
+  const largeLink = document.querySelector("#LargeNextBtnLink");
+  const smallLink = document.querySelector("#SmallNextBtnLink");
+  const largeImg = document.querySelector("#LargeNextBtnImage");
+  const smallImg = document.querySelector("#SmallNextBtnImage");
+
+  const largeStyle = normalizeText(large?.getAttribute?.("style") || "");
+  const smallStyle = normalizeText(small?.getAttribute?.("style") || "");
+  const largeVisible = Boolean(large && !largeStyle.includes("display:none"));
+  const smallVisible = Boolean(small && !smallStyle.includes("display:none"));
+
+  const largeHref = String(largeLink?.getAttribute?.("href") || "");
+  const smallHref = String(smallLink?.getAttribute?.("href") || "");
+  const largeImgSrc = String(largeImg?.getAttribute?.("src") || "");
+  const smallImgSrc = String(smallImg?.getAttribute?.("src") || "");
+
+  const hasNextHref =
+    largeHref.includes("fnNextStep('P')") ||
+    smallHref.includes("fnNextStep('P')") ||
+    largeHref.includes("fnNextStep") ||
+    smallHref.includes("fnNextStep");
+  const imgOn =
+    /btn_next_on\.gif/i.test(largeImgSrc) ||
+    /btn_next_02\.gif/i.test(smallImgSrc) ||
+    /btn_next\.gif/i.test(largeImgSrc);
+
+  return {
+    largeVisible,
+    smallVisible,
+    largeHref,
+    smallHref,
+    largeImgSrc,
+    smallImgSrc,
+    hasNextHref,
+    imgOn
+  };
+}
+
+function isLegacyNextReady() {
+  const s = getLegacyNextUiState();
+  if (isLegacyNextProcessing()) return false;
+  if (!s.hasNextHref) return false;
+  if (!s.largeVisible && !s.smallVisible) return false;
+  return true;
+}
+
+async function runLegacyNextByScriptFallback() {
+  const before = getLegacyBookingFormState();
+  let hit = false;
+  for (let i = 0; i < 2; i += 1) {
+    hit = (await runLegacyNextInPageContext(`fallback_${i + 1}`)) || hit;
+    await sleep(120);
+  }
+
+  const after = getLegacyBookingFormState();
+  if (hit) {
+    log(
+      `旧版Next兜底诊断: PlayDate ${before.playDate || "-"} -> ${after.playDate || "-"}, PlaySeq ${before.playSeq || "-"} -> ${after.playSeq || "-"}, seatSrc=${String(document.querySelector("#ifrmSeat")?.getAttribute("src") || "-")}`
+    );
+  }
+  return hit;
+}
+
+function isLegacySeatLayerVisible() {
+  const layer = document.querySelector("#divBookSeat");
+  if (!isDomElement(layer)) return false;
+  const styleText = normalizeText(layer.getAttribute("style") || "");
+  if (styleText.includes("display:none")) return false;
+  if (visible(layer)) return true;
+  return false;
+}
+
+function isLegacySeatIframeReady() {
+  const ifrm = document.querySelector("#ifrmSeat");
+  if (!isDomElement(ifrm)) return false;
+  const src = String(ifrm.getAttribute("src") || "").trim();
+  if (!src) return false;
+  if (src === "about:blank") return false;
+  return true;
+}
+
+function isLegacyCertifyLayerVisible() {
+  const layer = document.querySelector("#divBookCertify");
+  if (!isDomElement(layer)) return false;
+  const styleText = normalizeText(layer.getAttribute("style") || "");
+  if (styleText.includes("display:none")) return false;
+  if (visible(layer)) return true;
+  return false;
+}
+
+function isLegacyNextProcessing() {
+  const proc = document.querySelector("#LargeProcBtn");
+  if (isDomElement(proc)) {
+    const styleText = normalizeText(proc.getAttribute("style") || "");
+    if (!styleText.includes("display:none")) return true;
+  }
+  return false;
+}
+
+async function waitLegacyNextTransition(timeoutMs = 8000, intervalMs = 250) {
+  const startedAt = Date.now();
+  let seenProcessing = false;
+  let processingSince = 0;
+  while (Date.now() - startedAt < timeoutMs) {
+    if (isLegacySeatLayerVisible() || isLegacySeatIframeReady()) return "seat";
+    if (isLegacyCertifyLayerVisible()) return "certify";
+    if (isLegacyNextProcessing()) {
+      if (!seenProcessing) {
+        seenProcessing = true;
+        processingSince = Date.now();
+      }
+      await sleep(intervalMs);
+      continue;
+    }
+    if (seenProcessing) {
+      // 出现过 processing 且刚消失，通常是即将切层，给额外窗口避免误判失败。
+      if (Date.now() - processingSince < 9000) {
+        await sleep(intervalMs);
+        continue;
+      }
+    }
+    await sleep(intervalMs);
+  }
+  return seenProcessing ? "processing_timeout" : "timeout";
+}
+
+function tryLegacyHeaderDateSelectFallback() {
+  const sel = document.querySelector("#SelPlayDate");
+  if (!sel || !isDomElement(sel)) return false;
+  const options = Array.from(sel.querySelectorAll("option"));
+  if (!options.length) return false;
+
+  const current = String(sel.value || "");
+  const curIdx = options.findIndex((o) => String(o.value || "") === current);
+  const nextIdx = options.length > 1 ? ((curIdx >= 0 ? curIdx : -1) + 1) % options.length : 0;
+  const target = options[nextIdx];
+  if (!target) return false;
+
+  sel.value = String(target.value || "");
+  sel.dispatchEvent(new Event("change", { bubbles: true }));
+  state.dateLastDayClickAt = Date.now();
+  log(`旧版日期兜底: 通过 SelPlayDate 切换到 ${target.value || target.textContent || ""}`);
+  return true;
+}
+
+function isLegacyDateStepLikely(frameDoc) {
+  if (!frameDoc) return false;
+  const text = normalizeText(frameDoc.body?.innerText || "");
+  if (text.includes("select date") || text.includes("选择日期") || text.includes("請選擇觀賞日期")) {
+    return true;
+  }
+  const docs = getLegacyCandidateDocs(frameDoc);
+  const dateFnCount = docs.reduce(
+    (acc, doc) =>
+      acc +
+      doc.querySelectorAll(
+        "a[href*='fnSelectPlayDate'], a[onclick*='fnSelectPlayDate'], [onclick*='fnSelectPlayDate'], [href*='SelectPlayDate']"
+      ).length,
+    0
+  );
+  return dateFnCount > 0;
+}
+
+async function runLegacyDateStep() {
+  if (isLegacySeatLayerVisible() || isLegacySeatIframeReady()) return;
+  if (isLegacyCertifyLayerVisible()) {
+    if (Date.now() - state.queueLastLogAt > 4000) {
+      log("旧版检测到认证层(divBookCertify)，请先手动完成认证");
+      state.queueLastLogAt = Date.now();
+    }
+    return;
+  }
+  if (isLegacyNextProcessing()) return;
+  if (state.legacyNextPendingUntil && Date.now() < state.legacyNextPendingUntil) {
+    return;
+  }
+  if (state.legacyNextPendingUntil && Date.now() >= state.legacyNextPendingUntil) {
+    state.legacyNextPendingUntil = 0;
+  }
+  if (state.dateLastNextAt && Date.now() - state.dateLastNextAt < 1500) {
+    // Next 后给页面内部状态流转留窗口，避免高频重点日期/场次把流程打断。
+    return;
+  }
+
+  const frameDoc = getLegacyBookFrameDocument();
+  if (!frameDoc) {
+    if (Date.now() - state.queueLastLogAt > 5000) {
+      log("旧版日期页: ifrmBookStep 未就绪，等待加载");
+      state.queueLastLogAt = Date.now();
+    }
+    return;
+  }
+
+  const monthRaw = String(state.config.dateMonth || "").trim();
+  const dayRaw = String(state.config.dateDay || "").trim();
+  const timeRaw = String(state.config.dateTime || "").trim();
+
+  if (monthRaw) {
+    const targetMonth = Number(monthRaw.match(/\d+/)?.[0]);
+    const displayed = getLegacyDateMonthParts(frameDoc);
+    if (Number.isFinite(targetMonth) && displayed?.month && displayed.month !== targetMonth) {
+      const direction = targetMonth > displayed.month ? 1 : -1;
+      if (Date.now() - state.dateLastDayClickAt > 700 && clickLegacyMonthNav(frameDoc, direction)) {
+        log(`旧版日期页切换月份: ${displayed.month} -> ${targetMonth}`);
+        state.dateLastDayClickAt = Date.now();
+      }
+      return;
+    }
+  }
+
+  const dayCandidates = getLegacyDayCandidates(frameDoc);
+  if (!dayCandidates.length) {
+    if (Date.now() - state.dateLastDayClickAt > 1200 && tryLegacyHeaderDateSelectFallback()) {
+      return;
+    }
+    const docs = getLegacyCandidateDocs(frameDoc);
+    const hitByFn = docs.reduce(
+      (acc, doc) =>
+        acc +
+        doc.querySelectorAll(
+          "a[href*='fnSelectPlayDate'], a[onclick*='fnSelectPlayDate'], [onclick*='fnSelectPlayDate'], [href*='SelectPlayDate']"
+        ).length,
+      0
+    );
+    log(`旧版日期页未找到可选日期，等待下一轮 (fnSelectPlayDate节点=${hitByFn})`);
+    return;
+  }
+
+  let bookingState = getLegacyBookingFormState();
+  const panelReady = isLegacyMyPlayDateReady(bookingState);
+
+  let dayDone = false;
+  if (panelReady && !dayRaw && !timeRaw) {
+    dayDone = true;
+  } else if (dayRaw) {
+    const targetDay = Number(dayRaw);
+    const target = dayCandidates.find((x) => x.day === targetDay);
+    if (target) {
+      dayDone = target.selected || clickLegacyDayCandidate(target);
+    } else {
+      log(`旧版日期页未命中配置日期: ${dayRaw}`);
+      return;
+    }
+  } else {
+    const selected = dayCandidates.find((x) => x.selected);
+    if (selected) {
+      dayDone = true;
+    } else if (Date.now() - state.dateLastDayClickAt > 600) {
+      dayDone = clickLegacyDayCandidate(dayCandidates[0]);
+    }
+  }
+  if (!dayDone) return;
+
+  await sleep(120);
+
+  const timeCandidates = getLegacyTimeCandidates(frameDoc);
+  if (!timeCandidates.length) {
+    if (panelReady) {
+      // 右侧已显示完整日期时间时，场次列表可能被折叠/异步隐藏，可直接进入下一步。
+      bookingState = getLegacyBookingFormState();
+    } else {
+    if (Date.now() - state.dateLastDayClickAt > 700 && dayCandidates.length) {
+      const selected = dayCandidates.find((x) => x.selected);
+      let fallback = selected || dayCandidates[0];
+      if (!dayRaw && dayCandidates.length > 1) {
+        const idx = selected ? dayCandidates.findIndex((x) => x.day === selected.day) : -1;
+        if (idx >= 0) {
+          fallback = dayCandidates[(idx + 1) % dayCandidates.length] || fallback;
+        }
+      }
+      clickLegacyDayCandidate(fallback);
+      log(`旧版日期页未发现场次，重触发日期点击: ${fallback.day}`);
+      return;
+    }
+    log("旧版日期页当前日期无可选场次，等待下一轮");
+    return;
+    }
+  }
+
+  let timeDone = false;
+  if (panelReady && !timeRaw) {
+    timeDone = true;
+  } else if (timeRaw) {
+    const targetToken = normalizeTimeToken(timeRaw);
+    const target = timeCandidates.find((x) => normalizeTimeToken(x.text).includes(targetToken));
+    if (target) {
+      timeDone = target.selected || clickLegacyTimeCandidate(target);
+    } else {
+      log(`旧版日期页未命中配置场次: ${timeRaw}`);
+      return;
+    }
+  } else {
+    const selected = timeCandidates.find((x) => x.selected);
+    if (selected) {
+      timeDone = true;
+    } else if (Date.now() - state.dateLastSlotClickAt > 700) {
+      timeDone = clickLegacyTimeCandidate(timeCandidates[0]);
+    }
+  }
+  if (!timeDone) return;
+
+  bookingState = getLegacyBookingFormState();
+  if (!bookingState.playDate || !bookingState.playSeq) {
+    const selectedDay = dayCandidates.find((x) => x.selected) || dayCandidates[0];
+    const selectedTime = timeCandidates.find((x) => x.selected) || timeCandidates[0];
+    runLegacyHandlerScript(selectedDay?.el, ["fnselectplaydate", "selectplaydate"]);
+    await sleep(90);
+    runLegacyHandlerScript(selectedTime?.el, ["fnselectplayseq", "selectplayseq"]);
+    await sleep(140);
+    bookingState = getLegacyBookingFormState();
+    if (!bookingState.playDate || !bookingState.playSeq) {
+      log(
+        `旧版日期状态未就绪: PlayDate=${bookingState.playDate || "-"}, PlaySeq=${bookingState.playSeq || "-"}, PlayTime=${bookingState.playTime || "-"}`
+      );
+      return;
+    }
+    log(
+      `旧版日期状态已就绪: PlayDate=${bookingState.playDate}, PlaySeq=${bookingState.playSeq}, PlayTime=${bookingState.playTime || "-"}`
+    );
+  }
+  if (Date.now() - state.lastInfoStepAt > 2000) {
+    log(
+      `旧版日期状态检查: PlayDate=${bookingState.playDate || "-"}, PlaySeq=${bookingState.playSeq || "-"}, PlayTime=${bookingState.playTime || "-"}, MyPlayDate=${bookingState.myPlayDate || "-"}`
+    );
+    state.lastInfoStepAt = Date.now();
+  }
+
+  if (!isLegacyNextReady()) {
+    const now = Date.now();
+    if (now - state.legacyNextWaitLogAt > 1200) {
+      const s = getLegacyNextUiState();
+      log(
+        `旧版日期页等待 Next 激活: large=${s.largeVisible ? "Y" : "N"}, small=${s.smallVisible ? "Y" : "N"}, href=${s.hasNextHref ? "Y" : "N"}, processing=${isLegacyNextProcessing() ? "Y" : "N"}`
+      );
+      state.legacyNextWaitLogAt = now;
+    }
+    return;
+  }
+
+  if (Date.now() - state.dateLastNextAt < 500) return;
+  if (!(await clickLegacyNextButton())) return;
+  state.legacyNextPendingUntil = Date.now() + 12000;
+  const firstTransition = await waitLegacyNextTransition(14000, 250);
+  if (firstTransition === "seat") {
+    log("旧版Next后已进入座位层");
+    return;
+  }
+  if (firstTransition === "certify") {
+    log("旧版Next后触发认证层，请先手动完成认证");
+    return;
+  }
+  if (firstTransition === "processing_timeout") {
+    state.legacyNextPendingUntil = Date.now() + 10000;
+    log("旧版Next后仍在加载态，继续等待，不触发兜底");
+    return;
+  }
+
+  if (getLegacyActiveStepNumber() === 1 && (await runLegacyNextByScriptFallback())) {
+    log("旧版日期页 Next 点击后仍在 step1，已触发 CSP-safe 兜底点击");
+    const secondTransition = await waitLegacyNextTransition(12000, 250);
+    if (secondTransition === "seat") {
+      log("旧版兜底后已进入座位层");
+      return;
+    }
+    if (secondTransition === "certify") {
+      log("旧版兜底后触发认证层，请先手动完成认证");
+      return;
+    }
+    if (secondTransition === "processing_timeout") {
+      state.legacyNextPendingUntil = Date.now() + 10000;
+      log("旧版兜底后仍在加载态，继续等待");
+      return;
+    }
+    state.legacyNextPendingUntil = Date.now() + 8000;
+    log("旧版兜底后仍未进入下一步，等待下轮重试");
+  }
+}
+
+function resetLegacySeatRuntime() {
+  state.legacySeatFlowKey = "";
+  state.legacySeatAreaIndex = 0;
+  state.legacySeatCurrentAreaCode = "";
+  state.legacySeatLastAreaSwitchAt = 0;
+  state.legacySeatLastSeatClickAt = 0;
+  state.legacySeatLastNextAt = 0;
+  state.legacySeatSelectedAssumed = 0;
+  state.legacySeatClickedKeys = [];
+  state.legacySeatNoSeatCycles = 0;
+  state.legacySeatLastLogAt = 0;
+}
+
+function getLegacySeatFrameDocument() {
+  const frame = document.querySelector("iframe#ifrmSeat");
+  if (!frame) return null;
+  try {
+    return frame.contentDocument || frame.contentWindow?.document || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function getLegacySeatSearchDocuments(preferredDoc = null) {
+  const out = [];
+  const seen = new Set();
+  const push = (doc) => {
+    if (!doc || seen.has(doc)) return;
+    seen.add(doc);
+    out.push(doc);
+  };
+
+  const walkFrames = (doc, depth = 0, maxDepth = 1) => {
+    if (!doc || depth > maxDepth) return;
+    push(doc);
+    if (depth === maxDepth) return;
+    const frames = Array.from(doc.querySelectorAll("iframe, frame"));
+    for (const fr of frames) {
+      try {
+        const sub = fr.contentDocument || fr.contentWindow?.document || null;
+        if (sub) walkFrames(sub, depth + 1, maxDepth);
+      } catch (_) {}
+    }
+  };
+
+  const seatDoc = getLegacySeatFrameDocument();
+  if (seatDoc) walkFrames(seatDoc, 0, 1);
+  if (preferredDoc) walkFrames(preferredDoc, 0, 1);
+  walkFrames(document, 0, 1);
+  return out;
+}
+
+function extractLegacySeatAreaCode(raw) {
+  const text = String(raw || "");
+  if (!text) return "";
+  const byFn = text.match(/fnblockseatupdate\s*\(\s*'[^']*'\s*,\s*'[^']*'\s*,\s*'([^']+)'\s*\)/i);
+  if (byFn?.[1]) return String(byFn[1]).trim();
+  const lastQuoted = Array.from(text.matchAll(/'([^']+)'/g)).map((m) => String(m[1] || "").trim());
+  if (!lastQuoted.length) return "";
+  return lastQuoted[lastQuoted.length - 1] || "";
+}
+
+function collectLegacySeatAreaCandidates() {
+  const docs = getLegacySeatSearchDocuments();
+  const out = [];
+  const seen = new Set();
+  for (const doc of docs) {
+    const nodes = Array.from(
+      doc.querySelectorAll(
+        "a[href*='fnBlockSeatUpdate'], a[onclick*='fnBlockSeatUpdate'], [onclick*='fnBlockSeatUpdate']"
+      )
+    );
+    for (const el of nodes) {
+      if (!isDomElement(el)) continue;
+      const code = extractLegacySeatAreaCode(getLegacyHandlerCode(el));
+      const label = String(el.textContent || "").replace(/\s+/g, " ").trim();
+      const key = code || label;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push({ el, code, label: label || code || "-" });
+    }
+  }
+  return out;
+}
+
+function hasLegacySeatClickedKey(key) {
+  return state.legacySeatClickedKeys.includes(String(key || ""));
+}
+
+function rememberLegacySeatClickedKey(key) {
+  const k = String(key || "").trim();
+  if (!k || hasLegacySeatClickedKey(k)) return;
+  state.legacySeatClickedKeys.push(k);
+  if (state.legacySeatClickedKeys.length > 800) {
+    state.legacySeatClickedKeys = state.legacySeatClickedKeys.slice(-500);
+  }
+}
+
+function isLegacySeatSpanAvailable(el) {
+  if (!isDomElement(el) || !visibleForSeat(el)) return false;
+  const tag = String(el.tagName || "").toLowerCase();
+  if (tag !== "span") return false;
+  const cls = normalizeText(el.className || "");
+  const value = normalizeText(el.getAttribute("value") || "");
+  const handler = getLegacyHandlerCode(el);
+  const hasSelectSeatHandler = handler.includes("selectseat");
+  if (cls.includes("seatr") || cls.includes("seatb") || cls.includes("sold")) return false;
+  if (cls.includes("seatn")) return hasSelectSeatHandler || value === "n";
+  if (!hasSelectSeatHandler) return false;
+  if (value && value !== "n") return false;
+  return true;
+}
+
+function isLegacySeatSpanSelected(el) {
+  if (!isDomElement(el) || !visibleForSeat(el)) return false;
+  const cls = normalizeText(el.className || "");
+  if (!cls.includes("seat")) return false;
+  if (cls.includes("seatn") || cls.includes("seatr") || cls.includes("seatb")) return false;
+  return true;
+}
+
+function getLegacySeatKey(el) {
+  if (!isDomElement(el)) return "";
+  const rect = el.getBoundingClientRect();
+  const title = String(el.getAttribute("title") || "").trim();
+  const code = extractLegacySeatAreaCode(getLegacyHandlerCode(el));
+  const token = title || String(el.getAttribute("onclick") || "").trim();
+  return `${code || "-"}|${token || "-"}|${Math.round(rect.left)}:${Math.round(rect.top)}`;
+}
+
+function getLegacySelectedSeatCount() {
+  let textCount = 0;
+  const docs = getLegacySeatSearchDocuments();
+  const patterns = [
+    /선택\s*좌석\s*[:：]?\s*(\d+)/i,
+    /selected\s*seats?\s*[:：]?\s*(\d+)/i,
+    /선택\s*(\d+)\s*매/i
+  ];
+  for (const doc of docs) {
+    const text = String(doc.body?.innerText || "").replace(/\u00a0/g, " ");
+    for (const re of patterns) {
+      const m = text.match(re);
+      if (!m) continue;
+      const n = Number(String(m[1] || "").replace(/,/g, ""));
+      if (Number.isFinite(n) && n >= 0) {
+        textCount = Math.max(textCount, n);
+      }
+    }
+  }
+
+  const seatNodes = docs.flatMap((doc) => Array.from(doc.querySelectorAll("span#Seats, span[name='Seats']")));
+  const domSelected = seatNodes.filter((el) => isLegacySeatSpanSelected(el)).length;
+  return Math.max(textCount, domSelected, Number(state.legacySeatSelectedAssumed) || 0);
+}
+
+function getLegacyAvailableSeatCandidates(preferredDoc = null) {
+  const docs = getLegacySeatSearchDocuments(preferredDoc);
+  const out = [];
+  for (const doc of docs) {
+    const view = doc.defaultView || window;
+    const centerX = Math.max(240, view.innerWidth || window.innerWidth || 1024) / 2;
+    const nodes = Array.from(doc.querySelectorAll("span#Seats, span[name='Seats'], span[class*='Seat']"));
+    for (const el of nodes) {
+      if (!isLegacySeatSpanAvailable(el)) continue;
+      const key = getLegacySeatKey(el);
+      if (!key) continue;
+      const rect = el.getBoundingClientRect();
+      out.push({
+        el,
+        key,
+        rect,
+        centerDist: Math.abs(rect.left + rect.width / 2 - centerX)
+      });
+    }
+  }
+
+  out.sort((a, b) => {
+    if (Math.abs(a.rect.top - b.rect.top) > 1) return a.rect.top - b.rect.top;
+    if (Math.abs(a.centerDist - b.centerDist) > 1) return a.centerDist - b.centerDist;
+    return a.rect.left - b.rect.left;
+  });
+  return out;
+}
+
+async function switchLegacySeatArea(area) {
+  if (!area?.el) return false;
+  const now = Date.now();
+  if (now - state.legacySeatLastAreaSwitchAt < 220 && state.legacySeatCurrentAreaCode === area.code) {
+    return true;
+  }
+
+  let hit = runLegacyHandlerScript(area.el, ["fnblockseatupdate", "blockseatupdate"]);
+  const anchor = String(area.el.tagName || "").toLowerCase() === "a" ? area.el : area.el.closest?.("a");
+  if (!hit && anchor) {
+    hit = runLegacyHandlerScript(anchor, ["fnblockseatupdate", "blockseatupdate"]);
+  }
+  if (!hit && !hasJavascriptHref(area.el)) {
+    hit = forceClick(area.el) || clickAtCenter(area.el) || clickElement(area.el);
+  }
+  if (!hit && anchor && !hasJavascriptHref(anchor)) {
+    hit = forceClick(anchor) || clickAtCenter(anchor) || clickElement(anchor);
+  }
+  if (!hit) return false;
+
+  state.legacySeatCurrentAreaCode = area.code || "";
+  state.legacySeatLastAreaSwitchAt = now;
+  log(`旧版选座切换区域: ${area.label}${area.code ? `(${area.code})` : ""}`);
+  return true;
+}
+
+async function clickLegacySeatCandidate(candidate, target) {
+  const seat = candidate?.el;
+  if (!seat) return false;
+  const key = candidate.key || getLegacySeatKey(seat);
+  if (key) rememberLegacySeatClickedKey(key);
+
+  const before = getLegacySelectedSeatCount();
+  runLegacyHandlerScript(seat, ["selectseat"]);
+  forceClick(seat);
+  clickAtCenter(seat);
+  clickElement(seat);
+  await sleep(140);
+
+  const after = getLegacySelectedSeatCount();
+  const stillAvailable = isLegacySeatSpanAvailable(seat);
+  const success = after > before || !stillAvailable;
+  if (success) {
+    if (after > state.legacySeatSelectedAssumed) {
+      state.legacySeatSelectedAssumed = after;
+    } else {
+      state.legacySeatSelectedAssumed = Math.min(target, Math.max(before + 1, state.legacySeatSelectedAssumed));
+    }
+    log(`旧版选座进度: ${Math.min(target, getLegacySelectedSeatCount())}/${target}`);
+  }
+  return success;
+}
+
+async function runLegacySeatStep() {
+  const flowKey = `${location.host}${location.pathname}${location.search}|${String(document.querySelector("#ifrmSeat")?.getAttribute("src") || "")}`;
+  if (state.legacySeatFlowKey !== flowKey) {
+    resetLegacySeatRuntime();
+    state.legacySeatFlowKey = flowKey;
+  }
+
+  const seatDoc = getLegacySeatFrameDocument();
+  if (!seatDoc) {
+    if (Date.now() - state.legacySeatLastLogAt > 2500) {
+      log("旧版选座: ifrmSeat 文档未就绪，等待加载");
+      state.legacySeatLastLogAt = Date.now();
+    }
+    return;
+  }
+
+  const target = normalizeQuantity(state.config.quantity, 1);
+  const selected = getLegacySelectedSeatCount();
+  if (selected >= target) {
+    if (Date.now() - state.legacySeatLastNextAt < 900) return;
+    if (await clickLegacyNextButton()) {
+      state.legacySeatLastNextAt = Date.now();
+      log(`旧版座位已满足目标(${selected}/${target})，尝试进入下一步`);
+    }
+    return;
+  }
+
+  const areas = collectLegacySeatAreaCandidates();
+  if (areas.length) {
+    if (state.legacySeatAreaIndex >= areas.length) state.legacySeatAreaIndex = 0;
+    const currentArea = areas[state.legacySeatAreaIndex];
+    if (!state.legacySeatCurrentAreaCode) {
+      if (await switchLegacySeatArea(currentArea)) {
+        await sleep(150);
+      }
+    }
+  }
+
+  if (Date.now() - state.legacySeatLastAreaSwitchAt < 180) return;
+  const candidates = getLegacyAvailableSeatCandidates(seatDoc);
+  const untried = candidates.filter((x) => !hasLegacySeatClickedKey(x.key));
+
+  if (!untried.length) {
+    if (areas.length > 1 && Date.now() - state.legacySeatLastAreaSwitchAt > 260) {
+      state.legacySeatAreaIndex = (state.legacySeatAreaIndex + 1) % areas.length;
+      if (state.legacySeatAreaIndex === 0) {
+        state.legacySeatNoSeatCycles += 1;
+        if (state.legacySeatNoSeatCycles % 2 === 0) {
+          state.legacySeatClickedKeys = [];
+        }
+      }
+      const nextArea = areas[state.legacySeatAreaIndex];
+      await switchLegacySeatArea(nextArea);
+      return;
+    }
+    if (Date.now() - state.legacySeatLastLogAt > 2400) {
+      log(
+        `旧版选座: 当前区域暂无可选 SeatN，已轮询圈数=${state.legacySeatNoSeatCycles}`
+      );
+      state.legacySeatLastLogAt = Date.now();
+    }
+    return;
+  }
+
+  const clickBudget = Math.max(1, Math.min(target - selected, 2));
+  for (let i = 0; i < Math.min(untried.length, clickBudget); i += 1) {
+    if (Date.now() - state.legacySeatLastSeatClickAt < 120) break;
+    await clickLegacySeatCandidate(untried[i], target);
+    state.legacySeatLastSeatClickAt = Date.now();
+    if (getLegacySelectedSeatCount() >= target) break;
+  }
+}
+
+async function runLegacyInterparkTick() {
+  state.lastStage = "legacy";
+  if (!state.priceLockedSlow) setTickMode("fast");
+  if (state.queueActive) {
+    clearQueueRuntimeState();
+  }
+
+  if (isLegacySeatLayerVisible() || isLegacySeatIframeReady()) {
+    state.legacyNextPendingUntil = 0;
+    state.legacyNextWaitLogAt = 0;
+    const captchaHandled = await runCaptchaStep();
+    if (captchaHandled) {
+      await sleep(180);
+      return;
+    }
+    await runLegacySeatStep();
+    return;
+  }
+
+  if (state.legacySeatFlowKey) {
+    resetLegacySeatRuntime();
+  }
+
+  const stepNo = getLegacyActiveStepNumber();
+  const frameDoc = getLegacyBookFrameDocument();
+  if (stepNo === 1 || (!stepNo && isLegacyDateStepLikely(frameDoc))) {
+    await runLegacyDateStep();
+    return;
+  }
+
+  if (Date.now() - state.queueLastLogAt > 5000) {
+    log(`旧版页面当前处于 step ${stepNo || "unknown"}，日期流程仅在 step 1 执行`);
+    state.queueLastLogAt = Date.now();
+  }
+}
+
 async function tick() {
+  if (!IS_TOP_FRAME) return;
+  if (!isBotOwner() && !tryClaimBotOwner()) return;
+  touchBotOwner();
   if (!state.config.enabled || state.busy) return;
   state.busy = true;
   try {
@@ -3890,94 +5580,17 @@ async function tick() {
       }
       state.loginHinted = false;
       await runProductStep();
-    } else if (host === "tickets.interpark.com") {
-      if (isQueuePage()) {
-        state.lastStage = "queue";
-        if (!state.priceLockedSlow) setTickMode("fast");
-        if (!state.queueActive) {
-          state.queueActive = true;
-          state.queueKeepAliveCount = 0;
-          state.queueLastRemaining = null;
-          scheduleNextQueueKeepAlive(true);
-          if (state.firstBuyNowClickAt) {
-            const cost = Date.now() - state.firstBuyNowClickAt;
-            log(`检测到排队页，进入等待(点击到入队 ${cost}ms)`);
-          } else {
-            log("检测到排队页，进入等待");
-          }
-          state.queueHealth.lastProbeAt = 0;
-          state.queueHealth.consecutiveFail = 0;
-          state.queueHealth.lastSuccessAt = Date.now();
-          state.queueHealth.alertActive = false;
-          state.queueHealth.lastAlertAt = 0;
-        }
-        if (state.queueNextKeepAliveAt && Date.now() >= state.queueNextKeepAliveAt) {
-          runQueueKeepAliveAction();
-          scheduleNextQueueKeepAlive(false);
-        }
-        await runQueueHealthGuard();
-        await maybeNotifyQueueThresholds();
-        if (Date.now() - state.queueLastLogAt > 5000) {
-          log("排队中，等待放行...");
-          state.queueLastLogAt = Date.now();
-        }
-        return;
-      }
-
-      if (state.queueActive) {
-        state.queueActive = false;
-        state.queueNextKeepAliveAt = 0;
-        state.queueKeepAliveCount = 0;
-        state.queueLastRemaining = null;
-        state.queueHealth.consecutiveFail = 0;
-        state.queueHealth.alertActive = false;
-        if (!state.priceLockedSlow) setTickMode("critical");
-        log("排队已放行，立即开始点击选取");
-        await runImmediatePostQueueBurst();
-        return;
-      }
-
-      const captchaHandled = await runCaptchaStep();
-      if (captchaHandled) {
-        if (!state.priceLockedSlow) setTickMode("fast");
-        await sleep(260);
-        return;
-      }
-      const stage = detectCurrentStage();
-      if (stage === "seat") {
-        state.lastStage = "seat";
-        if (!state.priceLockedSlow) setTickMode("fast");
-        await runSeatStep();
-      } else if (stage === "price") {
-        if (state.lastStage !== "price") {
-          await maybeNotifyEnteredPrice();
-        }
-        state.lastStage = "price";
-        if (await stopAtPriceByConfigIfNeeded()) return;
-        if (!state.priceLockedSlow) {
-          state.priceLockedSlow = true;
-          setTickMode("normal");
-        }
-        await runPriceStep();
-      } else if (stage === "info") {
-        state.lastStage = "info";
-        if (!state.priceLockedSlow) {
-          state.priceLockedSlow = true;
-          setTickMode("normal");
-        }
-        await runInfoStep();
-      } else if (stage === "date") {
-        state.lastStage = "date";
-        if (!state.priceLockedSlow) setTickMode("fast");
-        await runDateStep();
+    } else if (
+      host === "tickets.interpark.com" ||
+      host === "gpoticket.globalinterpark.com" ||
+      isLegacyBookingUrl()
+    ) {
+      const variant = detectInterparkBookingVariant();
+      rememberBookingVariant(variant);
+      if (variant === "legacy") {
+        await runLegacyInterparkTick();
       } else {
-        state.lastStage = "unknown";
-        if (clickReserveEntryAggressive()) {
-          log("未知阶段命中预约入口，已点击 预约");
-          await sleep(180);
-          return;
-        }
-        log("未命中页面阶段，等待下一轮识别");
+        await runNewInterparkTick();
       }
     } else if (host === "secureapi.ext.eximbay.com") {
       state.lastStage = "payment";
@@ -3992,19 +5605,28 @@ async function tick() {
 }
 
 function ensureLoop() {
+  if (!IS_TOP_FRAME) return;
   if (state.intervalId || !state.config.enabled) return;
+  if (!tryClaimBotOwner()) return;
   state.intervalId = window.setInterval(tick, state.tickIntervalMs || TICK_MS_FAST);
   log("自动流程已启动");
   setBadge("NOL BOT 运行中", true);
 }
 
-function stopLoop() {
+function stopLoop(reason = "") {
+  const ownerBeforeStop = isBotOwner();
   if (state.intervalId) {
     clearInterval(state.intervalId);
     state.intervalId = null;
-    log("自动流程已停止");
+    const suffix = reason ? ` (原因: ${reason})` : "";
+    log(`自动流程已停止${suffix}`);
   }
-  setBadge("NOL BOT 已停止", false);
+  if (ownerBeforeStop) {
+    delete window[BOT_OWNER_KEY];
+  }
+  if (ownerBeforeStop || !window[BOT_OWNER_KEY]) {
+    setBadge("NOL BOT 已停止", false);
+  }
 }
 
 async function loadConfig() {
@@ -4047,11 +5669,24 @@ async function loadConfig() {
   state.buyNowCachedEl = null;
   state.firstBuyNowClickAt = 0;
   state.lastStage = "unknown";
+  state.lastBookingPageVariant = "unknown";
+  state.legacyNextPendingUntil = 0;
+  state.legacyNextWaitLogAt = 0;
   state.notifySale3mSent = false;
   state.notifyPriceEnteredSent = false;
   state.notifyQueueThresholdSent = { 1000: false, 100: false, 10: false };
   state.queueTop50FastestSwitchDone = false;
   state.queueLastRemaining = null;
+  state.legacySeatFlowKey = "";
+  state.legacySeatAreaIndex = 0;
+  state.legacySeatCurrentAreaCode = "";
+  state.legacySeatLastAreaSwitchAt = 0;
+  state.legacySeatLastSeatClickAt = 0;
+  state.legacySeatLastNextAt = 0;
+  state.legacySeatSelectedAssumed = 0;
+  state.legacySeatClickedKeys = [];
+  state.legacySeatNoSeatCycles = 0;
+  state.legacySeatLastLogAt = 0;
   if (state.config.enabled) {
     if (state.intervalId) {
       clearInterval(state.intervalId);
@@ -4059,7 +5694,7 @@ async function loadConfig() {
     }
     ensureLoop();
   } else {
-    stopLoop();
+    stopLoop("配置 enabled=false");
   }
 }
 
@@ -4077,7 +5712,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
   if (message?.type === "PING_BOT") {
-    sendResponse({ ok: true, enabled: state.config.enabled, host: location.host });
+    sendResponse({
+      ok: true,
+      enabled: state.config.enabled,
+      host: location.host,
+      pageVariant: detectInterparkBookingVariant()
+    });
     return;
   }
   return false;
