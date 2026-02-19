@@ -1,2 +1,12 @@
 __pycache__/
 .venv/
+
+# Build / local artifacts
+dist/
+extension/dist/
+
+# Dependencies
+extension/node_modules/
+
+# Local private config
+dist_vpn/vpn_local_backend/vpn_switch.yaml

@@ -68,6 +68,15 @@ async function saveConfig(config) {
       dateTime: String(config?.dateTime || "").trim(),
       legacyAreaOrderMode: normalizeLegacyAreaOrderMode(config?.legacyAreaOrderMode, "default"),
       legacyAreaCustomCodes: normalizeLegacyAreaCustomCodes(config?.legacyAreaCustomCodes || []),
+      legacyAreaSwitchIntervalMs: normalizeLegacyAreaTimingMs(
+        config?.legacyAreaSwitchIntervalMs,
+        1200
+      ),
+      legacyAreaSettleMs: normalizeLegacyAreaTimingMs(config?.legacyAreaSettleMs, 1200),
+      legacyAreaRandomJitterMs: normalizeLegacyAreaRandomJitterMs(
+        config?.legacyAreaRandomJitterMs,
+        0
+      ),
       fullFlowEnabled: config?.fullFlowEnabled !== false,
       ocrApiUrl: normalizeOcrApiUrl(config?.ocrApiUrl, DEFAULT_OCR_API_URL),
       ocrActivationCode: String(config?.ocrActivationCode || current?.ocrActivationCode || "").trim(),
@@ -136,6 +145,18 @@ async function saveConfigOnly(config) {
       ),
       legacyAreaCustomCodes: normalizeLegacyAreaCustomCodes(
         config?.legacyAreaCustomCodes || current.legacyAreaCustomCodes || []
+      ),
+      legacyAreaSwitchIntervalMs: normalizeLegacyAreaTimingMs(
+        config?.legacyAreaSwitchIntervalMs,
+        current.legacyAreaSwitchIntervalMs || 1200
+      ),
+      legacyAreaSettleMs: normalizeLegacyAreaTimingMs(
+        config?.legacyAreaSettleMs,
+        current.legacyAreaSettleMs || 1200
+      ),
+      legacyAreaRandomJitterMs: normalizeLegacyAreaRandomJitterMs(
+        config?.legacyAreaRandomJitterMs,
+        current.legacyAreaRandomJitterMs || 0
       ),
       fullFlowEnabled:
         typeof config?.fullFlowEnabled === "boolean"
@@ -251,6 +272,18 @@ function normalizeLegacyAreaCustomCodes(raw) {
     out.push(code);
   }
   return out;
+}
+
+function normalizeLegacyAreaTimingMs(raw, fallback = 1200) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return Math.min(5000, Math.max(120, Number(fallback) || 1200));
+  return Math.min(5000, Math.max(120, Math.round(n)));
+}
+
+function normalizeLegacyAreaRandomJitterMs(raw, fallback = 0) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return Math.min(1500, Math.max(0, Number(fallback) || 0));
+  return Math.min(1500, Math.max(0, Math.round(n)));
 }
 
 function normalizeCriticalSeconds(raw, fallback, min, max) {
@@ -1176,6 +1209,9 @@ chrome.runtime.onInstalled.addListener(async () => {
         dateTime: "",
         legacyAreaOrderMode: "default",
         legacyAreaCustomCodes: [],
+        legacyAreaSwitchIntervalMs: 1200,
+        legacyAreaSettleMs: 1200,
+        legacyAreaRandomJitterMs: 0,
         fullFlowEnabled: true,
         saleStartTime: "",
         preEnterSeconds: 30,

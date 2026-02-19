@@ -22,6 +22,9 @@ const state = {
     dateTime: "",
     legacyAreaOrderMode: "default",
     legacyAreaCustomCodes: [],
+    legacyAreaSwitchIntervalMs: 1200,
+    legacyAreaSettleMs: 1200,
+    legacyAreaRandomJitterMs: 0,
     countryCode: "86",
     phoneNumber: "",
     ocrApiUrl: DEFAULT_OCR_API_URL,
@@ -111,6 +114,7 @@ const state = {
   legacySeatAreaIndex: 0,
   legacySeatCurrentAreaCode: "",
   legacySeatLastAreaSwitchAt: 0,
+  legacySeatAreaNextSwitchAt: 0,
   legacySeatLastSeatClickAt: 0,
   legacySeatLastNextAt: 0,
   legacySeatSelectedAssumed: 0,
@@ -179,6 +183,7 @@ const QUEUE_KEEP_ALIVE_MIN_MS = 2.2 * 60 * 1000;
 const QUEUE_KEEP_ALIVE_MAX_MS = 4.8 * 60 * 1000;
 const LEGACY_AREA_SETTLE_MS = 1200;
 const LEGACY_AREA_SWITCH_INTERVAL_MS = 1200;
+const LEGACY_AREA_RANDOM_JITTER_MS = 0;
 const IS_TOP_FRAME = window.top === window;
 const BOT_OWNER_KEY = "__nolBotTopOwner";
 const BOT_INSTANCE_ID = `nol_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -409,6 +414,47 @@ function normalizeScavengeRoundMaxSec(raw, fallback = 0) {
   const n = Number(raw);
   if (!Number.isFinite(n)) return Math.min(10800, Math.max(0, Math.round(Number(fallback) || 0)));
   return Math.min(10800, Math.max(0, Math.round(n)));
+}
+
+function normalizeLegacyAreaTimingMs(raw, fallback = 1200) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return Math.min(5000, Math.max(120, Math.round(Number(fallback) || 1200)));
+  return Math.min(5000, Math.max(120, Math.round(n)));
+}
+
+function normalizeLegacyAreaRandomJitterMs(raw, fallback = 0) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return Math.min(1500, Math.max(0, Math.round(Number(fallback) || 0)));
+  return Math.min(1500, Math.max(0, Math.round(n)));
+}
+
+function withJitterMs(baseMs, jitterMs, minMs = 0, maxMs = 60000) {
+  const base = Math.round(Number(baseMs) || 0);
+  const jitter = Math.max(0, Math.round(Number(jitterMs) || 0));
+  if (!jitter) return Math.min(maxMs, Math.max(minMs, base));
+  const delta = Math.floor(Math.random() * (jitter * 2 + 1)) - jitter;
+  return Math.min(maxMs, Math.max(minMs, base + delta));
+}
+
+function getLegacyAreaSwitchIntervalMs() {
+  const base = normalizeLegacyAreaTimingMs(
+    state.config.legacyAreaSwitchIntervalMs,
+    LEGACY_AREA_SWITCH_INTERVAL_MS
+  );
+  const jitter = normalizeLegacyAreaRandomJitterMs(
+    state.config.legacyAreaRandomJitterMs,
+    LEGACY_AREA_RANDOM_JITTER_MS
+  );
+  return withJitterMs(base, jitter, 120, 5000);
+}
+
+function getLegacyAreaSettleMs() {
+  const base = normalizeLegacyAreaTimingMs(state.config.legacyAreaSettleMs, LEGACY_AREA_SETTLE_MS);
+  const jitter = normalizeLegacyAreaRandomJitterMs(
+    state.config.legacyAreaRandomJitterMs,
+    LEGACY_AREA_RANDOM_JITTER_MS
+  );
+  return withJitterMs(base, jitter, 120, 5000);
 }
 
 function normalizeQuantity(raw, fallback = 2) {
@@ -896,7 +942,43 @@ function isElementShown(el) {
   return rect.width > 1 && rect.height > 1;
 }
 
+function getHumanVerifyChallengeIframes() {
+  const selectors = [
+    "iframe[src*='challenges.cloudflare.com']",
+    "iframe[src*='turnstile']",
+    "iframe[title*='turnstile']",
+    "iframe[src*='recaptcha']",
+    "iframe[title*='recaptcha']",
+    "iframe[src*='hcaptcha']",
+    "iframe[title*='hcaptcha']"
+  ];
+  const out = [];
+  for (const selector of selectors) {
+    const nodes = Array.from(document.querySelectorAll(selector));
+    for (const node of nodes) {
+      if (!isElementShown(node)) continue;
+      if (!out.includes(node)) out.push(node);
+    }
+  }
+  return out;
+}
+
+function findHumanVerifyContainer() {
+  const container = document.querySelector(
+    "#content[aria-live='polite'], .cb-c, #ehurV4, #verifying, #success, #fail"
+  );
+  if (isElementShown(container)) return container;
+  const frame = getHumanVerifyChallengeIframes()[0] || null;
+  if (frame) return frame;
+  return null;
+}
+
 function findHumanVerifyCheckbox() {
+  const cloudflareDirect = Array.from(
+    document.querySelectorAll(".cb-c input[type='checkbox'], .cb-lb input[type='checkbox']")
+  ).find((input) => isElementShown(input.closest("label") || input));
+  if (cloudflareDirect) return cloudflareDirect;
+
   const strict = Array.from(
     document.querySelectorAll("label.cb-lb input[type='checkbox'], input[type='checkbox']")
   ).find((input) => {
@@ -937,6 +1019,17 @@ function findHumanVerifyCheckbox() {
 }
 
 function isHumanVerifyWidgetPresent() {
+  const cloudflareLabel = Array.from(document.querySelectorAll(".cb-c .cb-lb-t"))
+    .find((el) => normalizeText(el.textContent || "").includes("verify you are human"));
+  if (cloudflareLabel && isElementShown(cloudflareLabel.closest(".cb-c") || cloudflareLabel)) {
+    return true;
+  }
+
+  const challengeFrames = getHumanVerifyChallengeIframes();
+  if (challengeFrames.length) return true;
+
+  if (findHumanVerifyContainer()) return true;
+
   const text = normalizeText(document.body?.innerText || "");
   if (
     text.includes("verify you are human") ||
@@ -947,7 +1040,7 @@ function isHumanVerifyWidgetPresent() {
     return true;
   }
   if (findHumanVerifyCheckbox()) return true;
-  return Boolean(document.querySelector("#content[aria-live='polite'] .cb-c, #verifying, #success, #fail"));
+  return false;
 }
 
 async function runHumanVerifyStep() {
@@ -964,8 +1057,16 @@ async function runHumanVerifyStep() {
 
   const checkbox = findHumanVerifyCheckbox();
   if (!checkbox) {
+    const challengeContainer = findHumanVerifyContainer();
+    const now = Date.now();
+    if (challengeContainer && now - state.humanVerifyLastClickAt >= 1200) {
+      state.humanVerifyLastClickAt = now;
+      forceClick(challengeContainer);
+      clickAtCenter(challengeContainer);
+      clickElement(challengeContainer);
+    }
     if (Date.now() - state.humanVerifyLastLogAt > 2000) {
-      log("检测到人机验证框，暂未定位到 checkbox");
+      log("检测到人机验证框（含挑战 iframe），等待验证通过");
       state.humanVerifyLastLogAt = Date.now();
     }
     return true;
@@ -977,9 +1078,13 @@ async function runHumanVerifyStep() {
   state.humanVerifyLastClickAt = now;
 
   const clickable = checkbox.closest("label") || checkbox;
-  forceClick(clickable);
-  clickAtCenter(clickable);
-  clickElement(clickable);
+  const indicator = clickable?.querySelector?.(".cb-i") || null;
+  const clickTargets = [indicator, clickable, checkbox].filter(Boolean);
+  for (const target of clickTargets) {
+    forceClick(target);
+    clickAtCenter(target);
+    clickElement(target);
+  }
   log("检测到人机验证，已点击 Verify checkbox");
   return true;
 }
@@ -5626,6 +5731,7 @@ function resetLegacySeatRuntime() {
   state.legacySeatAreaIndex = 0;
   state.legacySeatCurrentAreaCode = "";
   state.legacySeatLastAreaSwitchAt = 0;
+  state.legacySeatAreaNextSwitchAt = 0;
   state.legacySeatLastSeatClickAt = 0;
   state.legacySeatLastNextAt = 0;
   state.legacySeatSelectedAssumed = 0;
@@ -6212,7 +6318,8 @@ async function switchLegacySeatArea(area) {
 
   state.legacySeatCurrentAreaCode = areaIdentity;
   state.legacySeatLastAreaSwitchAt = now;
-  state.legacySeatAreaSettleUntil = now + LEGACY_AREA_SETTLE_MS;
+  state.legacySeatAreaNextSwitchAt = now + getLegacyAreaSwitchIntervalMs();
+  state.legacySeatAreaSettleUntil = now + getLegacyAreaSettleMs();
   const srcChanged =
     mainResult && mainResult.beforeSeatSrc !== mainResult.afterSeatSrc ? "Y" : "N";
   const mainExec = (() => {
@@ -6359,9 +6466,11 @@ async function runLegacySeatStep() {
       }
       return;
     }
-    if (
+  if (
       areas.length > 1 &&
-      Date.now() - state.legacySeatLastAreaSwitchAt > LEGACY_AREA_SWITCH_INTERVAL_MS
+      Date.now() >=
+        (Number(state.legacySeatAreaNextSwitchAt || 0) ||
+          state.legacySeatLastAreaSwitchAt + getLegacyAreaSwitchIntervalMs())
     ) {
       state.legacySeatAreaIndex = (state.legacySeatAreaIndex + 1) % areas.length;
       if (state.legacySeatAreaIndex === 0) {
@@ -6565,6 +6674,18 @@ async function loadConfig() {
     dateTime: String(config.dateTime || "").trim(),
     legacyAreaOrderMode: String(config.legacyAreaOrderMode || "default").trim().toLowerCase() === "custom" ? "custom" : "default",
     legacyAreaCustomCodes: normalizeLegacyAreaCustomCodes(config.legacyAreaCustomCodes || []),
+    legacyAreaSwitchIntervalMs: normalizeLegacyAreaTimingMs(
+      config.legacyAreaSwitchIntervalMs,
+      LEGACY_AREA_SWITCH_INTERVAL_MS
+    ),
+    legacyAreaSettleMs: normalizeLegacyAreaTimingMs(
+      config.legacyAreaSettleMs,
+      LEGACY_AREA_SETTLE_MS
+    ),
+    legacyAreaRandomJitterMs: normalizeLegacyAreaRandomJitterMs(
+      config.legacyAreaRandomJitterMs,
+      LEGACY_AREA_RANDOM_JITTER_MS
+    ),
     countryCode: String(config.countryCode || "86"),
     phoneNumber: String(config.phoneNumber || ""),
     ocrApiUrl: normalizeOcrApiUrl(config.ocrApiUrl, DEFAULT_OCR_API_URL),
@@ -6634,6 +6755,7 @@ async function loadConfig() {
   state.legacySeatAreaIndex = 0;
   state.legacySeatCurrentAreaCode = "";
   state.legacySeatLastAreaSwitchAt = 0;
+  state.legacySeatAreaNextSwitchAt = 0;
   state.legacySeatLastSeatClickAt = 0;
   state.legacySeatLastNextAt = 0;
   state.legacySeatSelectedAssumed = 0;

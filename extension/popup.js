@@ -125,6 +125,14 @@ function normalizeScavengeRoundMaxMin(raw) {
   return normalizeNumber(raw, 0, 180, 0, true);
 }
 
+function normalizeLegacyAreaTimingMs(raw, fallback = 1200) {
+  return normalizeNumber(raw, 120, 5000, Number(fallback) || 1200, true);
+}
+
+function normalizeLegacyAreaRandomJitterMs(raw, fallback = 0) {
+  return normalizeNumber(raw, 0, 1500, Number(fallback) || 0, true);
+}
+
 function normalizeLegacyAreaCode(raw) {
   const digits = String(raw || "").replace(/[^\d]/g, "");
   if (!digits) return "";
@@ -249,6 +257,15 @@ function getFormConfig() {
     dateTime: $("dateTime").value.trim(),
     legacyAreaOrderMode: $("legacyAreaOrderMode").value === "custom" ? "custom" : "default",
     legacyAreaCustomCodes: getLegacyAreaCodes(),
+    legacyAreaSwitchIntervalMs: normalizeLegacyAreaTimingMs(
+      $("legacyAreaSwitchIntervalMs").value || 1200,
+      1200
+    ),
+    legacyAreaSettleMs: normalizeLegacyAreaTimingMs($("legacyAreaSettleMs").value || 1200, 1200),
+    legacyAreaRandomJitterMs: normalizeLegacyAreaRandomJitterMs(
+      $("legacyAreaRandomJitterMs").value || 0,
+      0
+    ),
     countryCode: String(currentCountryCode || "86").trim(),
     phoneNumber: String(currentPhoneNumber || "").trim(),
     ocrApiUrl: normalizeOcrApiUrl(currentOcrApiUrl),
@@ -324,6 +341,15 @@ async function loadState() {
   applySelectValue("dateTime", config.dateTime, (v) => String(v || "").trim());
   $("legacyAreaOrderMode").value = config.legacyAreaOrderMode === "custom" ? "custom" : "default";
   setLegacyAreaCodes(config.legacyAreaCustomCodes || []);
+  $("legacyAreaSwitchIntervalMs").value = String(
+    normalizeLegacyAreaTimingMs(config.legacyAreaSwitchIntervalMs ?? 1200, 1200)
+  );
+  $("legacyAreaSettleMs").value = String(
+    normalizeLegacyAreaTimingMs(config.legacyAreaSettleMs ?? 1200, 1200)
+  );
+  $("legacyAreaRandomJitterMs").value = String(
+    normalizeLegacyAreaRandomJitterMs(config.legacyAreaRandomJitterMs ?? 0, 0)
+  );
   syncLegacyAreaCustomVisibility();
   currentCountryCode = String(config.countryCode || currentCountryCode || "86").trim() || "86";
   currentPhoneNumber = String(config.phoneNumber || currentPhoneNumber || "").trim();

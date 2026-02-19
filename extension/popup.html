@@ -121,6 +121,23 @@
           <div class="hint">将按输入顺序逐个查找这些区域</div>
         </div>
 
+        <div class="subpanel">
+          <h3>旧版区域切换速度</h3>
+          <label class="field">
+            <span>区域切换间隔(ms)</span>
+            <input id="legacyAreaSwitchIntervalMs" type="number" min="120" max="5000" step="10" value="1200" />
+          </label>
+          <label class="field">
+            <span>区域切换后等待(ms)</span>
+            <input id="legacyAreaSettleMs" type="number" min="120" max="5000" step="10" value="1200" />
+          </label>
+          <label class="field">
+            <span>随机抖动(±ms)</span>
+            <input id="legacyAreaRandomJitterMs" type="number" min="0" max="1500" step="10" value="0" />
+          </label>
+          <div class="hint">最终延迟 = 基础值 ± 随机抖动</div>
+        </div>
+
         <label class="field">
           <span>钉钉 Webhook (可选)</span>
           <input id="dingTalkWebhookUrl" type="url" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..." />
