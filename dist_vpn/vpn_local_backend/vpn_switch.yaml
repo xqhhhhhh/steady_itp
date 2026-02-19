@@ -1,0 +1,23 @@
+# Only edit this file. Do not edit Python code.
+
+server:
+  bind_host: "127.0.0.1"
+  port: 8000
+
+verify:
+  url: "https://tickets.interpark.com/"
+
+flclash:
+  selector: "Proxy"
+  # Cross-platform script. Keep absolute path if your startup cwd changes.
+  switch_script: "./scripts/flclash_switch.py"
+  # Optional. If empty and script ends with .py, backend auto-uses "python".
+  switch_interpreter: "python"
+  controller: "http://127.0.0.1:9090"
+  secret: ""
+  delay_url: "https://tickets.interpark.com/"
+  delay_timeout_ms: 3500
+  nodes:
+    - "HK-01"
+    - "JP-01"
+    - "SG-01"

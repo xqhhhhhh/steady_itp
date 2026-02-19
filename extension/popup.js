@@ -1,4 +1,40 @@
 const $ = (id) => document.getElementById(id);
+const legacyAreaCodes = [];
+const DEFAULT_OCR_API_URL = "https://api.nexuschat.top/ocr-api/ocr/file";
+let currentOcrApiUrl = DEFAULT_OCR_API_URL;
+let currentCountryCode = "86";
+let currentPhoneNumber = "";
+
+function isSupportedEventUrl(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || "").trim());
+    if (url.protocol !== "https:") return false;
+    const host = String(url.host || "").toLowerCase();
+    return (
+      host === "world.nol.com" ||
+      host === "tickets.interpark.com" ||
+      host === "gpoticket.globalinterpark.com"
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
+function normalizeOcrApiUrl(raw, fallback = DEFAULT_OCR_API_URL) {
+  const candidate = String(raw || "").trim();
+  const fb = String(fallback || DEFAULT_OCR_API_URL).trim();
+  if (!candidate) return fb;
+  try {
+    const u = new URL(candidate);
+    const host = String(u.hostname || "").toLowerCase();
+    const isLocalHost =
+      host === "127.0.0.1" || host === "localhost" || host === "::1" || host.endsWith(".local");
+    if (isLocalHost) return fb;
+    return u.toString();
+  } catch (_) {
+    return fb;
+  }
+}
 
 function addOption(select, value, label) {
   const opt = document.createElement("option");
@@ -77,7 +113,120 @@ function normalizeNumber(raw, min, max, fallback, integer = false) {
   return integer ? Math.round(clamped) : Math.round(clamped * 10) / 10;
 }
 
+function normalizeScavengeLoopIntervalSec(raw) {
+  return normalizeNumber(raw, 15, 3600, 600, true);
+}
+
+function normalizeScavengeLoopIntervalMin(raw) {
+  return normalizeNumber(raw, 1, 120, 10, true);
+}
+
+function normalizeScavengeRoundMaxMin(raw) {
+  return normalizeNumber(raw, 0, 180, 0, true);
+}
+
+function normalizeLegacyAreaCode(raw) {
+  const digits = String(raw || "").replace(/[^\d]/g, "");
+  if (!digits) return "";
+  const clipped = digits.slice(-3);
+  const n = Number(clipped);
+  if (!Number.isFinite(n) || n < 0 || n > 999) return "";
+  return String(n).padStart(3, "0");
+}
+
+function normalizeLegacyAreaCodes(raw) {
+  const values = Array.isArray(raw) ? raw : String(raw || "").split(/[,\s]+/);
+  const seen = new Set();
+  const out = [];
+  for (const item of values) {
+    const code = normalizeLegacyAreaCode(item);
+    if (!code || seen.has(code)) continue;
+    seen.add(code);
+    out.push(code);
+  }
+  return out;
+}
+
+function getLegacyAreaCodes() {
+  return legacyAreaCodes.slice();
+}
+
+function renderLegacyAreaCodeList() {
+  const list = $("legacyAreaCodeList");
+  if (!list) return;
+  list.innerHTML = "";
+  for (const code of legacyAreaCodes) {
+    const item = document.createElement("span");
+    item.className = "code-item";
+    item.textContent = code;
+
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "code-remove";
+    removeBtn.textContent = "x";
+    removeBtn.dataset.code = code;
+    removeBtn.addEventListener("click", () => {
+      const idx = legacyAreaCodes.indexOf(code);
+      if (idx >= 0) {
+        legacyAreaCodes.splice(idx, 1);
+        renderLegacyAreaCodeList();
+      }
+    });
+
+    item.appendChild(removeBtn);
+    list.appendChild(item);
+  }
+}
+
+function setLegacyAreaCodes(codes) {
+  legacyAreaCodes.splice(0, legacyAreaCodes.length, ...normalizeLegacyAreaCodes(codes));
+  renderLegacyAreaCodeList();
+}
+
+function syncLegacyAreaCustomVisibility() {
+  const mode = $("legacyAreaOrderMode").value === "custom" ? "custom" : "default";
+  $("legacyAreaCustomWrap").classList.toggle("hidden", mode !== "custom");
+}
+
+function getSelectedRunMode() {
+  return $("runModeScavenge").checked ? "scavenge" : "timed";
+}
+
+function setRunMode(mode) {
+  const isScavenge = mode === "scavenge";
+  $("runModeScavenge").checked = isScavenge;
+  $("runModeTimed").checked = !isScavenge;
+  syncRunModeVisibility();
+}
+
+function syncRunModeVisibility() {
+  const isScavenge = getSelectedRunMode() === "scavenge";
+  $("timedModeFields").classList.toggle("hidden", isScavenge);
+  $("scavengeModeFields").classList.toggle("hidden", !isScavenge);
+  $("vpnConfigWrap")?.classList.toggle("hidden", isScavenge);
+  syncVpnApiVisibility();
+}
+
+function syncVpnApiVisibility() {
+  const vpnApiUrlField = $("vpnApiUrlField");
+  const vpnAutoSwitchEnabled = $("vpnAutoSwitchEnabled");
+  if (!vpnApiUrlField || !vpnAutoSwitchEnabled) return;
+  vpnApiUrlField.classList.toggle("hidden", !vpnAutoSwitchEnabled.checked);
+}
+
+function addLegacyAreaCodeFromInput() {
+  const input = $("legacyAreaCodeInput");
+  const code = normalizeLegacyAreaCode(input.value);
+  input.value = "";
+  if (!code) return;
+  if (!legacyAreaCodes.includes(code)) {
+    legacyAreaCodes.push(code);
+    renderLegacyAreaCodeList();
+  }
+}
+
 function getFormConfig() {
+  const runMode = getSelectedRunMode();
   const preEnter = normalizeNumber($("preEnterSeconds").value || 30, 5, 300, 30, true);
   const criticalPre = normalizeNumber($("criticalPreSeconds").value || 2.5, 0.5, 10, 2.5, false);
   const criticalPost = normalizeNumber($("criticalPostSeconds").value || 8, 1, 20, 8, false);
@@ -89,23 +238,59 @@ function getFormConfig() {
     criticalPreSeconds: criticalPre,
     criticalPostSeconds: criticalPost,
     criticalTickMs: criticalTick,
+    scavengeLoopEnabled: runMode === "scavenge",
+    scavengeLoopIntervalSec:
+      normalizeScavengeLoopIntervalMin($("scavengeLoopIntervalMin").value || 10) * 60,
+    scavengeRoundMaxSec:
+      normalizeScavengeRoundMaxMin($("scavengeRoundMaxMin").value || 0) * 60,
     quantity: Number($("quantity").value || 1),
     dateMonth: $("dateMonth").value.trim(),
     dateDay: $("dateDay").value.trim(),
     dateTime: $("dateTime").value.trim(),
-    countryCode: ($("countryCode").value || "86").trim(),
-    phoneNumber: $("phoneNumber").value.trim(),
-    ocrApiUrl: $("ocrApiUrl").value.trim(),
+    legacyAreaOrderMode: $("legacyAreaOrderMode").value === "custom" ? "custom" : "default",
+    legacyAreaCustomCodes: getLegacyAreaCodes(),
+    countryCode: String(currentCountryCode || "86").trim(),
+    phoneNumber: String(currentPhoneNumber || "").trim(),
+    ocrApiUrl: normalizeOcrApiUrl(currentOcrApiUrl),
+    ocrActivationCode: $("ocrActivationCode").value.trim(),
     vpnApiUrl: $("vpnApiUrl").value.trim(),
-    vpnAutoSwitchEnabled: $("vpnAutoSwitchEnabled").checked,
+    vpnAutoSwitchEnabled: runMode === "scavenge" ? false : $("vpnAutoSwitchEnabled").checked,
     dingTalkWebhookUrl: $("dingTalkWebhookUrl").value.trim(),
     dingTalkSecret: $("dingTalkSecret").value.trim(),
-    fullFlowEnabled: $("fullFlowEnabled").checked
+    fullFlowEnabled: false
   };
 }
 
 function setStatus(text) {
   $("status").textContent = text;
+}
+
+function renderOcrLicenseStatus(config) {
+  const el = $("ocrLicenseStatus");
+  const bar = $("licenseBar");
+  const codeInput = $("ocrActivationCode");
+  const activateBtn = $("activateOcrBtn");
+  if (!el || !bar || !codeInput || !activateBtn) return;
+  const expiresAt = Number(config?.ocrLicenseExpiresAt || 0);
+  const isActivated = expiresAt > Date.now();
+
+  bar.classList.toggle("activated", isActivated);
+  el.classList.toggle("activated", isActivated);
+  codeInput.disabled = isActivated;
+  activateBtn.disabled = isActivated;
+  activateBtn.textContent = isActivated ? "已激活" : "激活";
+
+  if (isActivated) {
+    el.textContent = "已激活";
+    return;
+  }
+
+  if (String(config?.ocrActivationCode || "").trim()) {
+    el.textContent = "待激活";
+    return;
+  }
+
+  el.textContent = "未激活";
 }
 
 async function loadState() {
@@ -124,18 +309,34 @@ async function loadState() {
   $("criticalTickMs").value = String(
     normalizeNumber(config.criticalTickMs ?? 65, 40, 180, 65, true)
   );
+  setRunMode(config.scavengeLoopEnabled === true ? "scavenge" : "timed");
+  $("scavengeLoopIntervalMin").value = String(
+    normalizeScavengeLoopIntervalMin(
+      normalizeScavengeLoopIntervalSec(config.scavengeLoopIntervalSec ?? 600) / 60
+    )
+  );
+  $("scavengeRoundMaxMin").value = String(
+    normalizeScavengeRoundMaxMin(Number(config.scavengeRoundMaxSec || 0) / 60)
+  );
   if (config.quantity) $("quantity").value = config.quantity;
   applySelectValue("dateMonth", config.dateMonth, normalizeMonthValue);
   applySelectValue("dateDay", config.dateDay, normalizeDayValue);
   applySelectValue("dateTime", config.dateTime, (v) => String(v || "").trim());
-  if (config.countryCode) $("countryCode").value = config.countryCode;
-  if (config.phoneNumber) $("phoneNumber").value = config.phoneNumber;
-  if (config.ocrApiUrl) $("ocrApiUrl").value = config.ocrApiUrl;
+  $("legacyAreaOrderMode").value = config.legacyAreaOrderMode === "custom" ? "custom" : "default";
+  setLegacyAreaCodes(config.legacyAreaCustomCodes || []);
+  syncLegacyAreaCustomVisibility();
+  currentCountryCode = String(config.countryCode || currentCountryCode || "86").trim() || "86";
+  currentPhoneNumber = String(config.phoneNumber || currentPhoneNumber || "").trim();
+  currentOcrApiUrl = normalizeOcrApiUrl(config.ocrApiUrl || currentOcrApiUrl || DEFAULT_OCR_API_URL);
+  if (typeof config.ocrActivationCode === "string") {
+    $("ocrActivationCode").value = config.ocrActivationCode;
+  }
+  renderOcrLicenseStatus(config);
   if (config.vpnApiUrl) $("vpnApiUrl").value = config.vpnApiUrl;
   $("vpnAutoSwitchEnabled").checked = config.vpnAutoSwitchEnabled !== false;
+  syncVpnApiVisibility();
   if (config.dingTalkWebhookUrl) $("dingTalkWebhookUrl").value = config.dingTalkWebhookUrl;
   if (config.dingTalkSecret) $("dingTalkSecret").value = config.dingTalkSecret;
-  $("fullFlowEnabled").checked = config.fullFlowEnabled !== false;
   const base = config.enabled ? "运行中" : "未启动";
   const ready = response?.contentReady;
   const lastLog = response?.lastLog;
@@ -153,8 +354,8 @@ async function loadState() {
 $("startBtn").addEventListener("click", async () => {
   try {
     const config = getFormConfig();
-    if (!config.eventUrl.startsWith("https://world.nol.com/")) {
-      setStatus("URL 必须是 world.nol.com");
+    if (!isSupportedEventUrl(config.eventUrl)) {
+      setStatus("URL 必须是 world.nol.com / tickets.interpark.com / gpoticket.globalinterpark.com");
       return;
     }
     if (config.saleStartTime && Number.isNaN(new Date(config.saleStartTime).getTime())) {
@@ -176,8 +377,8 @@ $("startBtn").addEventListener("click", async () => {
 $("saveBtn").addEventListener("click", async () => {
   try {
     const config = getFormConfig();
-    if (!config.eventUrl.startsWith("https://world.nol.com/")) {
-      setStatus("URL 必须是 world.nol.com");
+    if (!isSupportedEventUrl(config.eventUrl)) {
+      setStatus("URL 必须是 world.nol.com / tickets.interpark.com / gpoticket.globalinterpark.com");
       return;
     }
     if (config.saleStartTime && Number.isNaN(new Date(config.saleStartTime).getTime())) {
@@ -200,19 +401,62 @@ $("stopBtn").addEventListener("click", async () => {
   }
 });
 
-$("diagBtn").addEventListener("click", async () => {
+$("activateOcrBtn").addEventListener("click", async () => {
+  const btn = $("activateOcrBtn");
   try {
-    const result = await chrome.runtime.sendMessage({ type: "PING_ACTIVE_TAB_BOT" });
-    if (!result?.ok) {
-      setStatus(`诊断失败: ${result?.error || "未知错误"}`);
+    const apiUrl = normalizeOcrApiUrl(currentOcrApiUrl || DEFAULT_OCR_API_URL);
+    const activationCode = $("ocrActivationCode").value.trim();
+    if (!activationCode) {
+      setStatus("请输入激活码");
       return;
     }
-    const enabled = result?.response?.enabled ? "enabled" : "disabled";
-    const host = result?.response?.host || "unknown";
-    setStatus(`已连接 content-script (${host}, ${enabled})`);
+    setStatus("激活中...");
+    if (btn) btn.disabled = true;
+    const resp = await chrome.runtime.sendMessage({
+      type: "ACTIVATE_OCR_LICENSE",
+      payload: {
+        ocrApiUrl: apiUrl,
+        ocrActivationCode: activationCode
+      }
+    });
+    if (!resp) {
+      throw new Error("未收到后台响应，请重载扩展后重试");
+    }
+    if (!resp?.ok) {
+      setStatus(`激活失败: ${resp?.error || "unknown"}`);
+      return;
+    }
+    setStatus("激活成功");
+    await loadState();
   } catch (err) {
-    setStatus(`诊断异常: ${String(err?.message || err)}`);
+    setStatus(`激活异常: ${String(err?.message || err)}`);
+  } finally {
+    if (btn && btn.textContent !== "已激活") {
+      btn.disabled = false;
+    }
   }
+});
+
+$("legacyAreaOrderMode").addEventListener("change", () => {
+  syncLegacyAreaCustomVisibility();
+});
+
+$("runModeTimed").addEventListener("change", () => {
+  syncRunModeVisibility();
+});
+
+$("runModeScavenge").addEventListener("change", () => {
+  syncRunModeVisibility();
+});
+
+$("vpnAutoSwitchEnabled").addEventListener("change", () => {
+  syncVpnApiVisibility();
+});
+
+$("legacyAreaCodeInput").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  addLegacyAreaCodeFromInput();
 });
 
 loadState();

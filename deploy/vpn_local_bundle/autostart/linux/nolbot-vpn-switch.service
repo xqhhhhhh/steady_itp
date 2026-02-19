@@ -1,0 +1,15 @@
+[Unit]
+Description=NOL Bot VPN Switch Backend
+After=network.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__APP_DIR__
+ExecStart=/bin/bash __APP_DIR__/start_linux.sh
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

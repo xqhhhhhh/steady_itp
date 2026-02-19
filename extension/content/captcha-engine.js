@@ -242,6 +242,12 @@
           return true;
         }
 
+        if (isLegacyCaptcha && !state.captcha.legacyFirstInputDelayDone) {
+          await sleep(500);
+          state.captcha.legacyFirstInputDelayDone = true;
+          log("旧版首次验证码输入前等待 0.5s");
+        }
+
         typeInInput(inputEl, code);
         log(`验证码已填写: ${code}`);
 

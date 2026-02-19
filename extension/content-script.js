@@ -1,9 +1,11 @@
 const STORAGE_KEY = "nolBotConfig";
 const EXIMBAY_ACTIVE_KEY = "nolBotEximbayActive";
+const DEFAULT_OCR_API_URL = "https://api.nexuschat.top/ocr-api/ocr/file";
 
 const state = {
   config: {
     enabled: false,
+    startedAt: 0,
     eventUrl: "",
     fullFlowEnabled: true,
     saleStartTime: "",
@@ -11,13 +13,25 @@ const state = {
     criticalPreSeconds: 2.5,
     criticalPostSeconds: 8,
     criticalTickMs: 65,
+    scavengeLoopEnabled: false,
+    scavengeLoopIntervalSec: 600,
+    scavengeRoundMaxSec: 0,
     quantity: 1,
     dateMonth: "",
     dateDay: "",
     dateTime: "",
+    legacyAreaOrderMode: "default",
+    legacyAreaCustomCodes: [],
     countryCode: "86",
     phoneNumber: "",
-    ocrApiUrl: "http://127.0.0.1:8000/ocr/file",
+    ocrApiUrl: DEFAULT_OCR_API_URL,
+    ocrActivationCode: "",
+    ocrApiToken: "",
+    ocrDeviceId: "",
+    ocrAccessToken: "",
+    ocrAccessTokenExpiresAt: 0,
+    ocrLicenseExpiresAt: 0,
+    ocrLicenseActivatedAt: 0,
     vpnApiUrl: "http://127.0.0.1:8000",
     vpnAutoSwitchEnabled: true,
     dingTalkWebhookUrl: "",
@@ -82,6 +96,12 @@ const state = {
   lastBookingPageVariant: "unknown",
   notifySale3mSent: false,
   notifyPriceEnteredSent: false,
+  notifyLegacySeatCompletedSent: false,
+  scavengeLoopSuccess: false,
+  scavengeLoopNextRestartAt: 0,
+  scavengeLoopLastRestartAt: 0,
+  scavengeLoopLastWaitLogAt: 0,
+  scavengeLoopLastWaitTargetAt: 0,
   notifyQueueThresholdSent: {
     1000: false,
     100: false,
@@ -95,8 +115,19 @@ const state = {
   legacySeatLastNextAt: 0,
   legacySeatSelectedAssumed: 0,
   legacySeatClickedKeys: [],
+  legacySeatAttemptedKeys: {},
   legacySeatNoSeatCycles: 0,
   legacySeatLastLogAt: 0,
+  legacySeatLastClickFailLogAt: 0,
+  legacySeatLastGradeClickAt: 0,
+  legacySeatCurrentGrade: "",
+  legacySeatGradeIndex: 0,
+  legacySeatLastAreaDiscoveryAt: 0,
+  legacySeatAreaSettleUntil: 0,
+  legacySeatSinglePickPendingUntil: 0,
+  legacySeatSubmitTriggeredAt: 0,
+  legacySeatSubmitSelectedAtTrigger: 0,
+  legacySeatSubmitTargetAtTrigger: 0,
   selectedSeatCountCache: {
     ts: 0,
     count: 0
@@ -108,13 +139,32 @@ const state = {
     solvedAt: 0,
     lastPassLogAt: 0,
     candidates: [],
-    candidateIndex: 0
+    candidateIndex: 0,
+    legacyFirstInputDelayDone: false
   }
 };
 
 const STEP_TEXT = {
   buyNow: ["立即购买", "立即購買", "buy now", "book now", "예매하기"],
-  reserveEntry: ["预约", "預約", "reservation", "reserve", "book reservation", "예매"],
+  reserveEntry: [
+    "预约",
+    "預約",
+    "预订",
+    "預訂",
+    "预定",
+    "預定",
+    "一般预订",
+    "一般預訂",
+    "一般预定",
+    "一般預定",
+    "general reservation",
+    "normal reservation",
+    "reservation",
+    "reserve",
+    "book reservation",
+    "예매",
+    "일반예매"
+  ],
   nextStep: ["下一步", "下一步", "next", "다음"],
   completeSeat: ["完成选择", "完成選擇", "done", "confirm seat", "좌석선택완료"],
   priceStep: ["选择价格", "選擇價格", "price selection", "가격 선택"],
@@ -127,12 +177,36 @@ const TICK_MS_NORMAL = 480;
 const TICK_MS_CRITICAL_DEFAULT = 65;
 const QUEUE_KEEP_ALIVE_MIN_MS = 2.2 * 60 * 1000;
 const QUEUE_KEEP_ALIVE_MAX_MS = 4.8 * 60 * 1000;
+const LEGACY_AREA_SETTLE_MS = 1200;
+const LEGACY_AREA_SWITCH_INTERVAL_MS = 1200;
 const IS_TOP_FRAME = window.top === window;
 const BOT_OWNER_KEY = "__nolBotTopOwner";
 const BOT_INSTANCE_ID = `nol_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
 function normalizeText(text) {
   return (text || "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function normalizeLegacyAreaCode(raw) {
+  const digits = String(raw || "").replace(/[^\d]/g, "");
+  if (!digits) return "";
+  const clipped = digits.slice(-3);
+  const n = Number(clipped);
+  if (!Number.isFinite(n) || n < 0 || n > 999) return "";
+  return String(n).padStart(3, "0");
+}
+
+function normalizeLegacyAreaCustomCodes(raw) {
+  const values = Array.isArray(raw) ? raw : String(raw || "").split(/[,\s]+/);
+  const seen = new Set();
+  const out = [];
+  for (const item of values) {
+    const code = normalizeLegacyAreaCode(item);
+    if (!code || seen.has(code)) continue;
+    seen.add(code);
+    out.push(code);
+  }
+  return out;
 }
 
 function isDomElement(el) {
@@ -161,7 +235,6 @@ function visibleForSeat(el) {
   return (
     style.visibility !== "hidden" &&
     style.display !== "none" &&
-    style.pointerEvents !== "none" &&
     rect.width > 0.4 &&
     rect.height > 0.4
   );
@@ -296,6 +369,22 @@ function normalizePreEnterSeconds(raw, fallback = 30) {
   return Math.min(300, Math.max(5, Math.round(n)));
 }
 
+function normalizeOcrApiUrl(raw, fallback = DEFAULT_OCR_API_URL) {
+  const candidate = String(raw || "").trim();
+  const fb = String(fallback || DEFAULT_OCR_API_URL).trim();
+  if (!candidate) return fb;
+  try {
+    const u = new URL(candidate);
+    const host = String(u.hostname || "").toLowerCase();
+    const isLocalHost =
+      host === "127.0.0.1" || host === "localhost" || host === "::1" || host.endsWith(".local");
+    if (isLocalHost) return fb;
+    return u.toString();
+  } catch (_) {
+    return fb;
+  }
+}
+
 function normalizeCriticalSeconds(raw, fallback, min, max) {
   const n = Number(raw);
   const base = Number(fallback);
@@ -308,6 +397,18 @@ function normalizeCriticalTickMs(raw, fallback = TICK_MS_CRITICAL_DEFAULT) {
   const n = Number(raw);
   if (!Number.isFinite(n)) return Math.min(180, Math.max(40, Number(fallback) || TICK_MS_CRITICAL_DEFAULT));
   return Math.min(180, Math.max(40, Math.round(n)));
+}
+
+function normalizeScavengeLoopIntervalSec(raw, fallback = 600) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return Math.min(3600, Math.max(15, Math.round(Number(fallback) || 600)));
+  return Math.min(3600, Math.max(15, Math.round(n)));
+}
+
+function normalizeScavengeRoundMaxSec(raw, fallback = 0) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return Math.min(10800, Math.max(0, Math.round(Number(fallback) || 0)));
+  return Math.min(10800, Math.max(0, Math.round(n)));
 }
 
 function normalizeQuantity(raw, fallback = 2) {
@@ -557,6 +658,199 @@ async function maybeNotifyEnteredPrice() {
     "已进入价格页",
     `已进入价格页(step=price)，当前检测已选座位数: ${selected}。`
   );
+  await maybeFinishScavengeLoopIfEnabled("已进入价格页");
+}
+
+function markLegacySeatSubmitTriggered(selectedAtTrigger, targetAtTrigger) {
+  state.legacySeatSubmitTriggeredAt = Date.now();
+  state.legacySeatSubmitSelectedAtTrigger = Math.max(0, Number(selectedAtTrigger) || 0);
+  state.legacySeatSubmitTargetAtTrigger = Math.max(1, Number(targetAtTrigger) || 1);
+}
+
+async function maybeNotifyLegacySeatCompletedOnTransition() {
+  const triggeredAt = Number(state.legacySeatSubmitTriggeredAt || 0);
+  if (!triggeredAt) return;
+  if (state.notifyLegacySeatCompletedSent) {
+    state.legacySeatSubmitTriggeredAt = 0;
+    return;
+  }
+
+  const now = Date.now();
+  const elapsed = now - triggeredAt;
+  const stepNo = getLegacyActiveStepNumber();
+  const seatVisible = isLegacySeatLayerVisible();
+  const progressedByStep = Number.isFinite(stepNo) && stepNo > 0 && stepNo !== 2;
+  const progressedByLayer = elapsed > 1200 && !seatVisible && stepNo !== 2;
+
+  if (!progressedByStep && !progressedByLayer) {
+    if (elapsed > 20000) {
+      state.legacySeatSubmitTriggeredAt = 0;
+    }
+    return;
+  }
+
+  state.legacySeatSubmitTriggeredAt = 0;
+  const selected = Math.max(1, Number(state.legacySeatSubmitSelectedAtTrigger) || 1);
+  const target = Math.max(1, Number(state.legacySeatSubmitTargetAtTrigger) || 1);
+  const eventKey = `legacy_seat_done_${state.config.saleStartTime || "unknown"}_${location.pathname}_${location.search}`;
+  const sent = await sendDingTalkNotify(
+    eventKey,
+    "抢票成功：已提交座位",
+    `已选座并点击 completed，已进入下一界面。数量: ${selected}/${target}，step=${stepNo || "unknown"}，时间: ${new Date().toLocaleString()}`
+  );
+  if (sent) {
+    state.notifyLegacySeatCompletedSent = true;
+  }
+  await maybeFinishScavengeLoopIfEnabled("已选座并进入下一界面");
+}
+
+function getScavengeLoopIntervalMs() {
+  const sec = normalizeScavengeLoopIntervalSec(
+    state.config.scavengeLoopIntervalSec,
+    600
+  );
+  return sec * 1000;
+}
+
+function getScavengeRoundMaxMs() {
+  const sec = normalizeScavengeRoundMaxSec(
+    state.config.scavengeRoundMaxSec,
+    0
+  );
+  return sec > 0 ? sec * 1000 : 0;
+}
+
+async function persistScavengeRuntime(nextRestartAt = 0, lastRestartAt = 0) {
+  try {
+    const all = await chrome.storage.local.get(STORAGE_KEY);
+    const cfg = all[STORAGE_KEY] || {};
+    const startedAt = Number(cfg.startedAt || state.config.startedAt || 0);
+    await chrome.storage.local.set({
+      [STORAGE_KEY]: {
+        ...cfg,
+        scavengeLoopNextRestartAt: Number(nextRestartAt) || 0,
+        scavengeLoopLastRestartAt: Number(lastRestartAt) || 0,
+        scavengeLoopRuntimeStartedAt: startedAt
+      }
+    });
+  } catch (_) {}
+}
+
+async function clearScavengeRuntime() {
+  await persistScavengeRuntime(0, 0);
+}
+
+async function maybeFinishScavengeLoopIfEnabled(reason = "") {
+  if (state.config.scavengeLoopEnabled !== true) return false;
+  if (state.scavengeLoopSuccess) return true;
+  state.scavengeLoopSuccess = true;
+  state.scavengeLoopNextRestartAt = 0;
+  state.scavengeLoopLastWaitLogAt = 0;
+  state.scavengeLoopLastWaitTargetAt = 0;
+  const msg = String(reason || "命中成功条件");
+  log(`捡漏循环已命中成功条件，停止自动化: ${msg}`);
+  await chrome.storage.local.set({
+    [STORAGE_KEY]: {
+      ...state.config,
+      scavengeLoopNextRestartAt: 0,
+      scavengeLoopLastRestartAt: 0,
+      scavengeLoopRuntimeStartedAt: Number(state.config.startedAt || 0),
+      enabled: false,
+      stoppedAt: Date.now()
+    }
+  });
+  await clearScavengeRuntime();
+  stopLoop(`捡漏成功: ${msg}`);
+  return true;
+}
+
+async function maybeRunScavengeLoopRestart() {
+  if (!state.config.enabled || state.config.scavengeLoopEnabled !== true) return false;
+  if (state.scavengeLoopSuccess) return false;
+  const targetUrl = String(state.config.eventUrl || "").trim();
+  if (!targetUrl) return false;
+  const countdownMs = getSaleCountdownMs();
+  if (Number.isFinite(countdownMs) && countdownMs > 0) return false;
+  const intervalMs = getScavengeLoopIntervalMs();
+  if (intervalMs <= 0) return false;
+
+  const now = Date.now();
+  if (!state.scavengeLoopNextRestartAt || now < state.scavengeLoopNextRestartAt) return false;
+
+  state.scavengeLoopLastRestartAt = now;
+  state.scavengeLoopNextRestartAt = now + intervalMs;
+  state.scavengeLoopLastWaitLogAt = 0;
+  state.scavengeLoopLastWaitTargetAt = 0;
+  await persistScavengeRuntime(state.scavengeLoopNextRestartAt, state.scavengeLoopLastRestartAt);
+  const minutes = Math.max(1, Math.round(intervalMs / 60000));
+  log(`捡漏循环触发：每 ${minutes} 分钟重跑一次，正在重新开始流程`);
+  try {
+    window.location.assign(targetUrl);
+  } catch (_) {
+    window.location.href = targetUrl;
+  }
+  return true;
+}
+
+async function maybeAbortScavengeRoundByTimeout() {
+  if (!state.config.enabled || state.config.scavengeLoopEnabled !== true || state.scavengeLoopSuccess) {
+    return false;
+  }
+  const maxMs = getScavengeRoundMaxMs();
+  if (!maxMs) return false;
+
+  const host = String(location.host || "").toLowerCase();
+  const inBookingHost =
+    host === "tickets.interpark.com" ||
+    host === "gpoticket.globalinterpark.com" ||
+    isLegacyBookingUrl();
+  if (!inBookingHost) return false;
+
+  const now = Date.now();
+  if (!state.scavengeLoopLastRestartAt) {
+    state.scavengeLoopLastRestartAt = now;
+    return false;
+  }
+  const elapsed = now - state.scavengeLoopLastRestartAt;
+  if (elapsed < maxMs) return false;
+
+  const intervalMs = getScavengeLoopIntervalMs();
+  state.scavengeLoopLastRestartAt = now;
+  state.scavengeLoopNextRestartAt = now + intervalMs;
+  state.scavengeLoopLastWaitLogAt = 0;
+  state.scavengeLoopLastWaitTargetAt = 0;
+  await persistScavengeRuntime(state.scavengeLoopNextRestartAt, state.scavengeLoopLastRestartAt);
+
+  const maxMin = Math.max(1, Math.round(maxMs / 60000));
+  const nextAtText = new Date(state.scavengeLoopNextRestartAt).toLocaleString();
+  log(`捡漏单轮超时(${maxMin}分钟)，结束本轮并返回 world.nol.com，下一轮启动时间: ${nextAtText}`);
+
+  const waitUrl = "https://world.nol.com/";
+  try {
+    window.location.assign(waitUrl);
+  } catch (_) {
+    window.location.href = waitUrl;
+  }
+  return true;
+}
+
+function shouldHoldOnWorldForScavengeWaiting() {
+  if (!state.config.enabled || state.config.scavengeLoopEnabled !== true || state.scavengeLoopSuccess) {
+    return false;
+  }
+  const nextAt = Number(state.scavengeLoopNextRestartAt || 0);
+  if (!nextAt) return false;
+  const now = Date.now();
+  if (now >= nextAt) return false;
+
+  const shouldLog =
+    state.scavengeLoopLastWaitTargetAt !== nextAt || now - state.scavengeLoopLastWaitLogAt > 8000;
+  if (shouldLog) {
+    state.scavengeLoopLastWaitLogAt = now;
+    state.scavengeLoopLastWaitTargetAt = nextAt;
+    log(`捡漏等待中，下一轮启动时间: ${new Date(nextAt).toLocaleString()}`);
+  }
+  return true;
 }
 
 function setTickMode(mode) {
@@ -1728,7 +2022,7 @@ function findMinusButton() {
 }
 
 function getPreorderButtonStrict() {
-  const words = ["预购", "預購", "订购", "訂購"];
+  const words = ["预购", "預購", "preorder", "pre-order"];
   const buttons = Array.from(
     document.querySelectorAll("button, [role='button'], a, div, span")
   ).filter(visible);
@@ -1769,7 +2063,7 @@ function isElementDisabledLike(el) {
 }
 
 function clickPreorderButtonStrict() {
-  const words = ["预购", "預購", "订购", "訂購"];
+  const words = ["预购", "預購", "preorder", "pre-order"];
   const target = getPreorderButtonStrict();
   if (!target) {
     // fallback: bottom-right primary button with strict preorder keywords
@@ -1784,8 +2078,7 @@ function clickPreorderButtonStrict() {
 }
 
 function hasPreorderActionAvailable() {
-  const words = ["预购", "預購", "订购", "訂購"];
-  return Boolean(findButtonByClassAndText(words) || findClickableByText(words));
+  return Boolean(getPreorderButtonStrict());
 }
 
 async function runPriceStep() {
@@ -2069,6 +2362,18 @@ function normalizeTimeToken(text) {
   return normalizeText(text).replace(/\s+/g, "");
 }
 
+function isConfiguredTimeMatch(targetRaw, candidateText) {
+  const targetMinutes = parseTimeMinutes(targetRaw);
+  const candidateMinutes = parseTimeMinutes(candidateText);
+  if (Number.isFinite(targetMinutes) && Number.isFinite(candidateMinutes)) {
+    return targetMinutes === candidateMinutes;
+  }
+  const targetToken = normalizeTimeToken(targetRaw);
+  const candidateToken = normalizeTimeToken(candidateText);
+  if (!targetToken || !candidateToken) return false;
+  return candidateToken.includes(targetToken) || targetToken.includes(candidateToken);
+}
+
 function hasNeedChooseSessionHint() {
   const text = getWholeText();
   return (
@@ -2082,7 +2387,7 @@ function hasNeedChooseSessionHint() {
 }
 
 function parseTimeMinutes(text) {
-  const m = String(text || "").match(/(\d{1,2})\s*:\s*(\d{2})\s*([ap]m)?/i);
+  const m = String(text || "").match(/(\d{1,2})\s*[:：.]\s*(\d{2})\s*([ap]m)?/i);
   if (!m) return Number.POSITIVE_INFINITY;
   let hour = Number(m[1]);
   const minute = Number(m[2]);
@@ -2096,7 +2401,7 @@ function parseTimeMinutes(text) {
 }
 
 function getDateTimeOptionCandidates(sortMode = "score") {
-  const timePattern = /\b\d{1,2}\s*:\s*\d{2}\s*(?:am|pm)?\b/i;
+  const timePattern = /\b\d{1,2}\s*[:：.]\s*\d{2}\s*(?:am|pm)?\b/i;
   const nodes = Array.from(
     document.querySelectorAll("button, [role='button'], div, span, li, p")
   ).filter(visible);
@@ -2196,8 +2501,6 @@ function selectEarliestDateTimeOption() {
 function selectConfiguredDateTime() {
   const targetRaw = String(state.config.dateTime || "").trim();
   if (!targetRaw) return true;
-  const targetToken = normalizeTimeToken(targetRaw);
-  if (!targetToken) return true;
 
   const candidates = Array.from(
     document.querySelectorAll("button, [role='button'], div, span, li, p")
@@ -2206,8 +2509,7 @@ function selectConfiguredDateTime() {
     .map((el) => {
       const text = (el.textContent || "").trim();
       if (!text || text.length > 80) return null;
-      const token = normalizeTimeToken(text);
-      if (!token.includes(targetToken)) return null;
+      if (!isConfiguredTimeMatch(targetRaw, text)) return null;
       const cls = normalizeText(el.className?.toString() || "");
       const disabled =
         el.disabled ||
@@ -2221,6 +2523,11 @@ function selectConfiguredDateTime() {
       if (r.top > 90 && r.top < window.innerHeight * 0.72) score += 3;
       if (r.width > 120 && r.height > 34) score += 4;
       if (cls.includes("selected") || cls.includes("active")) score += 1;
+      const timeMinutes = parseTimeMinutes(text);
+      const targetMinutes = parseTimeMinutes(targetRaw);
+      if (Number.isFinite(timeMinutes) && Number.isFinite(targetMinutes) && timeMinutes === targetMinutes) {
+        score += 5;
+      }
       return { el, score };
     })
     .filter(Boolean)
@@ -2979,8 +3286,15 @@ function findReserveEntryButtonStrict() {
       if (
         text.startsWith("预约") ||
         text.startsWith("預約") ||
+        text.includes("一般预订") ||
+        text.includes("一般預訂") ||
+        text.includes("一般预定") ||
+        text.includes("一般預定") ||
+        text.includes("general reservation") ||
+        text.includes("normal reservation") ||
         text.startsWith("reservation") ||
-        text.startsWith("reserve")
+        text.startsWith("reserve") ||
+        text.includes("일반예매")
       ) {
         score += 4;
       }
@@ -3059,11 +3373,16 @@ async function runProductStep() {
     } else {
       setTickMode("fast");
     }
+    if (clickBuyNowAggressive()) {
+      log("商品页已点击立即购买，优先进入 Interpark gates 待命");
+      await sleep(state.tickMode === "critical" ? 35 : 140);
+      return;
+    }
     const now = Date.now();
     const remainSec = Math.ceil(countdownMs / 1000);
     const logInterval = countdownMs <= 10000 ? 500 : 4000;
     if (now - state.productLastCountdownLogAt >= logInterval) {
-      log(`距开抢 ${remainSec}s，待命中`);
+      log(`距开抢 ${remainSec}s，等待进入 Interpark gates`);
       state.productLastCountdownLogAt = now;
     }
     return;
@@ -3273,8 +3592,11 @@ async function runEximbayStep() {
 }
 
 function getOcrApiUrl() {
-  const raw = String(state.config.ocrApiUrl || "").trim();
-  return raw || "http://127.0.0.1:8000/ocr/file";
+  return normalizeOcrApiUrl(state.config.ocrApiUrl, DEFAULT_OCR_API_URL);
+}
+
+function getOcrApiToken() {
+  return String(state.config.ocrApiToken || "").trim();
 }
 
 function getCaptchaSearchDocuments(preferredDoc = null) {
@@ -3381,6 +3703,46 @@ async function triggerLegacyCaptchaAction(action) {
     return Boolean(resp?.ok && resp?.result?.ok);
   } catch (_) {
     return false;
+  }
+}
+
+async function triggerLegacyScriptMainWorld(script, label = "") {
+  const normalized = normalizeLegacyScriptCode(script);
+  if (!normalized) return { ok: false, error: "empty_script" };
+  try {
+    const resp = await chrome.runtime.sendMessage({
+      type: "LEGACY_RUN_SCRIPT_MAIN",
+      script: normalized,
+      label: String(label || "")
+    });
+    return resp?.result || { ok: false, error: "no_result" };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+}
+
+async function triggerLegacySeatSelectMainWorld(candidate) {
+  const seat = candidate?.el;
+  if (!seat) return { ok: false, error: "no_seat" };
+  const onclick = String(seat.getAttribute("onclick") || "").trim();
+  const title = String(seat.getAttribute("title") || "").trim();
+  const areaCode = String(
+    state.legacySeatCurrentAreaCode || extractLegacySeatAreaCode(onclick) || ""
+  ).trim();
+  const payload = {
+    title,
+    onclick,
+    areaCode,
+    key: String(candidate?.key || "").trim()
+  };
+  try {
+    const resp = await chrome.runtime.sendMessage({
+      type: "LEGACY_SELECT_SEAT_MAIN",
+      payload
+    });
+    return resp?.result || { ok: false, error: "no_result" };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
   }
 }
 
@@ -3799,6 +4161,7 @@ async function requestCaptchaOcr(imageBytes) {
   const resp = await chrome.runtime.sendMessage({
     type: "OCR_REQUEST",
     apiUrl,
+    ocrApiToken: getOcrApiToken(),
     bytes: Array.from(imageBytes)
   });
   if (!resp?.ok) {
@@ -3936,6 +4299,7 @@ function isQueuePage() {
 }
 
 function isDatePage() {
+  if (isInterparkSchedulePage()) return true;
   const text = getWholeText();
   if (
     text.includes("选择日期") ||
@@ -3950,33 +4314,8 @@ function isDatePage() {
 }
 
 function isPricePage() {
-  const text = getWholeText();
-  const step = String(new URLSearchParams(location.search).get("step") || "").toLowerCase();
-  const hasPriceKeyword = text.includes("选择价格") || text.includes("選擇價格");
-  const hasSeatCountText = /全席\s*\d+\s*\/\s*\d+/i.test(text) || /seats?\s*\d+\s*\/\s*\d+/i.test(text);
-  const preorderAvailable = hasPreorderActionAvailable();
-  const hasQtyControl = Boolean(findPlusButton() || findMinusButton());
-  const hasMoneyLike = /[\d,]+\s*(元|won)/i.test(text);
-  const hasInfoKeyword =
-    text.includes("订票者资讯") ||
-    text.includes("訂購者資訊") ||
-    text.includes("手機號碼") ||
-    text.includes("手机号");
-
-  // URL 已显式指向价格步骤时，直接判定为价格页。
-  if (step === "price") return true;
-
-  if (
-    hasPriceKeyword ||
-    hasSeatCountText
-  ) {
-    return true;
-  }
-  // 强兜底：右侧价格卡常见结构是“数量控件 + 金额文案”。
-  if (hasQtyControl && hasMoneyLike && !hasInfoKeyword) return true;
-  // 兜底：有预购动作且具备数量/金额特征时，按价格页处理
-  if (preorderAvailable && (hasQtyControl || hasMoneyLike) && !hasInfoKeyword) return true;
-  return false;
+  const href = String(location.href || "").toLowerCase();
+  return href.includes("price");
 }
 
 function isInfoPage() {
@@ -4021,7 +4360,6 @@ function detectCurrentStage() {
   if (isInfoPage()) return "info";
   if (isPricePage()) return "price";
   if (isDatePage()) return "date";
-  if (hasPreorderActionAvailable()) return "price";
   return "unknown";
 }
 
@@ -4032,6 +4370,32 @@ function isLegacyBookingUrl() {
     href.includes("/global/play/book/bookmain.asp") ||
     path.includes("/global/play/book/bookmain.asp")
   );
+}
+
+function isInterparkGatePage() {
+  const host = String(location.host || "").toLowerCase();
+  const path = String(location.pathname || "").toLowerCase();
+  return host === "tickets.interpark.com" && path.includes("/gates/");
+}
+
+function isInterparkSchedulePage() {
+  const host = String(location.host || "").toLowerCase();
+  const path = String(location.pathname || "").toLowerCase();
+  return host === "tickets.interpark.com" && path.includes("/onestop/schedule");
+}
+
+function isInterparkGateWithoutBizCode() {
+  if (!isInterparkGatePage()) return false;
+  try {
+    const params = new URLSearchParams(String(location.search || ""));
+    return !String(params.get("bizCode") || "").trim();
+  } catch (_) {
+    return !String(location.search || "").toLowerCase().includes("bizcode=");
+  }
+}
+
+function isInterparkGateWithBizCode() {
+  return isInterparkGatePage() && !isInterparkGateWithoutBizCode();
 }
 
 function detectInterparkBookingVariant() {
@@ -4053,7 +4417,8 @@ function rememberBookingVariant(variant) {
   if (!variant || variant === state.lastBookingPageVariant) return;
   state.lastBookingPageVariant = variant;
   if (variant === "new") {
-    log("识别到 Interpark 新版订票页面 (onestop/seat)，进入新版流程");
+    const path = String(location.pathname || "").trim() || "/";
+    log(`识别到 Interpark 新版订票页面 (${path})，进入新版流程`);
     return;
   }
   if (variant === "legacy") {
@@ -4159,6 +4524,43 @@ async function runBookingStageByType(stage, options = {}) {
 }
 
 async function runNewInterparkTick() {
+  if (isInterparkGateWithoutBizCode()) {
+    if (clickBuyNowAggressive()) {
+      log("Interpark gates: 已点击立即购买，进入带 bizCode 的一般预订页");
+      await sleep(140);
+      return;
+    }
+    if (Date.now() - state.productLastCountdownLogAt > 4000) {
+      log("Interpark gates: 等待进入带 bizCode 的一般预订页（未命中立即购买按钮）");
+      state.productLastCountdownLogAt = Date.now();
+    }
+    return;
+  }
+
+  if (isInterparkGateWithBizCode()) {
+    const countdownMs = getSaleCountdownMs();
+    if (Number.isFinite(countdownMs) && countdownMs > 0) {
+      if (countdownMs <= getCriticalPreMs()) {
+        setTickMode("critical");
+      } else {
+        setTickMode("fast");
+      }
+      const now = Date.now();
+      const remainSec = Math.ceil(countdownMs / 1000);
+      const logInterval = countdownMs <= 10000 ? 500 : 4000;
+      if (now - state.productLastCountdownLogAt >= logInterval) {
+        log(`Interpark gates 距一般预订 ${remainSec}s，待命中`);
+        state.productLastCountdownLogAt = now;
+      }
+      return;
+    }
+    if (clickReserveEntryAggressive()) {
+      log("Interpark gates: 已点击一般预订");
+      await sleep(state.tickMode === "critical" ? 40 : 160);
+      return;
+    }
+  }
+
   if (isQueuePage()) {
     state.lastStage = "queue";
     if (!state.priceLockedSlow) setTickMode("fast");
@@ -4484,7 +4886,7 @@ function clickLegacyDayCandidate(candidate) {
 function getLegacyTimeCandidates(frameDoc) {
   if (!frameDoc) return [];
   const docs = getLegacyCandidateDocs(frameDoc);
-  const timePattern = /\b\d{1,2}\s*:\s*\d{2}\s*(?:am|pm)?\b/i;
+  const timePattern = /\b\d{1,2}\s*[:：.]\s*\d{2}\s*(?:am|pm)?\b/i;
   const fnOut = [];
   const textOut = [];
 
@@ -4822,6 +5224,23 @@ async function clickLegacyNextButton() {
   return false;
 }
 
+async function clickLegacySeatCompleteButton() {
+  const mainScripts = ["fnSelect();", "javascript:fnSelect();"];
+  for (const script of mainScripts) {
+    const main = await triggerLegacyScriptMainWorld(script, "seat_complete");
+    if (main?.ok) {
+      const frameInfo = main.frameId ?? "-";
+      log(`旧版座位完成主世界触发: mode=${main.mode || "-"}, frame=${frameInfo}`);
+      return true;
+    }
+  }
+  if (Date.now() - state.legacySeatLastClickFailLogAt > 1200) {
+    log("旧版座位完成主世界触发失败: fnSelect 未执行成功（已禁用兜底点击）");
+    state.legacySeatLastClickFailLogAt = Date.now();
+  }
+  return false;
+}
+
 function getLegacyNextUiState() {
   const large = document.querySelector("#LargeNextBtn");
   const small = document.querySelector("#SmallNextBtn");
@@ -5107,8 +5526,8 @@ async function runLegacyDateStep() {
   if (panelReady && !timeRaw) {
     timeDone = true;
   } else if (timeRaw) {
-    const targetToken = normalizeTimeToken(timeRaw);
-    const target = timeCandidates.find((x) => normalizeTimeToken(x.text).includes(targetToken));
+    const matches = timeCandidates.filter((x) => isConfiguredTimeMatch(timeRaw, x.text));
+    const target = matches.find((x) => x.selected) || matches[0];
     if (target) {
       timeDone = target.selected || clickLegacyTimeCandidate(target);
     } else {
@@ -5211,8 +5630,16 @@ function resetLegacySeatRuntime() {
   state.legacySeatLastNextAt = 0;
   state.legacySeatSelectedAssumed = 0;
   state.legacySeatClickedKeys = [];
+  state.legacySeatAttemptedKeys = {};
   state.legacySeatNoSeatCycles = 0;
   state.legacySeatLastLogAt = 0;
+  state.legacySeatLastClickFailLogAt = 0;
+  state.legacySeatLastGradeClickAt = 0;
+  state.legacySeatCurrentGrade = "";
+  state.legacySeatGradeIndex = 0;
+  state.legacySeatLastAreaDiscoveryAt = 0;
+  state.legacySeatAreaSettleUntil = 0;
+  state.legacySeatSinglePickPendingUntil = 0;
 }
 
 function getLegacySeatFrameDocument() {
@@ -5234,7 +5661,7 @@ function getLegacySeatSearchDocuments(preferredDoc = null) {
     out.push(doc);
   };
 
-  const walkFrames = (doc, depth = 0, maxDepth = 1) => {
+  const walkFrames = (doc, depth = 0, maxDepth = 3) => {
     if (!doc || depth > maxDepth) return;
     push(doc);
     if (depth === maxDepth) return;
@@ -5248,9 +5675,9 @@ function getLegacySeatSearchDocuments(preferredDoc = null) {
   };
 
   const seatDoc = getLegacySeatFrameDocument();
-  if (seatDoc) walkFrames(seatDoc, 0, 1);
-  if (preferredDoc) walkFrames(preferredDoc, 0, 1);
-  walkFrames(document, 0, 1);
+  if (seatDoc) walkFrames(seatDoc, 0, 3);
+  if (preferredDoc) walkFrames(preferredDoc, 0, 3);
+  walkFrames(document, 0, 2);
   return out;
 }
 
@@ -5264,27 +5691,283 @@ function extractLegacySeatAreaCode(raw) {
   return lastQuoted[lastQuoted.length - 1] || "";
 }
 
-function collectLegacySeatAreaCandidates() {
-  const docs = getLegacySeatSearchDocuments();
+function normalizeLegacyScriptCode(raw) {
+  let code = String(raw || "").trim();
+  if (!code) return "";
+  code = code.replace(/^javascript:\s*/i, "").trim();
+  code = code.replace(/\breturn\s+false\b\s*;?/gi, "").trim();
+  if (!code) return "";
+  return code;
+}
+
+function runLegacyScriptCode(view, code, thisArg = null) {
+  if (!view) return false;
+  const script = normalizeLegacyScriptCode(code);
+  if (!script) return false;
+  try {
+    const fn = view.Function(script);
+    fn.call(thisArg || view);
+    return true;
+  } catch (_) {
+    try {
+      view.eval(script);
+      return true;
+    } catch (_) {}
+  }
+  return false;
+}
+
+function collectLegacyAreaScripts(el) {
+  if (!isDomElement(el)) return [];
+  const out = [];
+  const seen = new Set();
+  const pushScriptsFromNode = (node) => {
+    if (!isDomElement(node)) return;
+    const raws = getLegacyRawHandlerSnippets(node);
+    for (const raw of raws) {
+      const code = normalizeLegacyScriptCode(raw);
+      if (!code) continue;
+      const bag = normalizeText(code);
+      if (bag.includes("fnswapgrade")) continue;
+      if (!/[a-z_][\w$]*\s*\(/i.test(code)) continue;
+      if (seen.has(code)) continue;
+      seen.add(code);
+      out.push(code);
+    }
+  };
+
+  pushScriptsFromNode(el);
+  const anchor =
+    String(el.tagName || "").toLowerCase() === "a" ? el : el.closest?.("a");
+  if (anchor) pushScriptsFromNode(anchor);
+  const li = el.closest?.("li");
+  if (li) pushScriptsFromNode(li);
+  const nested = Array.from(
+    el.querySelectorAll?.("a[href^='javascript:'], a[onclick], [onclick]") || []
+  );
+  for (const node of nested) pushScriptsFromNode(node);
+  return out;
+}
+
+function parseLegacyRemainCount(raw) {
+  const n = Number(String(raw || "").replace(/[^\d-]/g, ""));
+  if (!Number.isFinite(n)) return null;
+  return n;
+}
+
+function collectLegacySeatGradeCandidates(preferredDoc = null) {
+  const docs = getLegacySeatSearchDocuments(preferredDoc);
+  const out = [];
+  const seen = new Set();
+
+  for (const doc of docs) {
+    const nodes = Array.from(
+      doc.querySelectorAll(
+        ".watch_info [onclick*='fnSwapGrade'], #SeatGradeInfo [onclick*='fnSwapGrade'], a[href*='fnSwapGrade'], a[onclick*='fnSwapGrade']"
+      )
+    );
+    for (const el of nodes) {
+      if (!isDomElement(el) || !visible(el)) continue;
+      const raw = getLegacyRawHandlerSnippets(el).join(" ");
+      const bag = normalizeText(raw);
+      if (!bag.includes("fnswapgrade")) continue;
+
+      const gradeMatch = raw.match(/fnswapgrade\s*\(\s*'?(\d+)'?\s*\)/i);
+      const gradeId = String(gradeMatch?.[1] || "").trim();
+
+      let detail = null;
+      if (gradeId) {
+        const detailNodes = Array.from(
+          doc.querySelectorAll("#GradeDetail[seatgrade], td#GradeDetail[seatgrade]")
+        );
+        detail =
+          detailNodes.find(
+            (node) => String(node.getAttribute("seatgrade") || "").trim() === gradeId
+          ) || null;
+      }
+      if (!detail) {
+        const tr = el.closest("tr");
+        const next = tr?.nextElementSibling;
+        detail =
+          next?.querySelector?.("#GradeDetail[seatgrade], td#GradeDetail[seatgrade]") || null;
+      }
+
+      const remain = parseLegacyRemainCount(detail?.getAttribute?.("remaincnt") || "");
+      const label = String(el.textContent || "").replace(/\s+/g, " ").trim() || gradeId || "-";
+      const key = `${gradeId || "-"}|${label}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      let score = 0;
+      if (Number.isFinite(remain) && remain > 0) score += 10;
+      if (Number.isFinite(remain) && remain <= 0) score -= 3;
+      if (label.toLowerCase().includes("vip")) score += 2;
+      out.push({ el, gradeId, label, remain, score });
+    }
+  }
+
+  out.sort((a, b) => {
+    const ar = Number.isFinite(a.remain) ? a.remain : -1;
+    const br = Number.isFinite(b.remain) ? b.remain : -1;
+    if (ar !== br) return br - ar;
+    if (a.score !== b.score) return b.score - a.score;
+    return String(a.gradeId || "").localeCompare(String(b.gradeId || ""));
+  });
+  return out;
+}
+
+async function clickLegacySeatGradeCandidate(grade) {
+  if (!grade?.el) return false;
+  const now = Date.now();
+  const current = String(grade.gradeId || grade.label || "").trim();
+  if (now - state.legacySeatLastGradeClickAt < 320 && state.legacySeatCurrentGrade === current) {
+    return false;
+  }
+
+  let hit = runLegacyHandlerScript(grade.el, ["fnswapgrade", "swapgrade"]);
+  const anchor =
+    String(grade.el.tagName || "").toLowerCase() === "a" ? grade.el : grade.el.closest?.("a");
+  if (!hit && anchor) {
+    hit = runLegacyHandlerScript(anchor, ["fnswapgrade", "swapgrade"]);
+  }
+  if (!hit && !hasJavascriptHref(grade.el)) {
+    hit = forceClick(grade.el) || clickAtCenter(grade.el) || clickElement(grade.el);
+  }
+  if (!hit && anchor && !hasJavascriptHref(anchor)) {
+    hit = forceClick(anchor) || clickAtCenter(anchor) || clickElement(anchor);
+  }
+  if (!hit) return false;
+
+  state.legacySeatLastGradeClickAt = now;
+  state.legacySeatCurrentGrade = current;
+  log(
+    `旧版选座先切等级: ${grade.label}${
+      Number.isFinite(grade.remain) ? ` (remain=${grade.remain})` : ""
+    }`
+  );
+  return true;
+}
+
+function collectLegacySeatAreaCandidates(preferredDoc = null) {
+  const docs = getLegacySeatSearchDocuments(preferredDoc);
   const out = [];
   const seen = new Set();
   for (const doc of docs) {
     const nodes = Array.from(
       doc.querySelectorAll(
-        "a[href*='fnBlockSeatUpdate'], a[onclick*='fnBlockSeatUpdate'], [onclick*='fnBlockSeatUpdate']"
+        "a[href*='fnBlockSeatUpdate'], a[onclick*='fnBlockSeatUpdate'], [onclick*='fnBlockSeatUpdate'], .watch_info li, .watch_info a, #SeatGradeInfo li, #SeatGradeInfo a, #GradeDetail li, #GradeDetail a"
       )
     );
     for (const el of nodes) {
       if (!isDomElement(el)) continue;
-      const code = extractLegacySeatAreaCode(getLegacyHandlerCode(el));
+      const scripts = collectLegacyAreaScripts(el);
+      if (!scripts.length) continue;
+      const raw = scripts.join("; ");
+      const handlerBag = normalizeText(raw);
+      const metaBag = normalizeText(
+        [handlerBag, el.id, el.className?.toString(), el.getAttribute("href"), el.textContent]
+          .filter(Boolean)
+          .join(" ")
+      );
+      if (!metaBag) continue;
+      if (metaBag.includes("fnswapgrade")) continue;
+      const inWatchInfo = Boolean(el.closest(".watch_info, #SeatGradeInfo"));
+      const hasAreaAction =
+        metaBag.includes("fnblockseatupdate") ||
+        metaBag.includes("blockseatupdate") ||
+        inWatchInfo;
+      if (!hasAreaAction) continue;
+
+      const code = extractLegacySeatAreaCode(raw || metaBag);
       const label = String(el.textContent || "").replace(/\s+/g, " ").trim();
-      const key = code || label;
+      const key = code || scripts[0] || label;
       if (!key || seen.has(key)) continue;
       seen.add(key);
-      out.push({ el, code, label: label || code || "-" });
+      let score = 0;
+      if (metaBag.includes("fnblockseatupdate")) score += 8;
+      if (inWatchInfo) score += 3;
+      if (code) score += 2;
+      if (visible(el)) score += 1;
+      out.push({ el, code, key, scripts, label: label || code || "-", score });
     }
   }
+  out.sort((a, b) => b.score - a.score || String(a.label).localeCompare(String(b.label)));
   return out;
+}
+
+function mergeLegacySeatAreaCandidates(base = [], extra = []) {
+  const out = [];
+  const seen = new Set();
+  const push = (item) => {
+    if (!item) return;
+    const key = String(item.code || item.key || item.scripts?.[0] || item.label || "").trim();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push(item);
+  };
+  (Array.isArray(base) ? base : []).forEach(push);
+  (Array.isArray(extra) ? extra : []).forEach(push);
+  out.sort(
+    (a, b) =>
+      Number(b?.score || 0) - Number(a?.score || 0) ||
+      String(a?.label || "").localeCompare(String(b?.label || ""))
+  );
+  return out;
+}
+
+function applyLegacyAreaOrderByConfig(areas = []) {
+  const list = Array.isArray(areas) ? areas.slice() : [];
+  if (!list.length) return list;
+  const mode = state.config.legacyAreaOrderMode === "custom" ? "custom" : "default";
+  if (mode !== "custom") return list;
+
+  const customCodes = normalizeLegacyAreaCustomCodes(state.config.legacyAreaCustomCodes || []);
+  if (!customCodes.length) return list;
+
+  const orderMap = new Map(customCodes.map((code, idx) => [code, idx]));
+  const matched = list.filter((area) => orderMap.has(String(area?.code || "").trim()));
+  if (!matched.length) return list;
+
+  matched.sort((a, b) => {
+    const ai = orderMap.get(String(a?.code || "").trim());
+    const bi = orderMap.get(String(b?.code || "").trim());
+    if (ai !== bi) return ai - bi;
+    return String(a?.label || "").localeCompare(String(b?.label || ""));
+  });
+  return matched;
+}
+
+async function discoverLegacySeatAreasByGradeSweep(seatDoc, initialAreas = []) {
+  let mergedAreas = mergeLegacySeatAreaCandidates(initialAreas, []);
+  const grades = collectLegacySeatGradeCandidates(seatDoc);
+  if (!grades.length) return mergedAreas;
+
+  const startIdx = Number.isFinite(state.legacySeatGradeIndex)
+    ? state.legacySeatGradeIndex % grades.length
+    : 0;
+
+  for (let i = 0; i < grades.length; i += 1) {
+    const idx = (startIdx + i) % grades.length;
+    const grade = grades[idx];
+    await clickLegacySeatGradeCandidate(grade);
+    await sleep(500);
+    mergedAreas = mergeLegacySeatAreaCandidates(
+      mergedAreas,
+      collectLegacySeatAreaCandidates(seatDoc)
+    );
+  }
+  state.legacySeatGradeIndex = (startIdx + grades.length) % grades.length;
+
+  if (mergedAreas.length) {
+    const preview = mergedAreas
+      .slice(0, 10)
+      .map((x) => String(x.code || x.label || "-"))
+      .join(", ");
+    log(`旧版区域脚本收集完成: 共${mergedAreas.length}个，示例=${preview}`);
+  } else {
+    log("旧版已轮询全部 GradeRow，但仍未收集到 fnBlockSeatUpdate 区域脚本");
+  }
+  return applyLegacyAreaOrderByConfig(mergedAreas);
 }
 
 function hasLegacySeatClickedKey(key) {
@@ -5300,16 +5983,71 @@ function rememberLegacySeatClickedKey(key) {
   }
 }
 
+function rememberLegacySeatAttemptKey(key) {
+  const k = String(key || "").trim();
+  if (!k) return;
+  const now = Date.now();
+  state.legacySeatAttemptedKeys[k] = now;
+  const entries = Object.entries(state.legacySeatAttemptedKeys || {});
+  if (entries.length > 1200) {
+    const pruned = {};
+    for (const [ek, ts] of entries) {
+      if (now - Number(ts || 0) < 30000) pruned[ek] = Number(ts || 0);
+    }
+    state.legacySeatAttemptedKeys = pruned;
+  }
+}
+
+function hasLegacySeatRecentAttempt(key, cooldownMs = 5000) {
+  const k = String(key || "").trim();
+  if (!k) return false;
+  const ts = Number(state.legacySeatAttemptedKeys?.[k] || 0);
+  if (!Number.isFinite(ts) || ts <= 0) return false;
+  return Date.now() - ts < cooldownMs;
+}
+
+function isLegacySeatDashedSelected(el) {
+  if (!isDomElement(el)) return false;
+  const inlineStyle = normalizeText(el.getAttribute("style") || "");
+  if (inlineStyle.includes("border") && inlineStyle.includes("dashed")) return true;
+  try {
+    const view = el.ownerDocument?.defaultView || window;
+    const st = view.getComputedStyle(el);
+    const borderStyle = normalizeText(st.borderStyle || "");
+    const borderWidth = Number.parseFloat(String(st.borderWidth || "0"));
+    if (borderStyle.includes("dashed") && Number.isFinite(borderWidth) && borderWidth > 0.4) {
+      return true;
+    }
+  } catch (_) {}
+  return false;
+}
+
 function isLegacySeatSpanAvailable(el) {
   if (!isDomElement(el) || !visibleForSeat(el)) return false;
   const tag = String(el.tagName || "").toLowerCase();
   if (tag !== "span") return false;
-  const cls = normalizeText(el.className || "");
+  const clsRaw =
+    typeof el.className === "string"
+      ? el.className
+      : typeof el.className?.baseVal === "string"
+        ? el.className.baseVal
+        : String(el.className || "");
+  const cls = normalizeText(clsRaw);
   const value = normalizeText(el.getAttribute("value") || "");
+  const title = normalizeText(el.getAttribute("title") || "");
+  const onclick = normalizeText(el.getAttribute("onclick") || "");
   const handler = getLegacyHandlerCode(el);
-  const hasSelectSeatHandler = handler.includes("selectseat");
+  const hasSelectSeatHandler = handler.includes("selectseat") || onclick.includes("selectseat");
+  const isSeatLike =
+    cls.includes("seat") ||
+    normalizeText(el.id || "") === "seats" ||
+    normalizeText(el.getAttribute("name") || "") === "seats" ||
+    hasSelectSeatHandler;
+  if (!isSeatLike) return false;
   if (cls.includes("seatr") || cls.includes("seatb") || cls.includes("sold")) return false;
-  if (cls.includes("seatn")) return hasSelectSeatHandler || value === "n";
+  if (isLegacySeatDashedSelected(el)) return false;
+  if (cls.includes("seatn") || value === "n") return true;
+  if (title.includes("구역") && hasSelectSeatHandler && !value) return true;
   if (!hasSelectSeatHandler) return false;
   if (value && value !== "n") return false;
   return true;
@@ -5317,6 +6055,7 @@ function isLegacySeatSpanAvailable(el) {
 
 function isLegacySeatSpanSelected(el) {
   if (!isDomElement(el) || !visibleForSeat(el)) return false;
+  if (isLegacySeatDashedSelected(el)) return true;
   const cls = normalizeText(el.className || "");
   if (!cls.includes("seat")) return false;
   if (cls.includes("seatn") || cls.includes("seatr") || cls.includes("seatb")) return false;
@@ -5327,7 +6066,8 @@ function getLegacySeatKey(el) {
   if (!isDomElement(el)) return "";
   const rect = el.getBoundingClientRect();
   const title = String(el.getAttribute("title") || "").trim();
-  const code = extractLegacySeatAreaCode(getLegacyHandlerCode(el));
+  const fromHandler = extractLegacySeatAreaCode(getLegacyHandlerCode(el));
+  const code = String(fromHandler || state.legacySeatCurrentAreaCode || "").trim();
   const token = title || String(el.getAttribute("onclick") || "").trim();
   return `${code || "-"}|${token || "-"}|${Math.round(rect.left)}:${Math.round(rect.top)}`;
 }
@@ -5363,7 +6103,11 @@ function getLegacyAvailableSeatCandidates(preferredDoc = null) {
   for (const doc of docs) {
     const view = doc.defaultView || window;
     const centerX = Math.max(240, view.innerWidth || window.innerWidth || 1024) / 2;
-    const nodes = Array.from(doc.querySelectorAll("span#Seats, span[name='Seats'], span[class*='Seat']"));
+    const nodes = Array.from(
+      doc.querySelectorAll(
+        "span#Seats, span[name='Seats'], span[class*='Seat'], span[onclick*='SelectSeat'], span[onclick*='selectseat'], span[value='N'], span[value='n']"
+      )
+    );
     for (const el of nodes) {
       if (!isLegacySeatSpanAvailable(el)) continue;
       const key = getLegacySeatKey(el);
@@ -5386,17 +6130,77 @@ function getLegacyAvailableSeatCandidates(preferredDoc = null) {
   return out;
 }
 
+function getLegacySeatScanStats(preferredDoc = null) {
+  const docs = getLegacySeatSearchDocuments(preferredDoc);
+  let total = 0;
+  let seatN = 0;
+  let available = 0;
+  for (const doc of docs) {
+    const nodes = Array.from(
+      doc.querySelectorAll(
+        "span#Seats, span[name='Seats'], span[class*='Seat'], span[onclick*='SelectSeat'], span[onclick*='selectseat'], span[value='N'], span[value='n']"
+      )
+    );
+    total += nodes.length;
+    for (const el of nodes) {
+      const clsRaw =
+        typeof el.className === "string"
+          ? el.className
+          : typeof el.className?.baseVal === "string"
+            ? el.className.baseVal
+            : String(el.className || "");
+      const cls = normalizeText(clsRaw);
+      const value = normalizeText(el.getAttribute("value") || "");
+      if (cls.includes("seatn") || value === "n") seatN += 1;
+      if (isLegacySeatSpanAvailable(el)) available += 1;
+    }
+  }
+  return { total, seatN, available, docs: docs.length };
+}
+
 async function switchLegacySeatArea(area) {
   if (!area?.el) return false;
   const now = Date.now();
-  if (now - state.legacySeatLastAreaSwitchAt < 220 && state.legacySeatCurrentAreaCode === area.code) {
+  const areaIdentity = String(area.code || area.key || area.label || "").trim();
+  if (
+    now - state.legacySeatLastAreaSwitchAt < 220 &&
+    state.legacySeatCurrentAreaCode === areaIdentity
+  ) {
     return true;
   }
 
-  let hit = runLegacyHandlerScript(area.el, ["fnblockseatupdate", "blockseatupdate"]);
+  let hit = false;
+  let mainResult = null;
+  let mainLastResult = null;
+  const areaLabel = String(area.code || area.label || area.key || "").trim();
+  const mainScripts = (Array.isArray(area.scripts) ? area.scripts : []).slice().sort((a, b) => {
+    const aa = /fnblockseatupdate\s*\(/i.test(String(a || "")) ? 1 : 0;
+    const bb = /fnblockseatupdate\s*\(/i.test(String(b || "")) ? 1 : 0;
+    return bb - aa;
+  });
+  for (const script of mainScripts) {
+    const main = await triggerLegacyScriptMainWorld(script, areaLabel);
+    mainLastResult = main;
+    if (main?.ok) {
+      hit = true;
+      mainResult = main;
+      break;
+    }
+  }
+  if (!hit) {
+    hit = runLegacyHandlerScript(area.el, [
+    "fnblockseatupdate",
+    "blockseatupdate",
+    "selectblock"
+    ]);
+  }
   const anchor = String(area.el.tagName || "").toLowerCase() === "a" ? area.el : area.el.closest?.("a");
   if (!hit && anchor) {
-    hit = runLegacyHandlerScript(anchor, ["fnblockseatupdate", "blockseatupdate"]);
+    hit = runLegacyHandlerScript(anchor, [
+      "fnblockseatupdate",
+      "blockseatupdate",
+      "selectblock"
+    ]);
   }
   if (!hit && !hasJavascriptHref(area.el)) {
     hit = forceClick(area.el) || clickAtCenter(area.el) || clickElement(area.el);
@@ -5406,9 +6210,27 @@ async function switchLegacySeatArea(area) {
   }
   if (!hit) return false;
 
-  state.legacySeatCurrentAreaCode = area.code || "";
+  state.legacySeatCurrentAreaCode = areaIdentity;
   state.legacySeatLastAreaSwitchAt = now;
-  log(`旧版选座切换区域: ${area.label}${area.code ? `(${area.code})` : ""}`);
+  state.legacySeatAreaSettleUntil = now + LEGACY_AREA_SETTLE_MS;
+  const srcChanged =
+    mainResult && mainResult.beforeSeatSrc !== mainResult.afterSeatSrc ? "Y" : "N";
+  const mainExec = (() => {
+    if (mainResult) {
+      return `, main=Y, fn=${mainResult.fnBlockSeatUpdateDefined ? "Y" : "N"}, host=${
+        mainResult.fnHost || "-"
+      }, srcChanged=${srcChanged}, frame=${mainResult.frameId ?? "-"}, mode=${
+        mainResult.mode || "-"
+      }`;
+    }
+    if (mainLastResult) {
+      return `, main=N, fn=${mainLastResult.fnBlockSeatUpdateDefined ? "Y" : "N"}, host=${
+        mainLastResult.fnHost || "-"
+      }, frame=${mainLastResult.frameId ?? "-"}, err=${String(mainLastResult.error || "-")}`;
+    }
+    return "";
+  })();
+  log(`旧版选座切换区域: ${area.label}${area.code ? `(${area.code})` : ""}${mainExec}`);
   return true;
 }
 
@@ -5416,31 +6238,38 @@ async function clickLegacySeatCandidate(candidate, target) {
   const seat = candidate?.el;
   if (!seat) return false;
   const key = candidate.key || getLegacySeatKey(seat);
-  if (key) rememberLegacySeatClickedKey(key);
+  if (key) rememberLegacySeatAttemptKey(key);
 
   const before = getLegacySelectedSeatCount();
-  runLegacyHandlerScript(seat, ["selectseat"]);
-  forceClick(seat);
-  clickAtCenter(seat);
-  clickElement(seat);
+  const main = await triggerLegacySeatSelectMainWorld(candidate);
+  if (!main?.ok) await sleep(120);
   await sleep(140);
 
   const after = getLegacySelectedSeatCount();
+  const visuallySelected = isLegacySeatSpanSelected(seat);
   const stillAvailable = isLegacySeatSpanAvailable(seat);
-  const success = after > before || !stillAvailable;
+  const success = after > before || visuallySelected || !stillAvailable;
   if (success) {
+    if (key) rememberLegacySeatClickedKey(key);
     if (after > state.legacySeatSelectedAssumed) {
       state.legacySeatSelectedAssumed = after;
     } else {
       state.legacySeatSelectedAssumed = Math.min(target, Math.max(before + 1, state.legacySeatSelectedAssumed));
     }
     log(`旧版选座进度: ${Math.min(target, getLegacySelectedSeatCount())}/${target}`);
+  } else if (main && Date.now() - state.legacySeatLastClickFailLogAt > 900) {
+    log(
+      `旧版SeatN点击未生效: matched=${main.matched ? "Y" : "N"}, mode=${main.mode || "-"}, selectSeat=${main.selectSeatDefined ? "Y" : "N"}@${main.selectSeatHost || "-"}, class=${main.beforeClass || "-"}->${main.afterClass || "-"}, frame=${main.frameId ?? "-"}, err=${main.error || "-"}`
+    );
+    state.legacySeatLastClickFailLogAt = Date.now();
   }
   return success;
 }
 
 async function runLegacySeatStep() {
-  const flowKey = `${location.host}${location.pathname}${location.search}|${String(document.querySelector("#ifrmSeat")?.getAttribute("src") || "")}`;
+  // Do not include #ifrmSeat src in flow key: switching area updates iframe src frequently,
+  // which would reset seat runtime and lose selected-seat state (can cause over-selection).
+  const flowKey = `${location.host}${location.pathname}${location.search}|step=${getLegacyActiveStepNumber() || 2}`;
   if (state.legacySeatFlowKey !== flowKey) {
     resetLegacySeatRuntime();
     state.legacySeatFlowKey = flowKey;
@@ -5456,17 +6285,26 @@ async function runLegacySeatStep() {
   }
 
   const target = normalizeQuantity(state.config.quantity, 1);
-  const selected = getLegacySelectedSeatCount();
+  const selected = Math.max(getLegacySelectedSeatCount(), Number(state.legacySeatSelectedAssumed) || 0);
   if (selected >= target) {
+    state.legacySeatSinglePickPendingUntil = 0;
     if (Date.now() - state.legacySeatLastNextAt < 900) return;
-    if (await clickLegacyNextButton()) {
+    if (await clickLegacySeatCompleteButton()) {
       state.legacySeatLastNextAt = Date.now();
-      log(`旧版座位已满足目标(${selected}/${target})，尝试进入下一步`);
+      markLegacySeatSubmitTriggered(selected, target);
+      log(`旧版座位已满足目标(${selected}/${target})，尝试提交座位确认`);
     }
     return;
   }
 
-  const areas = collectLegacySeatAreaCandidates();
+  let areas = applyLegacyAreaOrderByConfig(collectLegacySeatAreaCandidates(seatDoc));
+  if (!areas.length) {
+    const now = Date.now();
+    if (now - state.legacySeatLastAreaDiscoveryAt > 3000) {
+      state.legacySeatLastAreaDiscoveryAt = now;
+      areas = await discoverLegacySeatAreasByGradeSweep(seatDoc, areas);
+    }
+  }
   if (areas.length) {
     if (state.legacySeatAreaIndex >= areas.length) state.legacySeatAreaIndex = 0;
     const currentArea = areas[state.legacySeatAreaIndex];
@@ -5476,13 +6314,55 @@ async function runLegacySeatStep() {
       }
     }
   }
+  const currentAreaDebug = (() => {
+    if (state.legacySeatCurrentAreaCode) return state.legacySeatCurrentAreaCode;
+    if (!areas.length) return "unknown";
+    const a = areas[state.legacySeatAreaIndex] || areas[0];
+    return String(a?.code || a?.label || "unknown");
+  })();
+  const currentAreaPos = areas.length
+    ? `${state.legacySeatAreaIndex + 1}/${areas.length}`
+    : "0/0";
 
-  if (Date.now() - state.legacySeatLastAreaSwitchAt < 180) return;
+  if (state.legacySeatAreaSettleUntil && Date.now() < state.legacySeatAreaSettleUntil) {
+    return;
+  }
   const candidates = getLegacyAvailableSeatCandidates(seatDoc);
-  const untried = candidates.filter((x) => !hasLegacySeatClickedKey(x.key));
+  const cooled = candidates.filter((x) => !hasLegacySeatRecentAttempt(x.key, 6000));
+  const untried = cooled.filter((x) => !hasLegacySeatClickedKey(x.key));
+  const clickPool = untried.length ? untried : cooled;
+  const now = Date.now();
 
-  if (!untried.length) {
-    if (areas.length > 1 && Date.now() - state.legacySeatLastAreaSwitchAt > 260) {
+  if (target === 1 && state.legacySeatSinglePickPendingUntil > now) {
+    if (now - state.legacySeatLastNextAt > 900) {
+      if (await clickLegacySeatCompleteButton()) {
+        state.legacySeatLastNextAt = Date.now();
+        // Keep single-seat lock during transition latency to prevent any second seat click.
+        state.legacySeatSinglePickPendingUntil = Date.now() + 5000;
+        markLegacySeatSubmitTriggered(1, target);
+        log("旧版单票模式: 已触发 Seat selection completed，等待页面切换");
+      }
+    }
+    if (now - state.legacySeatLastLogAt > 1200) {
+      const waitMs = Math.max(0, state.legacySeatSinglePickPendingUntil - now);
+      log(`旧版单票模式: 当前区域=${currentAreaDebug} 锁定中，仅提交completed(${waitMs}ms)`);
+      state.legacySeatLastLogAt = now;
+    }
+    return;
+  }
+
+  if (!clickPool.length) {
+    if (candidates.length) {
+      if (Date.now() - state.legacySeatLastLogAt > 1200) {
+        log(`旧版选座: 当前区域=${currentAreaDebug} 检测到SeatN(${candidates.length})，等待单击冷却`);
+        state.legacySeatLastLogAt = Date.now();
+      }
+      return;
+    }
+    if (
+      areas.length > 1 &&
+      Date.now() - state.legacySeatLastAreaSwitchAt > LEGACY_AREA_SWITCH_INTERVAL_MS
+    ) {
       state.legacySeatAreaIndex = (state.legacySeatAreaIndex + 1) % areas.length;
       if (state.legacySeatAreaIndex === 0) {
         state.legacySeatNoSeatCycles += 1;
@@ -5495,25 +6375,47 @@ async function runLegacySeatStep() {
       return;
     }
     if (Date.now() - state.legacySeatLastLogAt > 2400) {
+      const seatStats = getLegacySeatScanStats(seatDoc);
       log(
-        `旧版选座: 当前区域暂无可选 SeatN，已轮询圈数=${state.legacySeatNoSeatCycles}`
+        `旧版选座: 当前区域=${currentAreaDebug} (${currentAreaPos}) 暂无可选 SeatN，已轮询圈数=${state.legacySeatNoSeatCycles}, seat扫描=${seatStats.available}/${seatStats.seatN}/${seatStats.total}, docs=${seatStats.docs}`
       );
       state.legacySeatLastLogAt = Date.now();
     }
     return;
   }
+  if (!untried.length && candidates.length && Date.now() - state.legacySeatLastLogAt > 2400) {
+    log(`旧版选座: 当前区域=${currentAreaDebug} 检测到可选SeatN(${candidates.length})，重试已尝试座位`);
+    state.legacySeatLastLogAt = Date.now();
+  }
 
   const clickBudget = Math.max(1, Math.min(target - selected, 2));
-  for (let i = 0; i < Math.min(untried.length, clickBudget); i += 1) {
+  for (let i = 0; i < Math.min(clickPool.length, clickBudget); i += 1) {
     if (Date.now() - state.legacySeatLastSeatClickAt < 120) break;
-    await clickLegacySeatCandidate(untried[i], target);
+    const ok = await clickLegacySeatCandidate(clickPool[i], target);
     state.legacySeatLastSeatClickAt = Date.now();
-    if (getLegacySelectedSeatCount() >= target) break;
+    if (target === 1) {
+      state.legacySeatSinglePickPendingUntil = Date.now() + 8000;
+    }
+    const selectedNow = Math.max(
+      getLegacySelectedSeatCount(),
+      Number(state.legacySeatSelectedAssumed) || 0
+    );
+    if (ok && selectedNow >= target && Date.now() - state.legacySeatLastNextAt > 500) {
+      if (await clickLegacySeatCompleteButton()) {
+        state.legacySeatSinglePickPendingUntil = 0;
+        state.legacySeatLastNextAt = Date.now();
+        markLegacySeatSubmitTriggered(selectedNow, target);
+        log(`旧版选座已点击右下角 Seat selection completed (${selectedNow}/${target})`);
+        return;
+      }
+    }
+    if (selectedNow >= target) break;
   }
 }
 
 async function runLegacyInterparkTick() {
   state.lastStage = "legacy";
+  await maybeNotifyLegacySeatCompletedOnTransition();
   if (!state.priceLockedSlow) setTickMode("fast");
   if (state.queueActive) {
     clearQueueRuntimeState();
@@ -5533,6 +6435,8 @@ async function runLegacyInterparkTick() {
 
   if (state.legacySeatFlowKey) {
     resetLegacySeatRuntime();
+    state.legacySeatSelectedAssumed = 0;
+    state.legacySeatSinglePickPendingUntil = 0;
   }
 
   const stepNo = getLegacyActiveStepNumber();
@@ -5556,9 +6460,15 @@ async function tick() {
   state.busy = true;
   try {
     await maybeNotifySale3Minutes();
+    if (await maybeAbortScavengeRoundByTimeout()) {
+      return;
+    }
     const humanVerifyHandled = await runHumanVerifyStep();
     if (humanVerifyHandled) {
       await sleep(120);
+      return;
+    }
+    if (await maybeRunScavengeLoopRestart()) {
       return;
     }
     const host = location.host;
@@ -5576,6 +6486,9 @@ async function tick() {
           state.loginHinted = true;
         }
         setBadge("请先登录 NOL 账号", false);
+        return;
+      }
+      if (shouldHoldOnWorldForScavengeWaiting()) {
         return;
       }
       state.loginHinted = false;
@@ -5635,6 +6548,7 @@ async function loadConfig() {
   if (!config) return;
   state.config = {
     enabled: Boolean(config.enabled),
+    startedAt: Number(config.startedAt || 0),
     eventUrl: config.eventUrl || "",
     fullFlowEnabled: config.fullFlowEnabled !== false,
     saleStartTime: String(config.saleStartTime || "").trim(),
@@ -5642,18 +6556,33 @@ async function loadConfig() {
     criticalPreSeconds: normalizeCriticalSeconds(config.criticalPreSeconds, 2.5, 0.5, 10),
     criticalPostSeconds: normalizeCriticalSeconds(config.criticalPostSeconds, 8, 1, 20),
     criticalTickMs: normalizeCriticalTickMs(config.criticalTickMs, TICK_MS_CRITICAL_DEFAULT),
+    scavengeLoopEnabled: config.scavengeLoopEnabled === true,
+    scavengeLoopIntervalSec: normalizeScavengeLoopIntervalSec(config.scavengeLoopIntervalSec, 600),
+    scavengeRoundMaxSec: normalizeScavengeRoundMaxSec(config.scavengeRoundMaxSec, 0),
     quantity: normalizeQuantity(config.quantity, 1),
     dateMonth: String(config.dateMonth || "").trim(),
     dateDay: String(config.dateDay || "").trim(),
     dateTime: String(config.dateTime || "").trim(),
+    legacyAreaOrderMode: String(config.legacyAreaOrderMode || "default").trim().toLowerCase() === "custom" ? "custom" : "default",
+    legacyAreaCustomCodes: normalizeLegacyAreaCustomCodes(config.legacyAreaCustomCodes || []),
     countryCode: String(config.countryCode || "86"),
     phoneNumber: String(config.phoneNumber || ""),
-    ocrApiUrl: String(config.ocrApiUrl || "http://127.0.0.1:8000/ocr/file").trim(),
+    ocrApiUrl: normalizeOcrApiUrl(config.ocrApiUrl, DEFAULT_OCR_API_URL),
+    ocrActivationCode: String(config.ocrActivationCode || "").trim(),
+    ocrApiToken: String(config.ocrApiToken || "").trim(),
+    ocrDeviceId: String(config.ocrDeviceId || "").trim(),
+    ocrAccessToken: String(config.ocrAccessToken || "").trim(),
+    ocrAccessTokenExpiresAt: Number(config.ocrAccessTokenExpiresAt || 0),
+    ocrLicenseExpiresAt: Number(config.ocrLicenseExpiresAt || 0),
+    ocrLicenseActivatedAt: Number(config.ocrLicenseActivatedAt || 0),
     vpnApiUrl: String(config.vpnApiUrl || "http://127.0.0.1:8000").trim(),
     vpnAutoSwitchEnabled: config.vpnAutoSwitchEnabled !== false,
     dingTalkWebhookUrl: String(config.dingTalkWebhookUrl || "").trim(),
     dingTalkSecret: String(config.dingTalkSecret || "").trim()
   };
+  const storedScavengeNextRestartAt = Number(config.scavengeLoopNextRestartAt || 0);
+  const storedScavengeLastRestartAt = Number(config.scavengeLoopLastRestartAt || 0);
+  const storedScavengeRuntimeStartedAt = Number(config.scavengeLoopRuntimeStartedAt || 0);
   state.tickMode = "fast";
   state.tickIntervalMs = TICK_MS_FAST;
   state.priceLockedSlow = false;
@@ -5674,6 +6603,30 @@ async function loadConfig() {
   state.legacyNextWaitLogAt = 0;
   state.notifySale3mSent = false;
   state.notifyPriceEnteredSent = false;
+  state.notifyLegacySeatCompletedSent = false;
+  state.scavengeLoopSuccess = false;
+  state.scavengeLoopLastWaitLogAt = 0;
+  state.scavengeLoopLastWaitTargetAt = 0;
+  const now = Date.now();
+  const runtimeMatchesCurrentRun =
+    Number(state.config.startedAt || 0) > 0 &&
+    storedScavengeRuntimeStartedAt === Number(state.config.startedAt || 0);
+  if (
+    state.config.enabled &&
+    state.config.scavengeLoopEnabled === true &&
+    runtimeMatchesCurrentRun &&
+    storedScavengeNextRestartAt > now
+  ) {
+    state.scavengeLoopNextRestartAt = storedScavengeNextRestartAt;
+    state.scavengeLoopLastRestartAt =
+      storedScavengeLastRestartAt > 0 ? storedScavengeLastRestartAt : 0;
+  } else {
+    state.scavengeLoopNextRestartAt = 0;
+    state.scavengeLoopLastRestartAt = 0;
+    if (storedScavengeNextRestartAt || storedScavengeLastRestartAt) {
+      clearScavengeRuntime();
+    }
+  }
   state.notifyQueueThresholdSent = { 1000: false, 100: false, 10: false };
   state.queueTop50FastestSwitchDone = false;
   state.queueLastRemaining = null;
@@ -5685,8 +6638,26 @@ async function loadConfig() {
   state.legacySeatLastNextAt = 0;
   state.legacySeatSelectedAssumed = 0;
   state.legacySeatClickedKeys = [];
+  state.legacySeatAttemptedKeys = {};
   state.legacySeatNoSeatCycles = 0;
   state.legacySeatLastLogAt = 0;
+  state.legacySeatLastGradeClickAt = 0;
+  state.legacySeatCurrentGrade = "";
+  state.legacySeatGradeIndex = 0;
+  state.legacySeatLastAreaDiscoveryAt = 0;
+  state.legacySeatAreaSettleUntil = 0;
+  state.legacySeatSinglePickPendingUntil = 0;
+  state.legacySeatSubmitTriggeredAt = 0;
+  state.legacySeatSubmitSelectedAtTrigger = 0;
+  state.legacySeatSubmitTargetAtTrigger = 0;
+  state.captcha.lastImageSig = "";
+  state.captcha.lastAttemptAt = 0;
+  state.captcha.submitCount = 0;
+  state.captcha.solvedAt = 0;
+  state.captcha.lastPassLogAt = 0;
+  state.captcha.candidates = [];
+  state.captcha.candidateIndex = 0;
+  state.captcha.legacyFirstInputDelayDone = false;
   if (state.config.enabled) {
     if (state.intervalId) {
       clearInterval(state.intervalId);

@@ -1,64 +1,67 @@
 # NOL 抢票自动化（Chrome 插件 + FastAPI 后端）
 
-本项目用于 NOL / Interpark 抢票流程自动化，包含两部分：
+当前后端已拆分为两个独立服务：
 
-- Chrome 扩展：页面识别、抢票步骤执行、日志、钉钉通知。
-- Python 后端：验证码 OCR、VPN 健康探测与节点切换。
+- `ocr_service.py`：验证码识别（建议部署到云服务器）
+- `vpn_service.py`：VPN 健康探测与切换（建议保留本地）
 
 ## 目录结构
 
 - `/Users/xuqihan/Desktop/code_study/抢票/extension`：Chrome 扩展代码
-- `/Users/xuqihan/Desktop/code_study/抢票/captcha_api.py`：FastAPI 后端
+- `/Users/xuqihan/Desktop/code_study/抢票/ocr_service.py`：OCR 服务
+- `/Users/xuqihan/Desktop/code_study/抢票/vpn_service.py`：VPN 服务
+- `/Users/xuqihan/Desktop/code_study/抢票/captcha_api.py`：旧版合并服务（兼容）
 - `/Users/xuqihan/Desktop/code_study/抢票/vpn_switch.yaml`：VPN 切换配置
 - `/Users/xuqihan/Desktop/code_study/抢票/scripts/flclash_switch.sh`：FlClash 切节点脚本
-- `/Users/xuqihan/Desktop/code_study/抢票/scripts/flclash_list_proxies.sh`：查看代理组与当前节点
 
 ## 环境要求
 
 - Python 3.11+
 - `uv`
 - Chrome（开发者模式加载扩展）
-- FlClash（已开启 External Controller，默认 `127.0.0.1:9090`）
+- FlClash（本地 VPN 切换依赖）
 
-## 后端启动（uv）
+## 安装依赖
 
 ```bash
 cd /Users/xuqihan/Desktop/code_study/抢票
 uv venv
 source .venv/bin/activate
 uv pip install -r requirements.txt
-uv run python captcha_api.py
 ```
 
-健康检查：
+## 启动方式（拆分模式）
+
+### 1) 本地启动 VPN 服务
 
 ```bash
-curl -sS http://127.0.0.1:8000/health
+uv run python vpn_service.py
 ```
 
-## 扩展安装与使用
+默认监听：`http://127.0.0.1:8000`
 
-1. 打开 `chrome://extensions/`
-2. 打开“开发者模式”
-3. 点击“加载已解压的扩展程序”
-4. 选择目录：`/Users/xuqihan/Desktop/code_study/抢票/extension`
-5. 在插件弹窗填写配置后点击“开始”
+### 2) 启动 OCR 服务（本地调试或云端部署）
 
-## 核心自动化流程（当前）
+```bash
+uv run python ocr_service.py
+```
 
-1. 活动页：点击“立即购买”（支持开抢时间前预进场与临界加速）
-2. 可选预约页：如出现“预约/預約”，自动点击进入下一步
-3. 日期/场次页：优先早日期、早场次，失败自动回退重试
-4. 排队页：等待放行，带随机保活动作；支持队列健康探测
-5. 验证码页：截图发后端 OCR，回填并提交（6 位字母候选）
-6. 选座页：优先可选座，按策略选中后“完成选择”
-7. 价格页：先点加号到目标票数，再点“預購/訂購”
-8. 信息页：国家码、手机号、同意条款、信息提交
+默认监听：`http://127.0.0.1:8001`
 
-说明：
+部署到云端时，建议使用反向代理或直接以 `uvicorn ocr_service:app --host 0.0.0.0 --port 8001` 启动。
 
-- 已移除“总计后支付（如微信支付）”自动化。
-- 若 `执行全部流程` 关闭，则到价格页后停止。
+## 扩展配置（关键）
+
+插件中分开配置两个地址：
+
+- `OCR 服务地址（可填云服务器）`：例如 `https://your-ocr-domain.example.com/ocr/file`
+- `OCR 激活码（首激活必填）`：首次输入后绑定当前设备
+- `VPN 切换 API 地址`：保持本地，例如 `http://127.0.0.1:8000`
+
+默认值已调整为：
+
+- OCR：`http://127.0.0.1:8001/ocr/file`
+- VPN：`http://127.0.0.1:8000`
 
 ## VPN 切换配置
 
@@ -66,27 +69,10 @@ curl -sS http://127.0.0.1:8000/health
 
 - `/Users/xuqihan/Desktop/code_study/抢票/vpn_switch.yaml`
 
-可用环境变量覆盖配置文件路径：
+可用环境变量覆盖：
 
 ```bash
 export VPN_SWITCH_CONFIG="/absolute/path/to/vpn_switch.yaml"
-```
-
-`/Users/xuqihan/Desktop/code_study/抢票/vpn_switch.yaml` 示例：
-
-```yaml
-flclash:
-  selector: "🔰 选择节点"
-  switch_script: "/Users/xuqihan/Desktop/code_study/抢票/scripts/flclash_switch.sh"
-  controller: "http://127.0.0.1:9090"
-  secret: ""
-  delay_url: "https://tickets.interpark.com/"
-  delay_timeout_ms: 3500
-  nodes:
-    - "🇭🇰 香港Y01"
-    - "🇯🇵 日本Y01 | IEPL"
-    - "🇭🇰 香港Y02 | IEPL"
-    - "🇯🇵 日本Y02 | IEPL"
 ```
 
 `/vpn/switch` 策略：
@@ -94,20 +80,33 @@ flclash:
 - `round_robin`：按节点列表轮换
 - `fastest`：测列表节点延迟后切到最快
 
-当前触发点：
+## API 列表
 
-- 插件启动时：自动切到最快节点
-- 排队剩余人数 `<= 50`：再次切到最快节点
-- 队列重度异常：按策略自动切换（支持冷却与关键区间保护）
+### OCR 服务
 
-## 后端 API
+- `GET /health`
+- `POST /license/activate`（激活码 + 设备ID，返回短期 access token）
+- `POST /license/admin/create`（管理员导入激活码）
+- `POST /license/admin/generate`（管理员批量生成激活码）
+- `POST /license/admin/revoke`（管理员吊销激活码）
+- `POST /ocr/file`
+- `POST /ocr/base64`
 
-- `POST /ocr/file`：图片文件 OCR
-- `POST /ocr/base64`：base64 OCR
-- `POST /vpn/health`：网络健康探测
-- `POST /vpn/switch`：VPN 切换（支持 `strategy`）
+说明：
 
-示例：手动切最快节点
+- `POST /ocr/*` 需要鉴权请求头：`Authorization: Bearer <access_token>`
+- `access_token` 由 `/license/activate` 下发，带有效期
+- 激活码一旦绑定设备，其他设备使用同一激活码会被拒绝
+- 管理员接口需要配置 `OCR_ADMIN_TOKEN`
+- 可选兼容：若配置了 `OCR_API_TOKEN`，仍可作为静态 token 直连
+
+### VPN 服务
+
+- `GET /health`
+- `POST /vpn/health`
+- `POST /vpn/switch`
+
+示例：手动切换最快节点
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8000/vpn/switch \
@@ -115,38 +114,10 @@ curl -sS -X POST http://127.0.0.1:8000/vpn/switch \
   -d '{"reason":"manual_fastest","current_queue":10,"strategy":"fastest"}'
 ```
 
-## 钉钉通知（可选）
+## 兼容模式
 
-插件支持配置：
-
-- `dingTalkWebhookUrl`
-- `dingTalkSecret`（加签可选）
-
-已支持的关键通知：
-
-- 开抢前 3 分钟提醒
-- 排队剩余阈值（1000/100/10）
-- 进入价格页
-- 队列网络重度异常 / 恢复
-
-## 常见排查
-
-1. `verify_ok: false` 但 `ok: true`
-- 表示切换命令执行成功，只是验证 URL 超时。
-
-2. 检查当前节点是否切换成功
+如需一次性启动旧版合并服务，仍可使用：
 
 ```bash
-/Users/xuqihan/Desktop/code_study/抢票/scripts/flclash_list_proxies.sh
+uv run python captcha_api.py
 ```
-
-关注输出中 `Group: 🔰 选择节点` 的 `Now`。
-
-3. FlClash Controller 不通
-
-```bash
-lsof -nP -iTCP:9090 -sTCP:LISTEN
-curl -sS http://127.0.0.1:9090/version
-```
-
-若失败，先确认 FlClash 已开启 External Controller。
