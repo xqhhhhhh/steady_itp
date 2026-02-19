@@ -293,6 +293,49 @@ function clickAtCenter(el) {
   }
 }
 
+function dispatchRichPointerClick(el) {
+  if (!el) return false;
+  const rect = el.getBoundingClientRect();
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  const doc = el.ownerDocument || document;
+  const target = doc.elementFromPoint(x, y) || el;
+  const common = {
+    bubbles: true,
+    cancelable: true,
+    clientX: x,
+    clientY: y,
+    button: 0,
+    buttons: 1
+  };
+  try {
+    if (typeof target.focus === "function") target.focus({ preventScroll: true });
+  } catch (_) {}
+  try {
+    target.dispatchEvent(new PointerEvent("pointerover", { ...common, pointerType: "mouse", isPrimary: true }));
+    target.dispatchEvent(new PointerEvent("pointerdown", { ...common, pointerType: "mouse", isPrimary: true }));
+    target.dispatchEvent(new MouseEvent("mousedown", common));
+    target.dispatchEvent(new MouseEvent("mouseup", common));
+    target.dispatchEvent(new PointerEvent("pointerup", { ...common, pointerType: "mouse", isPrimary: true }));
+    target.dispatchEvent(new MouseEvent("click", common));
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function isCheckboxLikeChecked(el) {
+  if (!el) return false;
+  if (el instanceof HTMLInputElement && el.type === "checkbox") {
+    return Boolean(el.checked);
+  }
+  const aria = String(el.getAttribute?.("aria-checked") || "").toLowerCase();
+  if (aria === "true") return true;
+  const cls = normalizeText(el.className?.toString?.() || "");
+  if (cls.includes("checked") || cls.includes("selected")) return true;
+  return false;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1009,6 +1052,44 @@ function findHumanVerifyCheckbox() {
   });
   if (strict) return strict;
 
+  const roleBased = Array.from(
+    document.querySelectorAll("[role='checkbox'], [aria-checked], .cb-i, .cb-lb")
+  ).find((el) => {
+    const content = normalizeText(
+      [
+        el.getAttribute?.("aria-label"),
+        el.getAttribute?.("name"),
+        el.getAttribute?.("id"),
+        el.className?.toString?.(),
+        el.textContent
+      ]
+        .filter(Boolean)
+        .join(" ")
+    );
+    return (
+      isElementShown(el.closest?.(".cb-c, #content, #ehurV4, label") || el) &&
+      (content.includes("verify you are human") ||
+        content.includes("human") ||
+        content.includes("checkbox") ||
+        content.includes("cb-"))
+    );
+  });
+  if (roleBased) return roleBased;
+
+  const verifyTextHost = Array.from(document.querySelectorAll("label, div, span, p"))
+    .find((el) => normalizeText(el.textContent || "").includes("verify you are human"));
+  if (verifyTextHost) {
+    const host =
+      verifyTextHost.closest(".cb-c, #content, #ehurV4, label, div") ||
+      verifyTextHost.parentElement ||
+      verifyTextHost;
+    const near = host.querySelector(
+      "input[type='checkbox'], [role='checkbox'], [aria-checked], .cb-i, .cb-lb, label"
+    );
+    if (near && isElementShown(near.closest("label") || near)) return near;
+    if (isElementShown(host)) return host;
+  }
+
   const text = normalizeText(document.body?.innerText || "");
   if (!text.includes("verify you are human")) return null;
   return (
@@ -1073,17 +1154,29 @@ async function runHumanVerifyStep() {
   }
 
   const now = Date.now();
-  if (checkbox.checked) return true;
+  if (isCheckboxLikeChecked(checkbox)) return true;
   if (now - state.humanVerifyLastClickAt < 1200) return true;
   state.humanVerifyLastClickAt = now;
 
-  const clickable = checkbox.closest("label") || checkbox;
-  const indicator = clickable?.querySelector?.(".cb-i") || null;
-  const clickTargets = [indicator, clickable, checkbox].filter(Boolean);
+  const clickable =
+    checkbox.closest?.("label, [role='checkbox'], button, a, div") || checkbox;
+  const indicator =
+    clickable?.querySelector?.(".cb-i, [role='checkbox'], input[type='checkbox']") || null;
+  const clickTargets = Array.from(new Set([indicator, clickable, checkbox].filter(Boolean)));
   for (const target of clickTargets) {
     forceClick(target);
     clickAtCenter(target);
     clickElement(target);
+    dispatchRichPointerClick(target);
+    try {
+      if (typeof target.focus === "function") target.focus({ preventScroll: true });
+      target.dispatchEvent(
+        new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: " ", code: "Space" })
+      );
+      target.dispatchEvent(
+        new KeyboardEvent("keyup", { bubbles: true, cancelable: true, key: " ", code: "Space" })
+      );
+    } catch (_) {}
   }
   log("检测到人机验证，已点击 Verify checkbox");
   return true;
@@ -3503,11 +3596,6 @@ async function runProductStep() {
     log("已点击 立即购买");
     await sleep(state.tickMode === "critical" ? 35 : 140);
     return;
-  }
-
-  if (clickReserveEntryAggressive()) {
-    log("已点击 预约");
-    await sleep(state.tickMode === "critical" ? 40 : 160);
   }
 }
 
