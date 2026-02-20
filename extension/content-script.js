@@ -95,6 +95,9 @@ const state = {
   firstBuyNowClickAt: 0,
   humanVerifyLastClickAt: 0,
   humanVerifyLastLogAt: 0,
+  humanVerifyAttempted: false,
+  humanVerifyAlertActive: false,
+  humanVerifyLastNotifyAt: 0,
   sliderCaptchaPaused: false,
   sliderCaptchaLastLogAt: 0,
   sliderCaptchaLastNotifyAt: 0,
@@ -1218,8 +1221,67 @@ async function runSliderCaptchaPauseGuard() {
   return true;
 }
 
+function dispatchHumanEvent(element, type, options = {}) {
+  if (!element) return;
+  try {
+    const keyboardTypes = new Set(["keydown", "keypress", "keyup"]);
+    if (keyboardTypes.has(String(type || "").toLowerCase())) {
+      const event = new KeyboardEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        ...options
+      });
+      element.dispatchEvent(event);
+      return;
+    }
+    const event = new MouseEvent(type, {
+      view: window,
+      bubbles: true,
+      cancelable: true,
+      ...options
+    });
+    element.dispatchEvent(event);
+  } catch (_) {}
+}
+
+function simulateMouseMovement(element) {
+  if (!isDomElement(element)) return;
+  const rect = element.getBoundingClientRect();
+  const centerX = rect.left + rect.width / 2;
+  const centerY = rect.top + rect.height / 2;
+  const startX = Math.floor(Math.random() * Math.max(1, window.innerWidth));
+  const startY = Math.floor(Math.random() * Math.max(1, window.innerHeight));
+  const steps = 5 + Math.floor(Math.random() * 10);
+  for (let i = 0; i <= steps; i += 1) {
+    const x = startX + (centerX - startX) * (i / steps) + (Math.random() * 10 - 5);
+    const y = startY + (centerY - startY) * (i / steps) + (Math.random() * 10 - 5);
+    dispatchHumanEvent(document, "mousemove", {
+      clientX: x,
+      clientY: y
+    });
+  }
+  dispatchHumanEvent(document, "mousemove", {
+    clientX: centerX,
+    clientY: centerY
+  });
+}
+
 async function runHumanVerifyStep() {
-  if (!isHumanVerifyWidgetPresent()) return false;
+  if (!isHumanVerifyWidgetPresent()) {
+    state.humanVerifyAttempted = false;
+    state.humanVerifyAlertActive = false;
+    return false;
+  }
+
+  if (!state.humanVerifyAlertActive || Date.now() - state.humanVerifyLastNotifyAt > 2 * 60 * 1000) {
+    state.humanVerifyAlertActive = true;
+    state.humanVerifyLastNotifyAt = Date.now();
+    await sendDingTalkNotify(
+      `human_verify_${location.pathname}_${Math.floor(Date.now() / (2 * 60 * 1000))}`,
+      "检测到 Cloudflare 人机验证",
+      `页面出现 Verify you are human 验证，请及时处理。\n页面: ${location.href}`
+    );
+  }
 
   const verifying = document.querySelector("#verifying");
   if (isElementShown(verifying)) {
@@ -1230,16 +1292,41 @@ async function runHumanVerifyStep() {
     return true;
   }
 
-  const checkbox = findHumanVerifyCheckbox();
+  const checkboxSelectors = [
+    "#challenge-stage input[type='checkbox']",
+    ".cf-checkbox-label",
+    "[name='cf_captcha_kind']",
+    ".verify-you-are-human-checkbox",
+    "[role='checkbox'][aria-checked='false']"
+  ];
+  let checkbox = null;
+  for (const selector of checkboxSelectors) {
+    const el = document.querySelector(selector);
+    if (el && isElementShown(el.closest?.("label, div") || el)) {
+      checkbox = el;
+      break;
+    }
+  }
   if (!checkbox) {
-    const challengeContainer = findHumanVerifyContainer();
+    checkbox = findHumanVerifyCheckbox();
+  }
+
+  const challengeContainer = findHumanVerifyContainer();
+  if (!checkbox && challengeContainer) {
     const now = Date.now();
-    if (challengeContainer && now - state.humanVerifyLastClickAt >= 1200) {
+    const randomDelay = 1200 + Math.floor(Math.random() * 800);
+    if (now - state.humanVerifyLastClickAt >= randomDelay && !state.humanVerifyAttempted) {
+      state.humanVerifyAttempted = true;
       state.humanVerifyLastClickAt = now;
+      simulateMouseMovement(challengeContainer);
+      await sleep(100 + Math.random() * 200);
       forceClick(challengeContainer);
+      await sleep(50 + Math.random() * 100);
       clickAtCenter(challengeContainer);
+      await sleep(50 + Math.random() * 100);
       clickElement(challengeContainer);
     }
+
     if (Date.now() - state.humanVerifyLastLogAt > 2000) {
       log("检测到人机验证框（含挑战 iframe），等待验证通过");
       state.humanVerifyLastLogAt = Date.now();
@@ -1247,32 +1334,71 @@ async function runHumanVerifyStep() {
     return true;
   }
 
-  const now = Date.now();
-  if (isCheckboxLikeChecked(checkbox)) return true;
-  if (now - state.humanVerifyLastClickAt < 1200) return true;
-  state.humanVerifyLastClickAt = now;
+  if (checkbox) {
+    const now = Date.now();
+    if (isCheckboxLikeChecked(checkbox)) {
+      state.humanVerifyAttempted = false;
+      return true;
+    }
 
-  const clickable =
-    checkbox.closest?.("label, [role='checkbox'], button, a, div") || checkbox;
-  const indicator =
-    clickable?.querySelector?.(".cb-i, [role='checkbox'], input[type='checkbox']") || null;
-  const clickTargets = Array.from(new Set([indicator, clickable, checkbox].filter(Boolean)));
-  for (const target of clickTargets) {
-    forceClick(target);
-    clickAtCenter(target);
-    clickElement(target);
-    dispatchRichPointerClick(target);
-    try {
-      if (typeof target.focus === "function") target.focus({ preventScroll: true });
-      target.dispatchEvent(
-        new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: " ", code: "Space" })
-      );
-      target.dispatchEvent(
-        new KeyboardEvent("keyup", { bubbles: true, cancelable: true, key: " ", code: "Space" })
-      );
-    } catch (_) {}
+    const minClickInterval = 1200 + Math.floor(Math.random() * 800);
+    if (now - state.humanVerifyLastClickAt < minClickInterval) return true;
+
+    state.humanVerifyAttempted = true;
+    state.humanVerifyLastClickAt = now;
+
+    const clickable =
+      checkbox.closest?.("label, [role='checkbox'], button, a, div") || checkbox;
+    const indicator =
+      clickable?.querySelector?.(".cb-i, [role='checkbox'], input[type='checkbox']") || null;
+    const clickTargets = Array.from(new Set([indicator, clickable, checkbox].filter(Boolean)));
+
+    for (const target of clickTargets) {
+      simulateMouseMovement(target);
+      await sleep(50 + Math.random() * 150);
+      dispatchHumanEvent(target, "mouseover");
+      dispatchHumanEvent(target, "mousemove");
+      await sleep(30 + Math.random() * 100);
+      dispatchHumanEvent(target, "mousedown", { button: 0 });
+      await sleep(100 + Math.random() * 200);
+      forceClick(target);
+      clickAtCenter(target);
+      clickElement(target);
+      dispatchRichPointerClick(target);
+      await sleep(50 + Math.random() * 100);
+      dispatchHumanEvent(target, "mouseup", { button: 0 });
+      dispatchHumanEvent(target, "click");
+      await sleep(50 + Math.random() * 100);
+
+      try {
+        if (typeof target.focus === "function") {
+          target.focus({ preventScroll: true });
+          await sleep(30 + Math.random() * 80);
+        }
+        dispatchHumanEvent(target, "keydown", {
+          key: " ",
+          code: "Space",
+          keyCode: 32
+        });
+        await sleep(50 + Math.random() * 100);
+        dispatchHumanEvent(target, "keypress", {
+          key: " ",
+          code: "Space",
+          keyCode: 32
+        });
+        await sleep(50 + Math.random() * 100);
+        dispatchHumanEvent(target, "keyup", {
+          key: " ",
+          code: "Space",
+          keyCode: 32
+        });
+      } catch (_) {}
+    }
+    log("检测到人机验证，已模拟真实操作点击 Verify checkbox");
+    return true;
   }
-  log("检测到人机验证，已点击 Verify checkbox");
+
+  state.humanVerifyAttempted = false;
   return true;
 }
 
@@ -6950,6 +7076,9 @@ async function loadConfig() {
   state.firstBuyNowClickAt = 0;
   state.lastStage = "unknown";
   state.lastBookingPageVariant = "unknown";
+  state.humanVerifyAttempted = false;
+  state.humanVerifyAlertActive = false;
+  state.humanVerifyLastNotifyAt = 0;
   state.sliderCaptchaPaused = false;
   state.sliderCaptchaLastLogAt = 0;
   state.sliderCaptchaLastNotifyAt = 0;
