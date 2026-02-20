@@ -66,6 +66,8 @@ async function saveConfig(config) {
       dateMonth: String(config?.dateMonth || "").trim(),
       dateDay: String(config?.dateDay || "").trim(),
       dateTime: String(config?.dateTime || "").trim(),
+      newAreaOrderMode: normalizeLegacyAreaOrderMode(config?.newAreaOrderMode, "default"),
+      newAreaCustomCodes: normalizeLegacyAreaCustomCodes(config?.newAreaCustomCodes || []),
       legacyAreaOrderMode: normalizeLegacyAreaOrderMode(config?.legacyAreaOrderMode, "default"),
       legacyAreaCustomCodes: normalizeLegacyAreaCustomCodes(config?.legacyAreaCustomCodes || []),
       legacyAreaSwitchIntervalMs: normalizeLegacyAreaTimingMs(
@@ -139,6 +141,13 @@ async function saveConfigOnly(config) {
       dateMonth: String(config?.dateMonth || "").trim(),
       dateDay: String(config?.dateDay || "").trim(),
       dateTime: String(config?.dateTime || "").trim(),
+      newAreaOrderMode: normalizeLegacyAreaOrderMode(
+        config?.newAreaOrderMode,
+        current.newAreaOrderMode || "default"
+      ),
+      newAreaCustomCodes: normalizeLegacyAreaCustomCodes(
+        config?.newAreaCustomCodes || current.newAreaCustomCodes || []
+      ),
       legacyAreaOrderMode: normalizeLegacyAreaOrderMode(
         config?.legacyAreaOrderMode,
         current.legacyAreaOrderMode || "default"
@@ -1248,6 +1257,8 @@ chrome.runtime.onInstalled.addListener(async () => {
         dateMonth: "",
         dateDay: "",
         dateTime: "",
+        newAreaOrderMode: "default",
+        newAreaCustomCodes: [],
         legacyAreaOrderMode: "default",
         legacyAreaCustomCodes: [],
         legacyAreaSwitchIntervalMs: 1200,

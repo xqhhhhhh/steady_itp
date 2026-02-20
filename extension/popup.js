@@ -1,5 +1,6 @@
 const $ = (id) => document.getElementById(id);
 const legacyAreaCodes = [];
+const newAreaCodes = [];
 const DEFAULT_OCR_API_URL = "https://api.nexuschat.top/ocr-api/ocr/file";
 let currentOcrApiUrl = DEFAULT_OCR_API_URL;
 let currentCountryCode = "86";
@@ -159,6 +160,42 @@ function getLegacyAreaCodes() {
   return legacyAreaCodes.slice();
 }
 
+function renderNewAreaCodeList() {
+  const list = $("newAreaCodeList");
+  if (!list) return;
+  list.innerHTML = "";
+  for (const code of newAreaCodes) {
+    const item = document.createElement("span");
+    item.className = "code-item";
+    item.textContent = code;
+
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "code-remove";
+    removeBtn.textContent = "x";
+    removeBtn.dataset.code = code;
+    removeBtn.addEventListener("click", () => {
+      const idx = newAreaCodes.indexOf(code);
+      if (idx >= 0) {
+        newAreaCodes.splice(idx, 1);
+        renderNewAreaCodeList();
+      }
+    });
+
+    item.appendChild(removeBtn);
+    list.appendChild(item);
+  }
+}
+
+function setNewAreaCodes(codes) {
+  newAreaCodes.splice(0, newAreaCodes.length, ...normalizeLegacyAreaCodes(codes));
+  renderNewAreaCodeList();
+}
+
+function getNewAreaCodes() {
+  return newAreaCodes.slice();
+}
+
 function renderLegacyAreaCodeList() {
   const list = $("legacyAreaCodeList");
   if (!list) return;
@@ -194,6 +231,11 @@ function setLegacyAreaCodes(codes) {
 function syncLegacyAreaCustomVisibility() {
   const mode = $("legacyAreaOrderMode").value === "custom" ? "custom" : "default";
   $("legacyAreaCustomWrap").classList.toggle("hidden", mode !== "custom");
+}
+
+function syncNewAreaCustomVisibility() {
+  const mode = $("newAreaOrderMode").value === "custom" ? "custom" : "default";
+  $("newAreaCustomWrap").classList.toggle("hidden", mode !== "custom");
 }
 
 function getSelectedRunMode() {
@@ -233,6 +275,17 @@ function addLegacyAreaCodeFromInput() {
   }
 }
 
+function addNewAreaCodeFromInput() {
+  const input = $("newAreaCodeInput");
+  const code = normalizeLegacyAreaCode(input.value);
+  input.value = "";
+  if (!code) return;
+  if (!newAreaCodes.includes(code)) {
+    newAreaCodes.push(code);
+    renderNewAreaCodeList();
+  }
+}
+
 function getFormConfig() {
   const runMode = getSelectedRunMode();
   const preEnter = normalizeNumber($("preEnterSeconds").value || 30, 5, 300, 30, true);
@@ -255,6 +308,8 @@ function getFormConfig() {
     dateMonth: $("dateMonth").value.trim(),
     dateDay: $("dateDay").value.trim(),
     dateTime: $("dateTime").value.trim(),
+    newAreaOrderMode: $("newAreaOrderMode").value === "custom" ? "custom" : "default",
+    newAreaCustomCodes: getNewAreaCodes(),
     legacyAreaOrderMode: $("legacyAreaOrderMode").value === "custom" ? "custom" : "default",
     legacyAreaCustomCodes: getLegacyAreaCodes(),
     legacyAreaSwitchIntervalMs: normalizeLegacyAreaTimingMs(
@@ -339,8 +394,11 @@ async function loadState() {
   applySelectValue("dateMonth", config.dateMonth, normalizeMonthValue);
   applySelectValue("dateDay", config.dateDay, normalizeDayValue);
   applySelectValue("dateTime", config.dateTime, (v) => String(v || "").trim());
+  $("newAreaOrderMode").value = config.newAreaOrderMode === "custom" ? "custom" : "default";
+  setNewAreaCodes(config.newAreaCustomCodes || []);
   $("legacyAreaOrderMode").value = config.legacyAreaOrderMode === "custom" ? "custom" : "default";
   setLegacyAreaCodes(config.legacyAreaCustomCodes || []);
+  syncNewAreaCustomVisibility();
   $("legacyAreaSwitchIntervalMs").value = String(
     normalizeLegacyAreaTimingMs(config.legacyAreaSwitchIntervalMs ?? 1200, 1200)
   );
@@ -467,6 +525,10 @@ $("legacyAreaOrderMode").addEventListener("change", () => {
   syncLegacyAreaCustomVisibility();
 });
 
+$("newAreaOrderMode").addEventListener("change", () => {
+  syncNewAreaCustomVisibility();
+});
+
 $("runModeTimed").addEventListener("change", () => {
   syncRunModeVisibility();
 });
@@ -483,6 +545,12 @@ $("legacyAreaCodeInput").addEventListener("keydown", (event) => {
   if (event.key !== "Enter") return;
   event.preventDefault();
   addLegacyAreaCodeFromInput();
+});
+
+$("newAreaCodeInput").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  addNewAreaCodeFromInput();
 });
 
 loadState();

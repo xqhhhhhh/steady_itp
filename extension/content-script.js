@@ -20,6 +20,8 @@ const state = {
     dateMonth: "",
     dateDay: "",
     dateTime: "",
+    newAreaOrderMode: "default",
+    newAreaCustomCodes: [],
     legacyAreaOrderMode: "default",
     legacyAreaCustomCodes: [],
     legacyAreaSwitchIntervalMs: 1200,
@@ -218,6 +220,22 @@ function normalizeLegacyAreaCustomCodes(raw) {
     out.push(code);
   }
   return out;
+}
+
+function normalizeNewAreaOrderMode(raw) {
+  const mode = String(raw || "default").trim().toLowerCase();
+  return mode === "custom" ? "custom" : "default";
+}
+
+function normalizeNewAreaCustomCodes(raw) {
+  return normalizeLegacyAreaCustomCodes(raw);
+}
+
+function buildNewAreaOrderMap() {
+  if (normalizeNewAreaOrderMode(state.config.newAreaOrderMode) !== "custom") return null;
+  const codes = normalizeNewAreaCustomCodes(state.config.newAreaCustomCodes || []);
+  if (!codes.length) return null;
+  return new Map(codes.map((code, idx) => [code, idx]));
 }
 
 function isDomElement(el) {
@@ -1839,6 +1857,20 @@ function getSeatBlockPriority(blockId) {
   return major * 1000 + minor;
 }
 
+function getSeatBlockAreaCode(blockId) {
+  const parts = parseSeatBlockParts(blockId);
+  if (!parts) return "";
+  return String(parts.minor).padStart(3, "0");
+}
+
+function getSeatBlockCustomRank(blockId, customOrderMap) {
+  if (!(customOrderMap instanceof Map) || !customOrderMap.size) return Number.POSITIVE_INFINITY;
+  const code = getSeatBlockAreaCode(blockId);
+  if (!code) return Number.POSITIVE_INFINITY;
+  const rank = customOrderMap.get(code);
+  return Number.isFinite(rank) ? rank : Number.POSITIVE_INFINITY;
+}
+
 function getSiblingGIndex(el) {
   if (!el || !el.parentElement) return 0;
   const gs = Array.from(el.parentElement.children).filter(
@@ -1871,6 +1903,7 @@ function findSeatBlockAndCluster(el) {
 }
 
 function buildSeatBlockMetrics(mapped) {
+  const customOrderMap = buildNewAreaOrderMap();
   const groups = new Map();
   mapped.forEach((item, idx) => {
     const key = item.blockId || "__no_block__";
@@ -1902,8 +1935,12 @@ function buildSeatBlockMetrics(mapped) {
     const centerNorm = blockCenterDist / Math.max(1, window.innerWidth);
     const blockScore = frontNorm * 0.6 + centerNorm * 0.4;
     const blockPriority = getSeatBlockPriority(key);
+    const blockAreaCode = getSeatBlockAreaCode(key);
+    const blockCustomRank = getSeatBlockCustomRank(key, customOrderMap);
     metrics.set(key, {
       blockId: key,
+      blockAreaCode,
+      blockCustomRank,
       blockPriority,
       blockTop: g.minTop,
       blockCenterDist,
@@ -2014,10 +2051,29 @@ function getSeatCandidates() {
     .filter(Boolean);
 
   const blockMetrics = buildSeatBlockMetrics(mapped);
-  const clusterMetrics = buildSeatClusterMetrics(mapped);
-  mapped.sort((a, b) => {
+  let ordered = mapped;
+  if (normalizeNewAreaOrderMode(state.config.newAreaOrderMode) === "custom") {
+    const matchedBlockIds = new Set(
+      Array.from(blockMetrics.values())
+        .filter((x) => Number.isFinite(x?.blockCustomRank))
+        .map((x) => x.blockId)
+    );
+    if (matchedBlockIds.size) {
+      ordered = mapped.filter((item) => matchedBlockIds.has(item.blockId || "__no_block__"));
+    }
+  }
+  const clusterMetrics = buildSeatClusterMetrics(ordered);
+  ordered.sort((a, b) => {
     const ba = blockMetrics.get(a.blockId || "__no_block__");
     const bb = blockMetrics.get(b.blockId || "__no_block__");
+    const aCustom = ba?.blockCustomRank ?? Number.POSITIVE_INFINITY;
+    const bCustom = bb?.blockCustomRank ?? Number.POSITIVE_INFINITY;
+    const aHasCustom = Number.isFinite(aCustom);
+    const bHasCustom = Number.isFinite(bCustom);
+    if (aHasCustom || bHasCustom) {
+      if (aHasCustom && bHasCustom && aCustom !== bCustom) return aCustom - bCustom;
+      if (aHasCustom !== bHasCustom) return aHasCustom ? -1 : 1;
+    }
     const aBlockTop = ba?.blockTop ?? Number.POSITIVE_INFINITY;
     const bBlockTop = bb?.blockTop ?? Number.POSITIVE_INFINITY;
     // 先按 block 靠前（top 更小）排序。
@@ -2062,7 +2118,7 @@ function getSeatCandidates() {
     return a.rect.left - b.rect.left;
   });
 
-  return mapped.map((x) => x.el);
+  return ordered.map((x) => x.el);
 }
 
 function clickSeatCandidate(el) {
@@ -7028,6 +7084,8 @@ async function loadConfig() {
     dateMonth: String(config.dateMonth || "").trim(),
     dateDay: String(config.dateDay || "").trim(),
     dateTime: String(config.dateTime || "").trim(),
+    newAreaOrderMode: normalizeNewAreaOrderMode(config.newAreaOrderMode),
+    newAreaCustomCodes: normalizeNewAreaCustomCodes(config.newAreaCustomCodes || []),
     legacyAreaOrderMode: String(config.legacyAreaOrderMode || "default").trim().toLowerCase() === "custom" ? "custom" : "default",
     legacyAreaCustomCodes: normalizeLegacyAreaCustomCodes(config.legacyAreaCustomCodes || []),
     legacyAreaSwitchIntervalMs: normalizeLegacyAreaTimingMs(

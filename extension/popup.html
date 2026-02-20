@@ -107,6 +107,21 @@
         </label>
 
         <label class="field">
+          <span>新版区域查询顺序</span>
+          <select id="newAreaOrderMode">
+            <option value="default">默认顺序</option>
+            <option value="custom">自定义顺序</option>
+          </select>
+        </label>
+
+        <div id="newAreaCustomWrap" class="field hidden">
+          <span>新版自定义区域 (三位数字，回车添加)</span>
+          <input id="newAreaCodeInput" type="text" inputmode="numeric" placeholder="例如 001" maxlength="3" />
+          <div id="newAreaCodeList" class="code-list"></div>
+          <div class="hint">将按输入顺序优先查询这些新版区域</div>
+        </div>
+
+        <label class="field">
           <span>旧版区域查询顺序</span>
           <select id="legacyAreaOrderMode">
             <option value="default">默认顺序</option>
