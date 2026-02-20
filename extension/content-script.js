@@ -95,6 +95,9 @@ const state = {
   firstBuyNowClickAt: 0,
   humanVerifyLastClickAt: 0,
   humanVerifyLastLogAt: 0,
+  sliderCaptchaPaused: false,
+  sliderCaptchaLastLogAt: 0,
+  sliderCaptchaLastNotifyAt: 0,
   lastStage: "unknown",
   lastBookingPageVariant: "unknown",
   notifySale3mSent: false,
@@ -870,11 +873,22 @@ async function maybeRunScavengeLoopRestart() {
   state.scavengeLoopNextRestartAt = now + intervalMs;
   state.scavengeLoopLastWaitLogAt = 0;
   state.scavengeLoopLastWaitTargetAt = 0;
+  state.productFlowKey = "";
+  state.productBuyClickedAt = 0;
+  state.productLastCountdownLogAt = 0;
+  state.buyNowCachedEl = null;
+  state.firstBuyNowClickAt = 0;
   await persistScavengeRuntime(state.scavengeLoopNextRestartAt, state.scavengeLoopLastRestartAt);
   const minutes = Math.max(1, Math.round(intervalMs / 60000));
   log(`捡漏循环触发：每 ${minutes} 分钟重跑一次，正在重新开始流程`);
   try {
-    window.location.assign(targetUrl);
+    const nowUrl = String(location.href || "").split("#")[0];
+    const targetNoHash = targetUrl.split("#")[0];
+    if (nowUrl === targetNoHash) {
+      window.location.reload();
+    } else {
+      window.location.assign(targetUrl);
+    }
   } catch (_) {
     window.location.href = targetUrl;
   }
@@ -927,6 +941,32 @@ function shouldHoldOnWorldForScavengeWaiting() {
   if (!state.config.enabled || state.config.scavengeLoopEnabled !== true || state.scavengeLoopSuccess) {
     return false;
   }
+
+  const normalizeUrlForCompare = (raw, dropQuery = false) => {
+    try {
+      const u = new URL(String(raw || "").trim(), location.href);
+      u.hash = "";
+      const path = String(u.pathname || "/").replace(/\/+$/, "") || "/";
+      return dropQuery ? `${u.origin}${path}` : `${u.origin}${path}${u.search}`;
+    } catch (_) {
+      return "";
+    }
+  };
+
+  const targetFull = normalizeUrlForCompare(state.config.eventUrl, false);
+  const targetPath = normalizeUrlForCompare(state.config.eventUrl, true);
+  const currentFull = normalizeUrlForCompare(location.href, false);
+  const currentPath = normalizeUrlForCompare(location.href, true);
+
+  // 在目标活动页（或同一路径）时，不等待下一轮，继续完整执行本轮流程。
+  if ((targetFull && currentFull === targetFull) || (targetPath && currentPath === targetPath)) {
+    return false;
+  }
+  // 若当前页仍存在可点击入口，也应继续跑本轮，不提前进入“等待下一轮”。
+  if (getCachedOrFindBuyNowButton() || findReserveEntryButtonStrict()) {
+    return false;
+  }
+
   const nextAt = Number(state.scavengeLoopNextRestartAt || 0);
   if (!nextAt) return false;
   const now = Date.now();
@@ -1122,6 +1162,60 @@ function isHumanVerifyWidgetPresent() {
   }
   if (findHumanVerifyCheckbox()) return true;
   return false;
+}
+
+function isSliderCaptchaWidgetPresent(preferredDoc = null) {
+  const docs = getCaptchaSearchDocuments(preferredDoc);
+  const hasSliderText = (text) => {
+    const bag = normalizeText(text || "");
+    if (!bag) return false;
+    return (
+      bag.includes("滑动滑块以调整谜题") ||
+      bag.includes("如果拼图匹配") ||
+      bag.includes("slider") ||
+      bag.includes("puzzle")
+    );
+  };
+  return docs.some((doc) => {
+    const layer = doc.querySelector(".captchSliderLayer");
+    if (isElementShown(layer)) return true;
+    const sliderRoot = doc.querySelector("#captchSlider, .sliderContainer, .captchSliderInner");
+    if (!isElementShown(sliderRoot)) return false;
+    const titleNode = doc.querySelector(".captchSliderTitle");
+    if (isElementShown(titleNode) && hasSliderText(titleNode.innerText || "")) return true;
+    return hasSliderText(doc.body?.innerText || "");
+  });
+}
+
+async function runSliderCaptchaPauseGuard() {
+  const active = isSliderCaptchaWidgetPresent();
+  if (!active) {
+    if (state.sliderCaptchaPaused) {
+      state.sliderCaptchaPaused = false;
+      state.sliderCaptchaLastLogAt = 0;
+      log("滑块验证码已完成，恢复自动流程");
+    }
+    return false;
+  }
+
+  const now = Date.now();
+  if (!state.sliderCaptchaPaused) {
+    state.sliderCaptchaPaused = true;
+    log("检测到滑块验证码，自动流程暂停，请手动完成滑块验证");
+  } else if (now - state.sliderCaptchaLastLogAt > 3500) {
+    log("滑块验证码处理中，等待人工完成后自动继续");
+  }
+  state.sliderCaptchaLastLogAt = now;
+
+  if (now - state.sliderCaptchaLastNotifyAt > 5 * 60 * 1000) {
+    state.sliderCaptchaLastNotifyAt = now;
+    await sendDingTalkNotify(
+      "",
+      "检测到滑块验证码，已暂停",
+      `页面出现滑块验证码，自动流程已暂停。请手动完成滑块后，脚本会自动继续。\n页面: ${location.href}`
+    );
+  }
+  return true;
 }
 
 async function runHumanVerifyStep() {
@@ -3524,9 +3618,25 @@ function clickReserveEntryAggressive() {
   return true;
 }
 
+function isScavengeRoundWarmupWindow(windowMs = 20000) {
+  if (!state.config.enabled || state.config.scavengeLoopEnabled !== true || state.scavengeLoopSuccess) {
+    return false;
+  }
+  const startedAt = Number(state.scavengeLoopLastRestartAt || 0);
+  if (!startedAt) return false;
+  return Date.now() - startedAt <= Math.max(1000, Number(windowMs) || 20000);
+}
+
 function clickBuyNowAggressive() {
+  const inScavengeWarmup = isScavengeRoundWarmupWindow(20000);
   const now = Date.now();
-  const minGap = state.tickMode === "critical" ? 110 : 320;
+  const minGap = inScavengeWarmup
+    ? state.tickMode === "critical"
+      ? 60
+      : 90
+    : state.tickMode === "critical"
+      ? 110
+      : 320;
   if (now - state.productBuyClickedAt < minGap) return false;
   const target = getCachedOrFindBuyNowButton();
   if (!target) {
@@ -3534,7 +3644,13 @@ function clickBuyNowAggressive() {
     return false;
   }
 
-  const bursts = state.tickMode === "critical" ? 2 : 3;
+  const bursts = inScavengeWarmup
+    ? state.tickMode === "critical"
+      ? 4
+      : 5
+    : state.tickMode === "critical"
+      ? 2
+      : 3;
   for (let i = 0; i < bursts; i += 1) {
     forceClick(target);
     clickAtCenter(target);
@@ -4936,40 +5052,43 @@ function getLegacyDateMonthParts(frameDoc) {
   return null;
 }
 
-function clickLegacyMonthNav(frameDoc, direction = 1) {
+function extractLegacyChangeMonthCode(raw) {
+  const src = String(raw || "");
+  if (!src) return "";
+  const match = src.match(/fnchangemonth\s*\(\s*['"]?(\d{6})['"]?\s*\)/i);
+  return match ? String(match[1]) : "";
+}
+
+async function clickLegacyMonthNav(frameDoc, direction = 1, targetParts = null) {
   if (!frameDoc) return false;
-  const words = direction > 0 ? ["next", "다음", "下个月", ">", "＞", "›", "»"] : ["prev", "previous", "이전", "上个月", "<", "＜", "‹", "«"];
-  const nodes = Array.from(
-    frameDoc.querySelectorAll("a, button, span, div, td")
-  ).filter((el) => visible(el));
-
-  const cands = nodes
-    .map((el) => {
-      const text = normalizeText(
-        [
-          el.textContent,
-          el.getAttribute("title"),
-          el.getAttribute("aria-label"),
-          el.className?.toString(),
-          el.id
-        ]
-          .filter(Boolean)
-          .join(" ")
-      );
-      if (!words.some((w) => text.includes(normalizeText(w)))) return null;
-      const r = el.getBoundingClientRect();
-      if (r.width > 120 || r.height > 120) return null;
-      return { el, score: r.top < 260 ? 4 : 1 };
-    })
-    .filter(Boolean)
-    .sort((a, b) => b.score - a.score);
-
-  const target = cands[0]?.el;
-  if (!target) return false;
-  forceClick(target);
-  clickAtCenter(target);
-  clickElement(target);
-  return true;
+  const displayed = getLegacyDateMonthParts(frameDoc);
+  const targetYearRaw = Number(targetParts?.year);
+  const targetYear =
+    Number.isFinite(targetYearRaw) && targetYearRaw >= 2000 && targetYearRaw <= 2099
+      ? targetYearRaw
+      : Number(displayed?.year);
+  const targetMonth = Number(targetParts?.month);
+  let targetYyyymm =
+    Number.isFinite(targetYear) && Number.isFinite(targetMonth) && targetMonth >= 1 && targetMonth <= 12
+      ? `${String(targetYear)}${String(targetMonth).padStart(2, "0")}`
+      : "";
+  if (!targetYyyymm) {
+    const nodes = Array.from(frameDoc.querySelectorAll("a, [onclick], [href]"));
+    const monthHits = nodes
+      .map((el) => getLegacyRawHandlerSnippets(el))
+      .flat()
+      .map((x) => extractLegacyChangeMonthCode(x))
+      .filter(Boolean);
+    const picked =
+      monthHits.find((x) => Number.isFinite(targetMonth) && Number(x.slice(4, 6)) === targetMonth) ||
+      monthHits[0] ||
+      "";
+    targetYyyymm = picked;
+  }
+  if (!targetYyyymm) return false;
+  const script = `javascript:fnChangeMonth('${targetYyyymm}');`;
+  const main = await triggerLegacyScriptMainWorld(script, `date_month_${targetYyyymm}`);
+  return Boolean(main?.ok);
 }
 
 function getLegacyDayCandidates(frameDoc) {
@@ -5634,13 +5753,31 @@ async function runLegacyDateStep() {
   const timeRaw = String(state.config.dateTime || "").trim();
 
   if (monthRaw) {
-    const targetMonth = Number(monthRaw.match(/\d+/)?.[0]);
+    const monthParts = parseMonthParts(monthRaw);
+    const targetMonth = Number(monthParts.month);
     const displayed = getLegacyDateMonthParts(frameDoc);
     if (Number.isFinite(targetMonth) && displayed?.month && displayed.month !== targetMonth) {
-      const direction = targetMonth > displayed.month ? 1 : -1;
-      if (Date.now() - state.dateLastDayClickAt > 700 && clickLegacyMonthNav(frameDoc, direction)) {
-        log(`旧版日期页切换月份: ${displayed.month} -> ${targetMonth}`);
+      let direction = targetMonth > displayed.month ? 1 : -1;
+      const targetYear = Number(monthParts.year);
+      if (Number.isFinite(targetYear) && Number.isFinite(displayed.year)) {
+        const delta = (targetYear - displayed.year) * 12 + (targetMonth - displayed.month);
+        direction = delta > 0 ? 1 : delta < 0 ? -1 : 0;
+      }
+      if (Date.now() - state.dateLastDayClickAt > 700 && direction !== 0) {
+        const switched = await clickLegacyMonthNav(frameDoc, direction, monthParts);
         state.dateLastDayClickAt = Date.now();
+        if (switched) {
+          await sleep(140);
+          const after = getLegacyDateMonthParts(frameDoc);
+          if (after?.month === targetMonth) {
+            log(`旧版日期页切换月份成功: ${displayed.month} -> ${targetMonth}`);
+          } else {
+            log(`旧版日期页切换月份请求已发出: ${displayed.month} -> ${targetMonth}（等待页面刷新）`);
+          }
+        } else if (Date.now() - state.queueLastLogAt > 1200) {
+          log(`旧版日期页切换月份失败: ${displayed.month} -> ${targetMonth}（fnChangeMonth未执行）`);
+          state.queueLastLogAt = Date.now();
+        }
       }
       return;
     }
@@ -6660,6 +6797,11 @@ async function tick() {
     if (await maybeAbortScavengeRoundByTimeout()) {
       return;
     }
+    const sliderPaused = await runSliderCaptchaPauseGuard();
+    if (sliderPaused) {
+      await sleep(180);
+      return;
+    }
     const humanVerifyHandled = await runHumanVerifyStep();
     if (humanVerifyHandled) {
       await sleep(120);
@@ -6808,6 +6950,9 @@ async function loadConfig() {
   state.firstBuyNowClickAt = 0;
   state.lastStage = "unknown";
   state.lastBookingPageVariant = "unknown";
+  state.sliderCaptchaPaused = false;
+  state.sliderCaptchaLastLogAt = 0;
+  state.sliderCaptchaLastNotifyAt = 0;
   state.legacyNextPendingUntil = 0;
   state.legacyNextWaitLogAt = 0;
   state.notifySale3mSent = false;

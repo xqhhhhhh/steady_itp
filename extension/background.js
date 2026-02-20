@@ -809,6 +809,9 @@ async function runLegacyScriptInMainWorld(tabId, frameId, script = "", label = "
           mode: "",
           fnBlockSeatUpdateDefined: false,
           fnHost: "",
+          fnChangeMonthDefined: false,
+          fnChangeMonthHost: "",
+          directMonthArg: "",
           directArgs: [],
           beforeSeatSrc: "",
           afterSeatSrc: "",
@@ -872,6 +875,31 @@ async function runLegacyScriptInMainWorld(tabId, frameId, script = "", label = "
             }
             return null;
           };
+          const parseFnChangeMonthArg = (source) => {
+            const m = String(source || "").match(
+              /(?:window\.|parent\.|top\.)?fnchangemonth\s*\(\s*['"]?(\d{6})['"]?\s*\)\s*;?/i
+            );
+            return m ? String(m[1] || "") : "";
+          };
+          const resolveFnChangeMonth = () => {
+            const refs = [
+              { host: "window", ref: window },
+              { host: "parent", ref: window.parent },
+              { host: "top", ref: window.top }
+            ];
+            for (const item of refs) {
+              try {
+                if (typeof item.ref?.fnChangeMonth === "function") {
+                  return {
+                    host: item.host,
+                    fn: item.ref.fnChangeMonth,
+                    ctx: item.ref
+                  };
+                }
+              } catch (_) {}
+            }
+            return null;
+          };
 
           const hasFnCall = /fnblockseatupdate\s*\(/i.test(code);
           const directArgs = hasFnCall ? parseFnBlockArgs(code) : null;
@@ -880,12 +908,23 @@ async function runLegacyScriptInMainWorld(tabId, frameId, script = "", label = "
             out.fnBlockSeatUpdateDefined = true;
             out.fnHost = resolvedFn.host;
           }
+          const directMonthArg = parseFnChangeMonthArg(code);
+          const resolvedMonthFn = resolveFnChangeMonth();
+          if (resolvedMonthFn) {
+            out.fnChangeMonthDefined = true;
+            out.fnChangeMonthHost = resolvedMonthFn.host;
+          }
 
           if (resolvedFn && directArgs?.length === 3) {
             resolvedFn.fn.call(resolvedFn.ctx, directArgs[0], directArgs[1], directArgs[2]);
             out.ok = true;
             out.mode = "direct_fn";
             out.directArgs = directArgs;
+          } else if (resolvedMonthFn && /^\d{6}$/.test(directMonthArg)) {
+            resolvedMonthFn.fn.call(resolvedMonthFn.ctx, directMonthArg);
+            out.ok = true;
+            out.mode = "direct_month_fn";
+            out.directMonthArg = directMonthArg;
           } else {
             try {
               window.eval(code);
@@ -922,7 +961,9 @@ async function runLegacyScriptInMainWorld(tabId, frameId, script = "", label = "
         result: row?.result || null
       }))
       .filter((x) => x.result);
-    const direct = mapped.find((x) => x.result.ok && x.result.mode === "direct_fn");
+    const direct = mapped.find(
+      (x) => x.result.ok && (x.result.mode === "direct_fn" || x.result.mode === "direct_month_fn")
+    );
     if (direct) return { ...direct.result, frameId: direct.frameId };
     const srcChanged = mapped.find(
       (x) =>
