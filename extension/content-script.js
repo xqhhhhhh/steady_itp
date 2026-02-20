@@ -232,7 +232,6 @@ function normalizeNewAreaCustomCodes(raw) {
 }
 
 function buildNewAreaOrderMap() {
-  if (normalizeNewAreaOrderMode(state.config.newAreaOrderMode) !== "custom") return null;
   const codes = normalizeNewAreaCustomCodes(state.config.newAreaCustomCodes || []);
   if (!codes.length) return null;
   return new Map(codes.map((code, idx) => [code, idx]));
@@ -2051,16 +2050,13 @@ function getSeatCandidates() {
     .filter(Boolean);
 
   const blockMetrics = buildSeatBlockMetrics(mapped);
+  const customOrderMap = buildNewAreaOrderMap();
   let ordered = mapped;
-  if (normalizeNewAreaOrderMode(state.config.newAreaOrderMode) === "custom") {
-    const matchedBlockIds = new Set(
-      Array.from(blockMetrics.values())
-        .filter((x) => Number.isFinite(x?.blockCustomRank))
-        .map((x) => x.blockId)
-    );
-    if (matchedBlockIds.size) {
-      ordered = mapped.filter((item) => matchedBlockIds.has(item.blockId || "__no_block__"));
-    }
+  if (customOrderMap instanceof Map && customOrderMap.size) {
+    ordered = mapped.filter((item) => {
+      const code = getSeatBlockAreaCode(item.blockId);
+      return Boolean(code && customOrderMap.has(code));
+    });
   }
   const clusterMetrics = buildSeatClusterMetrics(ordered);
   ordered.sort((a, b) => {
@@ -2147,7 +2143,9 @@ async function chooseSeatsByClick(quantity) {
     if (!candidates.length) {
       const totalSeatSvg = document.querySelectorAll("[class*='SeatMap_seatSvg__'], [class*='seatSvg']").length;
       const disabledSeatSvg = document.querySelectorAll("[class*='SeatMap_seatSvg__'][class*='disabled'], [class*='seatSvg'][class*='disabled']").length;
-      log(`未发现可选座位候选 (seatSvg=${totalSeatSvg}, disabled=${disabledSeatSvg})`);
+      const customCodes = normalizeNewAreaCustomCodes(state.config.newAreaCustomCodes || []);
+      const customText = customCodes.length ? `, custom=${customCodes.join("/")}` : "";
+      log(`未发现可选座位候选 (seatSvg=${totalSeatSvg}, disabled=${disabledSeatSvg}${customText})`);
       break;
     }
     if (!hintedBlock) {

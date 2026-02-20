@@ -284,6 +284,8 @@ function addNewAreaCodeFromInput() {
     newAreaCodes.push(code);
     renderNewAreaCodeList();
   }
+  $("newAreaOrderMode").value = "custom";
+  syncNewAreaCustomVisibility();
 }
 
 function getFormConfig() {
@@ -292,6 +294,7 @@ function getFormConfig() {
   const criticalPre = normalizeNumber($("criticalPreSeconds").value || 2.5, 0.5, 10, 2.5, false);
   const criticalPost = normalizeNumber($("criticalPostSeconds").value || 8, 1, 20, 8, false);
   const criticalTick = normalizeNumber($("criticalTickMs").value || 65, 40, 180, 65, true);
+  const newCodes = getNewAreaCodes();
   return {
     eventUrl: $("eventUrl").value.trim(),
     saleStartTime: $("saleStartTime").value.trim(),
@@ -308,8 +311,9 @@ function getFormConfig() {
     dateMonth: $("dateMonth").value.trim(),
     dateDay: $("dateDay").value.trim(),
     dateTime: $("dateTime").value.trim(),
-    newAreaOrderMode: $("newAreaOrderMode").value === "custom" ? "custom" : "default",
-    newAreaCustomCodes: getNewAreaCodes(),
+    newAreaOrderMode:
+      $("newAreaOrderMode").value === "custom" || newCodes.length ? "custom" : "default",
+    newAreaCustomCodes: newCodes,
     legacyAreaOrderMode: $("legacyAreaOrderMode").value === "custom" ? "custom" : "default",
     legacyAreaCustomCodes: getLegacyAreaCodes(),
     legacyAreaSwitchIntervalMs: normalizeLegacyAreaTimingMs(
