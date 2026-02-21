@@ -331,6 +331,7 @@ function getFormConfig() {
     ocrActivationCode: $("ocrActivationCode").value.trim(),
     vpnApiUrl: $("vpnApiUrl").value.trim(),
     vpnAutoSwitchEnabled: runMode === "scavenge" ? false : $("vpnAutoSwitchEnabled").checked,
+    queueVpnNotifyEnabled: $("queueVpnNotifyEnabled").checked,
     dingTalkWebhookUrl: $("dingTalkWebhookUrl").value.trim(),
     dingTalkSecret: $("dingTalkSecret").value.trim(),
     fullFlowEnabled: false
@@ -422,6 +423,7 @@ async function loadState() {
   renderOcrLicenseStatus(config);
   if (config.vpnApiUrl) $("vpnApiUrl").value = config.vpnApiUrl;
   $("vpnAutoSwitchEnabled").checked = config.vpnAutoSwitchEnabled !== false;
+  $("queueVpnNotifyEnabled").checked = config.queueVpnNotifyEnabled !== false;
   syncVpnApiVisibility();
   if (config.dingTalkWebhookUrl) $("dingTalkWebhookUrl").value = config.dingTalkWebhookUrl;
   if (config.dingTalkSecret) $("dingTalkSecret").value = config.dingTalkSecret;

@@ -39,6 +39,7 @@ const state = {
     ocrLicenseActivatedAt: 0,
     vpnApiUrl: "http://127.0.0.1:8000",
     vpnAutoSwitchEnabled: true,
+    queueVpnNotifyEnabled: true,
     dingTalkWebhookUrl: "",
     dingTalkSecret: ""
   },
@@ -654,6 +655,10 @@ async function triggerVpnAutoSwitch(reason, currentQueue, options = {}) {
   }
 }
 
+function shouldPushQueueVpnNotify() {
+  return state.config.queueVpnNotifyEnabled !== false;
+}
+
 async function runQueueHealthGuard() {
   const now = Date.now();
   if (now - state.queueHealth.lastProbeAt < state.queueHealth.probeIntervalMs) return;
@@ -670,11 +675,13 @@ async function runQueueHealthGuard() {
 
   if (health.ok) {
     if (state.queueHealth.alertActive) {
-      await sendDingTalkNotify(
-        `queue_recovered_${state.config.saleStartTime || location.pathname}`,
-        "排队网络已恢复",
-        `网络探测恢复正常，当前队列约 ${Number.isFinite(remaining) ? remaining : "未知"}。`
-      );
+      if (shouldPushQueueVpnNotify()) {
+        await sendDingTalkNotify(
+          `queue_recovered_${state.config.saleStartTime || location.pathname}`,
+          "排队网络已恢复",
+          `网络探测恢复正常，当前队列约 ${Number.isFinite(remaining) ? remaining : "未知"}。`
+        );
+      }
       state.queueHealth.alertActive = false;
       state.queueHealth.lastAlertAt = 0;
     }
@@ -688,11 +695,13 @@ async function runQueueHealthGuard() {
 
   const canResend = now - state.queueHealth.lastAlertAt > 60000;
   if (!state.queueHealth.alertActive || canResend) {
-    await sendDingTalkNotify(
-      `queue_unhealthy_${state.config.saleStartTime || location.pathname}`,
-      "排队网络异常（重度）",
-      `连续探测失败 ${state.queueHealth.consecutiveFail} 次，原因: ${health.reason || "unknown"}，当前队列约 ${Number.isFinite(remaining) ? remaining : "未知"}。`
-    );
+    if (shouldPushQueueVpnNotify()) {
+      await sendDingTalkNotify(
+        `queue_unhealthy_${state.config.saleStartTime || location.pathname}`,
+        "排队网络异常（重度）",
+        `连续探测失败 ${state.queueHealth.consecutiveFail} 次，原因: ${health.reason || "unknown"}，当前队列约 ${Number.isFinite(remaining) ? remaining : "未知"}。`
+      );
+    }
     state.queueHealth.alertActive = true;
     state.queueHealth.lastAlertAt = now;
   }
@@ -706,11 +715,13 @@ async function runQueueHealthGuard() {
   const switched = await triggerVpnAutoSwitch(health.reason || "queue_unhealthy", remaining);
   if (switched.ok) {
     log("已触发 VPN 自动切换");
-    await sendDingTalkNotify(
-      `vpn_switched_${state.config.saleStartTime || location.pathname}_${Math.floor(now / 600000)}`,
-      "已触发 VPN 自动切换",
-      `队列网络连续异常，已请求自动切换 VPN。当前队列约 ${Number.isFinite(remaining) ? remaining : "未知"}。`
-    );
+    if (shouldPushQueueVpnNotify()) {
+      await sendDingTalkNotify(
+        `vpn_switched_${state.config.saleStartTime || location.pathname}_${Math.floor(now / 600000)}`,
+        "已触发 VPN 自动切换",
+        `队列网络连续异常，已请求自动切换 VPN。当前队列约 ${Number.isFinite(remaining) ? remaining : "未知"}。`
+      );
+    }
   } else if (!switched.skipped) {
     log(`VPN 自动切换失败: ${switched.error || "unknown"}`);
   }
@@ -2242,6 +2253,8 @@ function closeSeatUnlockNoticeIfPresent() {
   const hit =
     text.includes("其他客户已选定的座位将被解除锁定") ||
     text.includes("其他客戶已選定的座位將被解除鎖定") ||
+    text.includes("已经选择的座位") ||
+    text.includes("已經選擇的座位") ||
     text.includes("selected by another customer") ||
     text.includes("will be unlocked");
   if (!hit) return false;
@@ -7113,6 +7126,7 @@ async function loadConfig() {
     ocrLicenseActivatedAt: Number(config.ocrLicenseActivatedAt || 0),
     vpnApiUrl: String(config.vpnApiUrl || "http://127.0.0.1:8000").trim(),
     vpnAutoSwitchEnabled: config.vpnAutoSwitchEnabled !== false,
+    queueVpnNotifyEnabled: config.queueVpnNotifyEnabled !== false,
     dingTalkWebhookUrl: String(config.dingTalkWebhookUrl || "").trim(),
     dingTalkSecret: String(config.dingTalkSecret || "").trim()
   };

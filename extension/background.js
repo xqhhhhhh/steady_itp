@@ -90,6 +90,7 @@ async function saveConfig(config) {
       ocrLicenseActivatedAt: Number(current?.ocrLicenseActivatedAt || 0),
       vpnApiUrl: String(config?.vpnApiUrl || "http://127.0.0.1:8000").trim(),
       vpnAutoSwitchEnabled: config?.vpnAutoSwitchEnabled !== false,
+      queueVpnNotifyEnabled: config?.queueVpnNotifyEnabled !== false,
       dingTalkWebhookUrl: String(config?.dingTalkWebhookUrl || "").trim(),
       dingTalkSecret: String(config?.dingTalkSecret || "").trim(),
       enabled: true,
@@ -191,6 +192,10 @@ async function saveConfigOnly(config) {
         typeof config?.vpnAutoSwitchEnabled === "boolean"
           ? config.vpnAutoSwitchEnabled
           : current.vpnAutoSwitchEnabled !== false,
+      queueVpnNotifyEnabled:
+        typeof config?.queueVpnNotifyEnabled === "boolean"
+          ? config.queueVpnNotifyEnabled
+          : current.queueVpnNotifyEnabled !== false,
       dingTalkWebhookUrl: String(
         config?.dingTalkWebhookUrl || current.dingTalkWebhookUrl || ""
       ).trim(),
@@ -1293,6 +1298,7 @@ chrome.runtime.onInstalled.addListener(async () => {
         ocrLicenseActivatedAt: 0,
         vpnApiUrl: "http://127.0.0.1:8000",
         vpnAutoSwitchEnabled: true,
+        queueVpnNotifyEnabled: true,
         dingTalkWebhookUrl: "",
         dingTalkSecret: ""
       }
