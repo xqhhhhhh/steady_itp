@@ -3,6 +3,7 @@
   "name": "NOL Ticket Fast Helper",
   "version": "0.1.0",
   "description": "Request-first and click-fallback helper for NOL ticket purchase flow.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAme6iht521ebG4I+nBKrGM+MA1eP9yqZ9oohR5fjivjjWt0BDNwuKw635BkKGGnDlZwgTKQMIZhiamNPLzjw84ZGPQlaYr73N+Jjh2+/H4KNpmEpCFfat9AOfdESpaqZPdWBuruIbybpzB9Oufggb3ZtVkJNT/L8dAqEaD1PL2hoZ+WDOaN2bW548Ht14laQQXmaYXb2+wZH1BH5rq4bkGdKOkZySvnDyxrE2u6B8yVn19sVGfxnUMWLawDvWhyeb4QAnZmZfafmj12wOHlD4XSJeDxmJSiOydV9Tqr5skLhmYHbmDl/fSOgmcwsZSiudQqcF+i8zLMNvwnPsicrjHQIDAQAB",
   "permissions": ["storage", "tabs", "scripting", "activeTab", "alarms"],
   "host_permissions": [
     "https://*/*",

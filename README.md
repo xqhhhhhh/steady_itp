@@ -89,6 +89,7 @@ export VPN_SWITCH_CONFIG="/absolute/path/to/vpn_switch.yaml"
 - `POST /license/admin/create`（管理员导入激活码）
 - `POST /license/admin/generate`（管理员批量生成激活码）
 - `POST /license/admin/revoke`（管理员吊销激活码）
+- `POST /console/api/revoke`（控制台内直接吊销激活码）
 - `POST /ocr/file`
 - `POST /ocr/base64`
 

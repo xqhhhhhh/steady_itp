@@ -77,6 +77,10 @@ class LicenseConsoleLookupRequest(BaseModel):
     activation_code: str
 
 
+class LicenseConsoleRevokeRequest(BaseModel):
+    activation_code: str
+
+
 _DIGIT_TO_LETTER_MAP: dict[str, str] = {
     "0": "O",
     "1": "I",
@@ -991,9 +995,10 @@ def console_page() -> str:
           <input id="availKeyword" type="text" placeholder="按激活码关键字筛选 (可选)" />
           <button id="availSearchBtn" type="button">查询</button>
         </div>
-        <div class="row" style="grid-template-columns: auto auto 1fr;">
+        <div class="row" style="grid-template-columns: auto auto auto 1fr;">
           <button id="availPrevBtn" class="secondary" type="button">上一页</button>
           <button id="availNextBtn" class="secondary" type="button">下一页</button>
+          <button id="availRevokedBtn" class="secondary" type="button">仅看已撤销</button>
           <div id="availStatus" class="status warn" style="margin: 0; align-self: center;">未查询</div>
         </div>
         <div style="margin-top:10px; overflow:auto;">
@@ -1006,9 +1011,10 @@ def console_page() -> str:
 
       <section class="card">
         <h2>激活码查询</h2>
-        <div class="row" style="grid-template-columns: 1fr auto;">
+        <div class="row" style="grid-template-columns: 1fr auto auto;">
           <input id="lookupCode" type="text" placeholder="输入完整激活码，如 PERM-XXXX-XXXX-XXXX-XXXX" />
           <button id="lookupBtn" type="button">查询</button>
+          <button id="lookupRevokeBtn" class="secondary" type="button">废除此码</button>
         </div>
         <div id="lookupStatus" class="status warn">请输入激活码后查询</div>
         <div id="lookupDetail" class="kv"></div>
@@ -1062,6 +1068,19 @@ def console_page() -> str:
 
       async function fetchLookup(code) {
         const resp = await fetch("./console/api/code", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...headers() },
+          body: JSON.stringify({ activation_code: code })
+        });
+        if (!resp.ok) {
+          const txt = await resp.text();
+          throw new Error(txt || `HTTP ${resp.status}`);
+        }
+        return resp.json();
+      }
+
+      async function fetchRevoke(code) {
+        const resp = await fetch("./console/api/revoke", {
           method: "POST",
           headers: { "Content-Type": "application/json", ...headers() },
           body: JSON.stringify({ activation_code: code })
@@ -1171,7 +1190,14 @@ def console_page() -> str:
               <td>${planLabel}</td>
               <td>${activatedAt}</td>
               <td>${expiresAt}</td>
-              <td><button class="secondary" type="button" data-code="${item.code}">复制</button></td>
+              <td>
+                <button class="secondary" type="button" data-action="copy" data-code="${item.code}">复制</button>
+                ${
+                  statusLabel === "REVOKED"
+                    ? ""
+                    : `<button class="secondary" type="button" data-action="revoke" data-code="${item.code}">废除</button>`
+                }
+              </td>
             `;
             body.appendChild(tr);
           }
@@ -1180,11 +1206,19 @@ def console_page() -> str:
             tr.innerHTML = '<td colspan="6">暂无符合条件的激活码</td>';
             body.appendChild(tr);
           }
-          for (const btn of Array.from(document.querySelectorAll("button[data-code]"))) {
+          for (const btn of Array.from(document.querySelectorAll("#availBody button[data-code]"))) {
             btn.addEventListener("click", async () => {
               const code = btn.getAttribute("data-code") || "";
-              const ok = await copyText(code);
-              setAvailStatus(ok ? "已复制激活码" : "复制失败，请手动复制", ok ? "ok" : "err");
+              const action = btn.getAttribute("data-action") || "copy";
+              if (!code) return;
+              if (action === "copy") {
+                const ok = await copyText(code);
+                setAvailStatus(ok ? "已复制激活码" : "复制失败，请手动复制", ok ? "ok" : "err");
+                return;
+              }
+              if (action === "revoke") {
+                await doRevokeByCode(code, { refresh: true });
+              }
             });
           }
           $("availPrevBtn").disabled = availPage <= 1;
@@ -1239,10 +1273,52 @@ def console_page() -> str:
         }
       }
 
+      async function doRevokeByCode(code, options = {}) {
+        const targetCode = String(code || "").trim();
+        if (!targetCode) {
+          setLookupStatus("请输入激活码", "warn");
+          return false;
+        }
+        const yes = confirm(`确认废除激活码？\n${targetCode}`);
+        if (!yes) return false;
+        try {
+          const data = await fetchRevoke(targetCode);
+          const already = data?.already_revoked === true;
+          const msg = already ? "该激活码已是撤销状态" : "激活码已废除";
+          setLookupStatus(msg, "ok");
+          if (options?.refresh) {
+            await Promise.all([refreshSummary(), refreshAvailableCodes(false)]);
+          }
+          try {
+            const lookupData = await fetchLookup(targetCode);
+            renderLookup(lookupData);
+          } catch (_) {}
+          return true;
+        } catch (err) {
+          const text = `废除失败: ${String(err.message || err)}`;
+          setLookupStatus(text, "err");
+          setAvailStatus(text, "err");
+          return false;
+        }
+      }
+
+      async function doLookupRevoke() {
+        const code = $("lookupCode").value.trim();
+        const ok = await doRevokeByCode(code, { refresh: true });
+        if (!ok) return;
+        $("availStatusFilter").value = "REVOKED";
+        await refreshAvailableCodes(true);
+      }
+
       $("loginBtn").addEventListener("click", doLogin);
       $("logoutBtn").addEventListener("click", doLogout);
       $("lookupBtn").addEventListener("click", doLookup);
+      $("lookupRevokeBtn").addEventListener("click", doLookupRevoke);
       $("availSearchBtn").addEventListener("click", () => {
+        refreshAvailableCodes(true);
+      });
+      $("availRevokedBtn").addEventListener("click", () => {
+        $("availStatusFilter").value = "REVOKED";
         refreshAvailableCodes(true);
       });
       $("availStatusFilter").addEventListener("change", () => {
@@ -1429,6 +1505,33 @@ def console_lookup_code(
             "created_at_ms": int(row["created_at_ms"] or 0),
         },
     }
+
+
+@app.post("/console/api/revoke")
+def console_revoke_code(
+    payload: LicenseConsoleRevokeRequest,
+    _auth: None = Depends(_require_console_auth),
+) -> dict[str, Any]:
+    normalized = _normalize_activation_code(payload.activation_code)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="激活码格式无效")
+    code_hash = _hash_activation_code(normalized)
+
+    with _connect_db() as conn:
+        row = conn.execute(
+            "SELECT revoked FROM activation_codes WHERE code_hash = ?",
+            (code_hash,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="激活码不存在")
+        already_revoked = int(row["revoked"] or 0) != 0
+        if not already_revoked:
+            conn.execute(
+                "UPDATE activation_codes SET revoked = 1, status = 'REVOKED' WHERE code_hash = ?",
+                (code_hash,),
+            )
+
+    return {"ok": True, "already_revoked": already_revoked, "message": "revoked"}
 
 
 @app.post("/ocr/file", response_model=OcrResponse)

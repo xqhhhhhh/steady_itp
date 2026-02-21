@@ -111,6 +111,7 @@ const state = {
   scavengeLoopSuccess: false,
   scavengeLoopNextRestartAt: 0,
   scavengeLoopLastRestartAt: 0,
+  scavengeLoopTimeoutBaseAt: 0,
   scavengeLoopLastWaitLogAt: 0,
   scavengeLoopLastWaitTargetAt: 0,
   notifyQueueThresholdSent: {
@@ -857,6 +858,7 @@ async function maybeFinishScavengeLoopIfEnabled(reason = "") {
   if (state.scavengeLoopSuccess) return true;
   state.scavengeLoopSuccess = true;
   state.scavengeLoopNextRestartAt = 0;
+  state.scavengeLoopTimeoutBaseAt = 0;
   state.scavengeLoopLastWaitLogAt = 0;
   state.scavengeLoopLastWaitTargetAt = 0;
   const msg = String(reason || "命中成功条件");
@@ -889,8 +891,10 @@ async function maybeRunScavengeLoopRestart() {
   const now = Date.now();
   if (!state.scavengeLoopNextRestartAt || now < state.scavengeLoopNextRestartAt) return false;
 
+  // 新一轮开始：用于首段“立即购买”冲刺；单轮超时单独按 timeoutBase 计算。
   state.scavengeLoopLastRestartAt = now;
-  state.scavengeLoopNextRestartAt = now + intervalMs;
+  state.scavengeLoopTimeoutBaseAt = 0;
+  state.scavengeLoopNextRestartAt = 0;
   state.scavengeLoopLastWaitLogAt = 0;
   state.scavengeLoopLastWaitTargetAt = 0;
   state.productFlowKey = "";
@@ -899,8 +903,7 @@ async function maybeRunScavengeLoopRestart() {
   state.buyNowCachedEl = null;
   state.firstBuyNowClickAt = 0;
   await persistScavengeRuntime(state.scavengeLoopNextRestartAt, state.scavengeLoopLastRestartAt);
-  const minutes = Math.max(1, Math.round(intervalMs / 60000));
-  log(`捡漏循环触发：每 ${minutes} 分钟重跑一次，正在重新开始流程`);
+  log("捡漏循环触发：正在开始新一轮流程");
   try {
     const nowUrl = String(location.href || "").split("#")[0];
     const targetNoHash = targetUrl.split("#")[0];
@@ -930,15 +933,17 @@ async function maybeAbortScavengeRoundByTimeout() {
   if (!inBookingHost) return false;
 
   const now = Date.now();
-  if (!state.scavengeLoopLastRestartAt) {
-    state.scavengeLoopLastRestartAt = now;
+  if (!state.scavengeLoopTimeoutBaseAt) {
+    // 单轮超时从“进入订票域名后”开始计算，避免把 product 页跳转耗时算进来。
+    state.scavengeLoopTimeoutBaseAt = now;
     return false;
   }
-  const elapsed = now - state.scavengeLoopLastRestartAt;
+  const elapsed = now - state.scavengeLoopTimeoutBaseAt;
   if (elapsed < maxMs) return false;
 
   const intervalMs = getScavengeLoopIntervalMs();
   state.scavengeLoopLastRestartAt = now;
+  state.scavengeLoopTimeoutBaseAt = 0;
   state.scavengeLoopNextRestartAt = now + intervalMs;
   state.scavengeLoopLastWaitLogAt = 0;
   state.scavengeLoopLastWaitTargetAt = 0;
@@ -959,31 +964,6 @@ async function maybeAbortScavengeRoundByTimeout() {
 
 function shouldHoldOnWorldForScavengeWaiting() {
   if (!state.config.enabled || state.config.scavengeLoopEnabled !== true || state.scavengeLoopSuccess) {
-    return false;
-  }
-
-  const normalizeUrlForCompare = (raw, dropQuery = false) => {
-    try {
-      const u = new URL(String(raw || "").trim(), location.href);
-      u.hash = "";
-      const path = String(u.pathname || "/").replace(/\/+$/, "") || "/";
-      return dropQuery ? `${u.origin}${path}` : `${u.origin}${path}${u.search}`;
-    } catch (_) {
-      return "";
-    }
-  };
-
-  const targetFull = normalizeUrlForCompare(state.config.eventUrl, false);
-  const targetPath = normalizeUrlForCompare(state.config.eventUrl, true);
-  const currentFull = normalizeUrlForCompare(location.href, false);
-  const currentPath = normalizeUrlForCompare(location.href, true);
-
-  // 在目标活动页（或同一路径）时，不等待下一轮，继续完整执行本轮流程。
-  if ((targetFull && currentFull === targetFull) || (targetPath && currentPath === targetPath)) {
-    return false;
-  }
-  // 若当前页仍存在可点击入口，也应继续跑本轮，不提前进入“等待下一轮”。
-  if (getCachedOrFindBuyNowButton() || findReserveEntryButtonStrict()) {
     return false;
   }
 
@@ -7144,6 +7124,7 @@ async function loadConfig() {
   state.notifyPriceEnteredSent = false;
   state.notifyLegacySeatCompletedSent = false;
   state.scavengeLoopSuccess = false;
+  state.scavengeLoopTimeoutBaseAt = 0;
   state.scavengeLoopLastWaitLogAt = 0;
   state.scavengeLoopLastWaitTargetAt = 0;
   const now = Date.now();
