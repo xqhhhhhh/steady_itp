@@ -556,13 +556,8 @@ function getSaleCountdownMs() {
   return ts - Date.now();
 }
 
-function hasDingTalkWebhookConfigured() {
-  return Boolean(String(state.config.dingTalkWebhookUrl || "").trim());
-}
-
 async function sendDingTalkNotify(eventKey, title, text) {
   if (window.top !== window) return false;
-  if (!hasDingTalkWebhookConfigured()) return false;
   try {
     const resp = await chrome.runtime.sendMessage({
       type: "DINGTALK_NOTIFY",
@@ -574,7 +569,12 @@ async function sendDingTalkNotify(eventKey, title, text) {
       log(`钉钉通知已发送: ${title}`);
       return true;
     }
-  } catch (_) {}
+    if (resp?.error) {
+      log(`钉钉通知发送失败: ${String(resp.error)}`);
+    }
+  } catch (err) {
+    log(`钉钉通知发送异常: ${String(err?.message || err)}`);
+  }
   return false;
 }
 
@@ -1270,14 +1270,17 @@ async function runHumanVerifyStep() {
     return false;
   }
 
-  if (!state.humanVerifyAlertActive || Date.now() - state.humanVerifyLastNotifyAt > 2 * 60 * 1000) {
+  const now = Date.now();
+  const shouldNotifyNow =
+    !state.humanVerifyAlertActive || now - state.humanVerifyLastNotifyAt > 2 * 60 * 1000;
+  if (shouldNotifyNow) {
     state.humanVerifyAlertActive = true;
-    state.humanVerifyLastNotifyAt = Date.now();
-    await sendDingTalkNotify(
-      `human_verify_${location.pathname}_${Math.floor(Date.now() / (2 * 60 * 1000))}`,
+    const sent = await sendDingTalkNotify(
+      `human_verify_${location.pathname}_${now}`,
       "检测到 Cloudflare 人机验证",
       `页面出现 Verify you are human 验证，请及时处理。\n页面: ${location.href}`
     );
+    state.humanVerifyLastNotifyAt = sent ? now : now - 110 * 1000;
   }
 
   const verifying = document.querySelector("#verifying");
@@ -6417,7 +6420,7 @@ function applyLegacyAreaOrderByConfig(areas = []) {
 
   const orderMap = new Map(customCodes.map((code, idx) => [code, idx]));
   const matched = list.filter((area) => orderMap.has(String(area?.code || "").trim()));
-  if (!matched.length) return list;
+  if (!matched.length) return [];
 
   matched.sort((a, b) => {
     const ai = orderMap.get(String(a?.code || "").trim());
@@ -6789,6 +6792,19 @@ async function runLegacySeatStep() {
     return;
   }
 
+  const customLegacyCodes =
+    state.config.legacyAreaOrderMode === "custom"
+      ? normalizeLegacyAreaCustomCodes(state.config.legacyAreaCustomCodes || [])
+      : [];
+  const strictLegacyAreaMode = customLegacyCodes.length > 0;
+  const strictLegacyCodeSet = new Set(customLegacyCodes);
+  if (strictLegacyAreaMode) {
+    const currentCode = normalizeLegacyAreaCode(state.legacySeatCurrentAreaCode || "");
+    if (currentCode && !strictLegacyCodeSet.has(currentCode)) {
+      state.legacySeatCurrentAreaCode = "";
+    }
+  }
+
   let areas = applyLegacyAreaOrderByConfig(collectLegacySeatAreaCandidates(seatDoc));
   if (!areas.length) {
     const now = Date.now();
@@ -6796,6 +6812,13 @@ async function runLegacySeatStep() {
       state.legacySeatLastAreaDiscoveryAt = now;
       areas = await discoverLegacySeatAreasByGradeSweep(seatDoc, areas);
     }
+  }
+  if (strictLegacyAreaMode && !areas.length) {
+    if (Date.now() - state.legacySeatLastLogAt > 1500) {
+      log(`旧版严格区域模式: 未命中配置区域(${customLegacyCodes.join(",")})，本轮不点击其他区域座位`);
+      state.legacySeatLastLogAt = Date.now();
+    }
+    return;
   }
   if (areas.length) {
     if (state.legacySeatAreaIndex >= areas.length) state.legacySeatAreaIndex = 0;

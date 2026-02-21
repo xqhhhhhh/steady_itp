@@ -595,7 +595,8 @@ async function buildDingTalkSignedUrl(webhookUrl, secret) {
   );
   const payload = `${timestamp}\n${sec}`;
   const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(payload));
-  const sign = encodeURIComponent(u8ToBase64(new Uint8Array(signature)));
+  // URLSearchParams 会自动编码参数，避免先 encodeURIComponent 导致二次编码。
+  const sign = u8ToBase64(new Uint8Array(signature));
   url.searchParams.set("timestamp", String(timestamp));
   url.searchParams.set("sign", sign);
   return url.toString();
@@ -1638,6 +1639,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         });
         sendResponse({ ok: true, sent: true });
       } catch (err) {
+        await chrome.storage.local.set({
+          nolBotLastLog: {
+            text: `钉钉通知发送失败: ${String(err?.message || err)}`,
+            ts: Date.now()
+          }
+        });
         sendResponse({ ok: false, error: String(err?.message || err) });
       }
       return;
