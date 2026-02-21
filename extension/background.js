@@ -651,11 +651,18 @@ async function sendDingTalkText(webhookUrl, secret, title, text) {
 
 async function forceInjectAndKick(tabId) {
   if (!tabId) return;
+  let contentReady = false;
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["content-script.js"]
-    });
+    const pong = await chrome.tabs.sendMessage(tabId, { type: "PING_BOT" });
+    contentReady = Boolean(pong?.ok);
+  } catch (_) {}
+  try {
+    if (!contentReady) {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ["content-script.js"]
+      });
+    }
   } catch (_) {}
   try {
     await chrome.tabs.sendMessage(tabId, { type: "FORCE_START" });
