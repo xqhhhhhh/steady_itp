@@ -14,12 +14,12 @@ if not exist ".venv" (
 ".venv\Scripts\python.exe" -m pip install --upgrade pip
 if errorlevel 1 exit /b 1
 
-".venv\Scripts\python.exe" -m pip install -r requirements-call.txt
+".venv\Scripts\python.exe" -m pip install -r requirements-alarm.txt
 if errorlevel 1 exit /b 1
 
-if not exist "call_service.yaml" (
-  copy /Y "call_service.yaml.template" "call_service.yaml" >nul
+if not exist "alarm_service.yaml" (
+  copy /Y "alarm_service.yaml.template" "alarm_service.yaml" >nul
 )
 
-set "CALL_SERVICE_CONFIG=%cd%\call_service.yaml"
-".venv\Scripts\python.exe" call_service.py
+set "ALARM_SERVICE_CONFIG=%cd%\alarm_service.yaml"
+".venv\Scripts\python.exe" alarm_service.py

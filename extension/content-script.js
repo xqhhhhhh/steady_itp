@@ -609,37 +609,32 @@ async function sendDingTalkNotify(eventKey, title, text) {
   return false;
 }
 
-function getPriceEnterCallNumber() {
-  return String(state.config.phoneNumber || "").trim();
-}
-
-async function sendAliyunCallNotify(eventKey, title, text, calledNumber = "") {
+async function sendLocalAlarmNotify(eventKey, title, text) {
   if (window.top !== window) return false;
   try {
     const resp = await chrome.runtime.sendMessage({
-      type: "ALIYUN_CALL_NOTIFY",
+      type: "LOCAL_ALARM_NOTIFY",
       eventKey: String(eventKey || "").trim(),
-      title: String(title || "NOL BOT 价格页提醒"),
+      title: String(title || "NOL BOT 报警提醒"),
       text: String(text || ""),
-      calledNumber: String(calledNumber || "").trim(),
       sourceUrl: location.href
     });
     if (resp?.ok && resp.sent) {
-      log(`阿里云电话通知已发送: ${title}`);
+      log(`本地报警已触发: ${title}`);
       return true;
     }
     if (resp?.ok && resp?.dedup) {
-      log(`阿里云电话通知去重跳过: ${title}`);
+      log(`本地报警去重跳过: ${title}`);
       return false;
     }
     if (resp?.ok && (resp?.skipped === "service_unavailable" || resp?.skipped === "backend_not_ready")) {
       return false;
     }
     if (resp?.error) {
-      log(`阿里云电话通知发送失败: ${String(resp.error)}`);
+      log(`本地报警触发失败: ${String(resp.error)}`);
     }
   } catch (err) {
-    log(`阿里云电话通知发送异常: ${String(err?.message || err)}`);
+    log(`本地报警触发异常: ${String(err?.message || err)}`);
   }
   return false;
 }
@@ -897,11 +892,10 @@ async function maybeNotifyEnteredPrice() {
     "已进入价格页",
     detailText
   );
-  await sendAliyunCallNotify(
-    `entered_price_call_${state.config.saleStartTime || location.pathname}${location.search}`,
+  await sendLocalAlarmNotify(
+    `entered_price_alarm_${state.config.saleStartTime || location.pathname}${location.search}`,
     "已进入价格页",
-    detailText,
-    getPriceEnterCallNumber()
+    detailText
   );
   await maybeFinishScavengeLoopIfEnabled("已进入价格页");
 }
@@ -944,11 +938,10 @@ async function maybeNotifyLegacySeatCompletedOnTransition() {
     "抢票成功：已提交座位",
     detailText
   );
-  await sendAliyunCallNotify(
-    `${eventKey}_call`,
+  await sendLocalAlarmNotify(
+    `${eventKey}_alarm`,
     "抢票成功：已提交座位",
-    detailText,
-    getPriceEnterCallNumber()
+    detailText
   );
   if (sent) {
     state.notifyLegacySeatCompletedSent = true;
@@ -3875,7 +3868,7 @@ function getCachedOrFindBuyNowButton() {
 }
 
 function findReserveEntryButtonStrict() {
-  const words = STEP_TEXT.reserveEntry.map((w) => normalizeText(w));
+  const strictWords = ["预定", "預定"].map((w) => normalizeText(w));
   const buyWords = STEP_TEXT.buyNow.map((w) => normalizeText(w));
   const nodes = Array.from(
     document.querySelectorAll("button, a, [role='button'], div, span")
@@ -3898,7 +3891,8 @@ function findReserveEntryButtonStrict() {
   const candidates = nodes
     .map((el) => {
       const text = normalizeText(el.textContent || "");
-      if (!text || !words.some((w) => text.includes(w))) return null;
+      // 严格匹配“预定/預定”整词，不允许出现其他字（如“一般预定”）。
+      if (!text || !strictWords.includes(text)) return null;
       // 排除“立即购买”类按钮，避免韩文 예매/예매하기 重叠误判
       if (buyWords.some((w) => text.includes(w))) return null;
       // 避免误点价格页“预购”
@@ -3909,29 +3903,14 @@ function findReserveEntryButtonStrict() {
         el.getAttribute("aria-disabled") === "true" ||
         cls.includes("disabled");
       if (disabled) return null;
+      if (!isLikelyInteractive(el)) return null;
       const r = el.getBoundingClientRect();
       let score = 0;
       if (r.left > window.innerWidth * 0.5) score += 3;
       if (r.top > window.innerHeight * 0.45) score += 3;
       if (r.width > 140 && r.height > 34) score += 3;
-      if (isLikelyInteractive(el)) score += 5;
-      else score -= 6;
-      if (
-        text.startsWith("预约") ||
-        text.startsWith("預約") ||
-        text.includes("一般预订") ||
-        text.includes("一般預訂") ||
-        text.includes("一般预定") ||
-        text.includes("一般預定") ||
-        text.includes("general reservation") ||
-        text.includes("normal reservation") ||
-        text.startsWith("reservation") ||
-        text.startsWith("reserve") ||
-        text.includes("일반예매")
-      ) {
-        score += 4;
-      }
-      if (text === "預約" || text === "预约" || text === "预定" || text === "預定") score -= 1;
+      score += 5;
+      if (text === "预定" || text === "預定") score += 4;
       if (cls.includes("primary") || cls.includes("button")) score += 2;
       return { el, score };
     })
