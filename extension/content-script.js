@@ -13,6 +13,9 @@ const state = {
     criticalPreSeconds: 2.5,
     criticalPostSeconds: 8,
     criticalTickMs: 65,
+    reserveClickIntervalMs: 65,
+    reserveClickBurstCount: 1,
+    reserveClickStartMode: "edge_once",
     scavengeLoopEnabled: false,
     scavengeLoopIntervalSec: 600,
     scavengeRoundMaxSec: 0,
@@ -73,6 +76,10 @@ const state = {
   legacyNextWaitLogAt: 0,
   productFlowKey: "",
   productBuyClickedAt: 0,
+  reserveEntryLastClickAt: 0,
+  reserveEntryFlowKey: "",
+  reserveEntryLastPresent: false,
+  reserveEntryClickedOnce: false,
   productLastCountdownLogAt: 0,
   queueLastLogAt: 0,
   queueActive: false,
@@ -96,6 +103,7 @@ const state = {
   priceLockedSlow: false,
   buyNowCachedEl: null,
   firstBuyNowClickAt: 0,
+  buyNowNoResponseLastNotifyAt: 0,
   humanVerifyLastClickAt: 0,
   humanVerifyLastLogAt: 0,
   humanVerifyAttempted: false,
@@ -113,6 +121,7 @@ const state = {
   scavengeLoopNextRestartAt: 0,
   scavengeLoopLastRestartAt: 0,
   scavengeLoopTimeoutBaseAt: 0,
+  scavengeLoopTimeoutPausedAt: 0,
   scavengeLoopLastWaitLogAt: 0,
   scavengeLoopLastWaitTargetAt: 0,
   notifyQueueThresholdSent: {
@@ -472,6 +481,23 @@ function normalizeCriticalTickMs(raw, fallback = TICK_MS_CRITICAL_DEFAULT) {
   return Math.min(180, Math.max(40, Math.round(n)));
 }
 
+function normalizeReserveClickIntervalMs(raw, fallback = 65) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return Math.min(1000, Math.max(40, Number(fallback) || 65));
+  return Math.min(1000, Math.max(40, Math.round(n)));
+}
+
+function normalizeReserveClickBurstCount(raw, fallback = 1) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return Math.min(5, Math.max(1, Number(fallback) || 1));
+  return Math.min(5, Math.max(1, Math.round(n)));
+}
+
+function normalizeReserveClickStartMode(raw, fallback = "edge_once") {
+  const mode = String(raw || fallback || "edge_once").trim().toLowerCase();
+  return mode === "always" ? "always" : "edge_once";
+}
+
 function normalizeScavengeLoopIntervalSec(raw, fallback = 600) {
   const n = Number(raw);
   if (!Number.isFinite(n)) return Math.min(3600, Math.max(15, Math.round(Number(fallback) || 600)));
@@ -570,6 +596,10 @@ async function sendDingTalkNotify(eventKey, title, text) {
       log(`钉钉通知已发送: ${title}`);
       return true;
     }
+    if (resp?.ok && resp?.dedup) {
+      log(`钉钉通知去重跳过: ${title}`);
+      return false;
+    }
     if (resp?.error) {
       log(`钉钉通知发送失败: ${String(resp.error)}`);
     }
@@ -579,13 +609,48 @@ async function sendDingTalkNotify(eventKey, title, text) {
   return false;
 }
 
+function getPriceEnterCallNumber() {
+  return String(state.config.phoneNumber || "").trim();
+}
+
+async function sendAliyunCallNotify(eventKey, title, text, calledNumber = "") {
+  if (window.top !== window) return false;
+  try {
+    const resp = await chrome.runtime.sendMessage({
+      type: "ALIYUN_CALL_NOTIFY",
+      eventKey: String(eventKey || "").trim(),
+      title: String(title || "NOL BOT 价格页提醒"),
+      text: String(text || ""),
+      calledNumber: String(calledNumber || "").trim(),
+      sourceUrl: location.href
+    });
+    if (resp?.ok && resp.sent) {
+      log(`阿里云电话通知已发送: ${title}`);
+      return true;
+    }
+    if (resp?.ok && resp?.dedup) {
+      log(`阿里云电话通知去重跳过: ${title}`);
+      return false;
+    }
+    if (resp?.ok && (resp?.skipped === "service_unavailable" || resp?.skipped === "backend_not_ready")) {
+      return false;
+    }
+    if (resp?.error) {
+      log(`阿里云电话通知发送失败: ${String(resp.error)}`);
+    }
+  } catch (err) {
+    log(`阿里云电话通知发送异常: ${String(err?.message || err)}`);
+  }
+  return false;
+}
+
 function parseQueueRemaining() {
   const raw = (document.body?.innerText || "").replace(/\u00a0/g, " ");
   const patterns = [
-    /我的等候[順位顺位]\s*[:：]?\s*([\d,]+)/i,
-    /目前等候[順位顺位]\s*[:：]?\s*([\d,]+)/i,
-    /等候[順位顺位]\s*[:：]?\s*([\d,]+)/i,
-    /대기\s*순위\s*[:：]?\s*([\d,]+)/i,
+    /我的\s*(?:等候|等待)\s*(?:順位|顺位)\s*[:：]?\s*([\d,]+)/i,
+    /目前\s*(?:等候|等待)\s*(?:順位|顺位)\s*[:：]?\s*([\d,]+)/i,
+    /(?:等候|等待)\s*(?:順位|顺位)\s*[:：]?\s*([\d,]+)/i,
+    /대기\s*(?:순위|순번)\s*[:：]?\s*([\d,]+)/i,
     /waiting\s*(?:rank|number|queue)\s*[:：]?\s*([\d,]+)/i
   ];
   for (const re of patterns) {
@@ -773,14 +838,70 @@ async function maybeNotifyQueueThresholds() {
   }
 }
 
+function hasBuyNowFlowReacted() {
+  const host = String(location.host || "").toLowerCase();
+  if (host === "secureapi.ext.eximbay.com") return true;
+  if (isQueuePage()) return true;
+
+  if (
+    host === "tickets.interpark.com" ||
+    host === "gpoticket.globalinterpark.com" ||
+    isLegacyBookingUrl()
+  ) {
+    const variant = detectInterparkBookingVariant();
+    if (variant === "legacy") {
+      if (isLegacySeatLayerVisible() || isLegacySeatIframeReady() || isLegacyCertifyLayerVisible()) {
+        return true;
+      }
+      const stepNo = Number(getLegacyActiveStepNumber() || 0);
+      return Number.isFinite(stepNo) && stepNo >= 1;
+    }
+    const stage = detectCurrentStage();
+    return stage === "date" || stage === "seat" || stage === "price" || stage === "info";
+  }
+  return false;
+}
+
+async function maybeNotifyBuyNowNoResponse() {
+  const firstAt = Number(state.firstBuyNowClickAt || 0);
+  if (!firstAt) return;
+
+  // 未到开抢时间前等待属于正常行为，不触发兜底告警。
+  const countdownMs = getSaleCountdownMs();
+  if (Number.isFinite(countdownMs) && countdownMs > 0) return;
+
+  if (hasBuyNowFlowReacted()) {
+    state.buyNowNoResponseLastNotifyAt = 0;
+    return;
+  }
+
+  const now = Date.now();
+  if (now - firstAt < 60 * 1000) return;
+  if (now - Number(state.buyNowNoResponseLastNotifyAt || 0) < 90 * 1000) return;
+
+  const sent = await sendDingTalkNotify(
+    `buy_now_no_response_${state.config.startedAt || state.config.saleStartTime || location.pathname}`,
+    "疑似 Cloudflare 验证阻塞",
+    `点击“立即购买”已超过 1 分钟仍无页面放行，疑似出现 Cloudflare Verify you are human，请手动验证后继续。\n页面: ${location.href}`
+  );
+  state.buyNowNoResponseLastNotifyAt = sent ? now : now - 30 * 1000;
+}
+
 async function maybeNotifyEnteredPrice() {
   if (state.notifyPriceEnteredSent) return;
   state.notifyPriceEnteredSent = true;
   const selected = detectSelectedSeatCount();
+  const detailText = `已进入价格页(step=price)，当前检测已选座位数: ${selected}。`;
   await sendDingTalkNotify(
     `entered_price_${state.config.saleStartTime || location.pathname}${location.search}`,
     "已进入价格页",
-    `已进入价格页(step=price)，当前检测已选座位数: ${selected}。`
+    detailText
+  );
+  await sendAliyunCallNotify(
+    `entered_price_call_${state.config.saleStartTime || location.pathname}${location.search}`,
+    "已进入价格页",
+    detailText,
+    getPriceEnterCallNumber()
   );
   await maybeFinishScavengeLoopIfEnabled("已进入价格页");
 }
@@ -817,10 +938,17 @@ async function maybeNotifyLegacySeatCompletedOnTransition() {
   const selected = Math.max(1, Number(state.legacySeatSubmitSelectedAtTrigger) || 1);
   const target = Math.max(1, Number(state.legacySeatSubmitTargetAtTrigger) || 1);
   const eventKey = `legacy_seat_done_${state.config.saleStartTime || "unknown"}_${location.pathname}_${location.search}`;
+  const detailText = `已选座并点击 completed，已进入下一界面。数量: ${selected}/${target}，step=${stepNo || "unknown"}，时间: ${new Date().toLocaleString()}`;
   const sent = await sendDingTalkNotify(
     eventKey,
     "抢票成功：已提交座位",
-    `已选座并点击 completed，已进入下一界面。数量: ${selected}/${target}，step=${stepNo || "unknown"}，时间: ${new Date().toLocaleString()}`
+    detailText
+  );
+  await sendAliyunCallNotify(
+    `${eventKey}_call`,
+    "抢票成功：已提交座位",
+    detailText,
+    getPriceEnterCallNumber()
   );
   if (sent) {
     state.notifyLegacySeatCompletedSent = true;
@@ -870,6 +998,7 @@ async function maybeFinishScavengeLoopIfEnabled(reason = "") {
   state.scavengeLoopSuccess = true;
   state.scavengeLoopNextRestartAt = 0;
   state.scavengeLoopTimeoutBaseAt = 0;
+  state.scavengeLoopTimeoutPausedAt = 0;
   state.scavengeLoopLastWaitLogAt = 0;
   state.scavengeLoopLastWaitTargetAt = 0;
   const msg = String(reason || "命中成功条件");
@@ -905,6 +1034,7 @@ async function maybeRunScavengeLoopRestart() {
   // 新一轮开始：用于首段“立即购买”冲刺；单轮超时单独按 timeoutBase 计算。
   state.scavengeLoopLastRestartAt = now;
   state.scavengeLoopTimeoutBaseAt = 0;
+  state.scavengeLoopTimeoutPausedAt = 0;
   state.scavengeLoopNextRestartAt = 0;
   state.scavengeLoopLastWaitLogAt = 0;
   state.scavengeLoopLastWaitTargetAt = 0;
@@ -947,14 +1077,32 @@ async function maybeAbortScavengeRoundByTimeout() {
   if (!state.scavengeLoopTimeoutBaseAt) {
     // 单轮超时从“进入订票域名后”开始计算，避免把 product 页跳转耗时算进来。
     state.scavengeLoopTimeoutBaseAt = now;
+  }
+
+  if (isQueuePage()) {
+    if (!state.scavengeLoopTimeoutPausedAt) {
+      state.scavengeLoopTimeoutPausedAt = now;
+      log("捡漏单轮计时已暂停（排队中）");
+    }
     return false;
   }
+
+  if (state.scavengeLoopTimeoutPausedAt) {
+    const pausedMs = Math.max(0, now - state.scavengeLoopTimeoutPausedAt);
+    state.scavengeLoopTimeoutBaseAt += pausedMs;
+    state.scavengeLoopTimeoutPausedAt = 0;
+    if (pausedMs > 0) {
+      log(`捡漏单轮计时已恢复（排队暂停 ${Math.round(pausedMs / 1000)}s）`);
+    }
+  }
+
   const elapsed = now - state.scavengeLoopTimeoutBaseAt;
   if (elapsed < maxMs) return false;
 
   const intervalMs = getScavengeLoopIntervalMs();
   state.scavengeLoopLastRestartAt = now;
   state.scavengeLoopTimeoutBaseAt = 0;
+  state.scavengeLoopTimeoutPausedAt = 0;
   state.scavengeLoopNextRestartAt = now + intervalMs;
   state.scavengeLoopLastWaitLogAt = 0;
   state.scavengeLoopLastWaitTargetAt = 0;
@@ -3732,6 +3880,21 @@ function findReserveEntryButtonStrict() {
   const nodes = Array.from(
     document.querySelectorAll("button, a, [role='button'], div, span")
   ).filter(visible);
+  const isLikelyInteractive = (el) => {
+    if (!isDomElement(el)) return false;
+    const tag = String(el.tagName || "").toLowerCase();
+    if (tag === "button" || tag === "a" || tag === "input") return true;
+    if (el.getAttribute("role") === "button") return true;
+    if (el.hasAttribute("onclick")) return true;
+    if (String(el.getAttribute("href") || "").trim()) return true;
+    const cls = normalizeText(el.className?.toString() || "");
+    if (cls.includes("button") || cls.includes("btn") || cls.includes("primary")) return true;
+    try {
+      const style = (el.ownerDocument?.defaultView || window).getComputedStyle(el);
+      if (style.cursor === "pointer") return true;
+    } catch (_) {}
+    return false;
+  };
   const candidates = nodes
     .map((el) => {
       const text = normalizeText(el.textContent || "");
@@ -3751,6 +3914,8 @@ function findReserveEntryButtonStrict() {
       if (r.left > window.innerWidth * 0.5) score += 3;
       if (r.top > window.innerHeight * 0.45) score += 3;
       if (r.width > 140 && r.height > 34) score += 3;
+      if (isLikelyInteractive(el)) score += 5;
+      else score -= 6;
       if (
         text.startsWith("预约") ||
         text.startsWith("預約") ||
@@ -3766,6 +3931,7 @@ function findReserveEntryButtonStrict() {
       ) {
         score += 4;
       }
+      if (text === "預約" || text === "预约" || text === "预定" || text === "預定") score -= 1;
       if (cls.includes("primary") || cls.includes("button")) score += 2;
       return { el, score };
     })
@@ -3775,21 +3941,43 @@ function findReserveEntryButtonStrict() {
 }
 
 function clickReserveEntryAggressive() {
+  const now = Date.now();
+  const startMode = normalizeReserveClickStartMode(
+    state.config.reserveClickStartMode,
+    "edge_once"
+  );
+  const minGap = normalizeReserveClickIntervalMs(state.config.reserveClickIntervalMs, 65);
+  const burstCount = normalizeReserveClickBurstCount(
+    state.config.reserveClickBurstCount,
+    1
+  );
   const target = findReserveEntryButtonStrict();
-  if (!target) return false;
-  for (let i = 0; i < 2; i += 1) {
-    forceClick(target);
-    clickAtCenter(target);
+  if (!target) {
+    state.reserveEntryLastPresent = false;
+    return false;
+  }
+  if (startMode === "edge_once") {
+    if (state.reserveEntryClickedOnce) {
+      state.reserveEntryLastPresent = true;
+      return false;
+    }
+    // 卡点模式：仅在目标按钮“刚出现”的边沿触发一次。
+    if (state.reserveEntryLastPresent) return false;
+  } else {
+    state.reserveEntryClickedOnce = false;
+    if (now - state.reserveEntryLastClickAt < minGap) {
+      state.reserveEntryLastPresent = true;
+      return false;
+    }
+  }
+
+  for (let i = 0; i < burstCount; i += 1) {
     clickElement(target);
-    try {
-      target.focus();
-      target.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true })
-      );
-      target.dispatchEvent(
-        new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true })
-      );
-    } catch (_) {}
+  }
+  state.reserveEntryLastClickAt = now;
+  state.reserveEntryLastPresent = true;
+  if (startMode === "edge_once") {
+    state.reserveEntryClickedOnce = true;
   }
   return true;
 }
@@ -3842,7 +4030,10 @@ function clickBuyNowAggressive() {
     } catch (_) {}
   }
   state.productBuyClickedAt = now;
-  if (!state.firstBuyNowClickAt) state.firstBuyNowClickAt = now;
+  if (!state.firstBuyNowClickAt) {
+    state.firstBuyNowClickAt = now;
+    state.buyNowNoResponseLastNotifyAt = 0;
+  }
   return true;
 }
 
@@ -3854,6 +4045,7 @@ async function runProductStep() {
     state.productLastCountdownLogAt = 0;
     state.buyNowCachedEl = null;
     state.firstBuyNowClickAt = 0;
+    state.buyNowNoResponseLastNotifyAt = 0;
   }
 
   const countdownMs = getSaleCountdownMs();
@@ -5009,7 +5201,17 @@ async function runBookingStageByType(stage, options = {}) {
 }
 
 async function runNewInterparkTick() {
+  const reserveFlowKey = `${location.host}${location.pathname}${location.search}`;
+  if (state.reserveEntryFlowKey !== reserveFlowKey) {
+    state.reserveEntryFlowKey = reserveFlowKey;
+    state.reserveEntryLastPresent = false;
+    state.reserveEntryClickedOnce = false;
+    state.reserveEntryLastClickAt = 0;
+  }
+
   if (isInterparkGateWithoutBizCode()) {
+    state.reserveEntryLastPresent = false;
+    state.reserveEntryClickedOnce = false;
     if (clickBuyNowAggressive()) {
       log("Interpark gates: 已点击立即购买，进入带 bizCode 的一般预订页");
       await sleep(140);
@@ -6887,7 +7089,7 @@ async function runLegacySeatStep() {
       }
       return;
     }
-  if (
+    if (
       areas.length > 1 &&
       Date.now() >=
         (Number(state.legacySeatAreaNextSwitchAt || 0) ||
@@ -6902,6 +7104,19 @@ async function runLegacySeatStep() {
       }
       const nextArea = areas[state.legacySeatAreaIndex];
       await switchLegacySeatArea(nextArea);
+      return;
+    }
+    if (
+      areas.length === 1 &&
+      Date.now() >=
+        (Number(state.legacySeatAreaNextSwitchAt || 0) ||
+          state.legacySeatLastAreaSwitchAt + getLegacyAreaSwitchIntervalMs())
+    ) {
+      await switchLegacySeatArea(areas[0]);
+      if (Date.now() - state.legacySeatLastLogAt > 1200) {
+        log(`旧版单区域刷新: 当前区域=${currentAreaDebug}，已重新触发区域切换`);
+        state.legacySeatLastLogAt = Date.now();
+      }
       return;
     }
     if (Date.now() - state.legacySeatLastLogAt > 2400) {
@@ -6947,8 +7162,44 @@ async function runLegacyInterparkTick() {
   state.lastStage = "legacy";
   await maybeNotifyLegacySeatCompletedOnTransition();
   if (!state.priceLockedSlow) setTickMode("fast");
+
+  if (isQueuePage()) {
+    state.lastStage = "queue";
+    if (!state.priceLockedSlow) setTickMode("fast");
+    if (!state.queueActive) {
+      state.queueActive = true;
+      state.queueKeepAliveCount = 0;
+      state.queueLastRemaining = null;
+      scheduleNextQueueKeepAlive(true);
+      if (state.firstBuyNowClickAt) {
+        const cost = Date.now() - state.firstBuyNowClickAt;
+        log(`检测到排队页，进入等待(点击到入队 ${cost}ms)`);
+      } else {
+        log("检测到排队页，进入等待");
+      }
+      state.queueHealth.lastProbeAt = 0;
+      state.queueHealth.consecutiveFail = 0;
+      state.queueHealth.lastSuccessAt = Date.now();
+      state.queueHealth.alertActive = false;
+      state.queueHealth.lastAlertAt = 0;
+    }
+    if (state.queueNextKeepAliveAt && Date.now() >= state.queueNextKeepAliveAt) {
+      runQueueKeepAliveAction();
+      scheduleNextQueueKeepAlive(false);
+    }
+    await runQueueHealthGuard();
+    await maybeNotifyQueueThresholds();
+    if (Date.now() - state.queueLastLogAt > 5000) {
+      log("排队中，等待放行...");
+      state.queueLastLogAt = Date.now();
+    }
+    return;
+  }
+
   if (state.queueActive) {
     clearQueueRuntimeState();
+    if (!state.priceLockedSlow) setTickMode("fast");
+    log("排队已放行，继续旧版流程");
   }
 
   if (isLegacySeatLayerVisible() || isLegacySeatIframeReady()) {
@@ -7006,6 +7257,7 @@ async function tick() {
     if (await maybeRunScavengeLoopRestart()) {
       return;
     }
+    await maybeNotifyBuyNowNoResponse();
     const host = location.host;
     if (host === "world.nol.com") {
       state.lastStage = "product";
@@ -7091,6 +7343,12 @@ async function loadConfig() {
     criticalPreSeconds: normalizeCriticalSeconds(config.criticalPreSeconds, 2.5, 0.5, 10),
     criticalPostSeconds: normalizeCriticalSeconds(config.criticalPostSeconds, 8, 1, 20),
     criticalTickMs: normalizeCriticalTickMs(config.criticalTickMs, TICK_MS_CRITICAL_DEFAULT),
+    reserveClickIntervalMs: normalizeReserveClickIntervalMs(config.reserveClickIntervalMs, 65),
+    reserveClickBurstCount: normalizeReserveClickBurstCount(config.reserveClickBurstCount, 1),
+    reserveClickStartMode: normalizeReserveClickStartMode(
+      config.reserveClickStartMode,
+      "edge_once"
+    ),
     scavengeLoopEnabled: config.scavengeLoopEnabled === true,
     scavengeLoopIntervalSec: normalizeScavengeLoopIntervalSec(config.scavengeLoopIntervalSec, 600),
     scavengeRoundMaxSec: normalizeScavengeRoundMaxSec(config.scavengeRoundMaxSec, 0),
@@ -7147,6 +7405,11 @@ async function loadConfig() {
   state.queueHealth.switching = false;
   state.buyNowCachedEl = null;
   state.firstBuyNowClickAt = 0;
+  state.reserveEntryLastClickAt = 0;
+  state.reserveEntryFlowKey = "";
+  state.reserveEntryLastPresent = false;
+  state.reserveEntryClickedOnce = false;
+  state.buyNowNoResponseLastNotifyAt = 0;
   state.lastStage = "unknown";
   state.lastBookingPageVariant = "unknown";
   state.humanVerifyAttempted = false;
@@ -7162,6 +7425,7 @@ async function loadConfig() {
   state.notifyLegacySeatCompletedSent = false;
   state.scavengeLoopSuccess = false;
   state.scavengeLoopTimeoutBaseAt = 0;
+  state.scavengeLoopTimeoutPausedAt = 0;
   state.scavengeLoopLastWaitLogAt = 0;
   state.scavengeLoopLastWaitTargetAt = 0;
   const now = Date.now();

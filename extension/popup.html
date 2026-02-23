@@ -68,6 +68,24 @@
             <span>临界轮询毫秒</span>
             <input id="criticalTickMs" type="number" min="40" max="180" step="1" value="65" />
           </label>
+
+          <label class="field">
+            <span>预定点击间隔(ms)</span>
+            <input id="reserveClickIntervalMs" type="number" min="40" max="1000" step="1" value="65" />
+          </label>
+
+          <label class="field">
+            <span>预定触发策略</span>
+            <select id="reserveClickStartMode">
+              <option value="edge_once">卡点出现时只点一次</option>
+              <option value="always">到点后持续点击</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>每轮预定点击次数</span>
+            <input id="reserveClickBurstCount" type="number" min="1" max="5" step="1" value="1" />
+          </label>
         </div>
 
         <div id="scavengeModeFields" class="subpanel hidden">

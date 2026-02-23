@@ -294,6 +294,22 @@ function getFormConfig() {
   const criticalPre = normalizeNumber($("criticalPreSeconds").value || 2.5, 0.5, 10, 2.5, false);
   const criticalPost = normalizeNumber($("criticalPostSeconds").value || 8, 1, 20, 8, false);
   const criticalTick = normalizeNumber($("criticalTickMs").value || 65, 40, 180, 65, true);
+  const reserveClickInterval = normalizeNumber(
+    $("reserveClickIntervalMs").value || 65,
+    40,
+    1000,
+    65,
+    true
+  );
+  const reserveClickBurstCount = normalizeNumber(
+    $("reserveClickBurstCount").value || 1,
+    1,
+    5,
+    1,
+    true
+  );
+  const reserveClickStartMode =
+    $("reserveClickStartMode").value === "always" ? "always" : "edge_once";
   const newCodes = getNewAreaCodes();
   return {
     eventUrl: $("eventUrl").value.trim(),
@@ -302,6 +318,9 @@ function getFormConfig() {
     criticalPreSeconds: criticalPre,
     criticalPostSeconds: criticalPost,
     criticalTickMs: criticalTick,
+    reserveClickIntervalMs: reserveClickInterval,
+    reserveClickBurstCount,
+    reserveClickStartMode,
     scavengeLoopEnabled: runMode === "scavenge",
     scavengeLoopIntervalSec:
       normalizeScavengeLoopIntervalMin($("scavengeLoopIntervalMin").value || 10) * 60,
@@ -386,6 +405,16 @@ async function loadState() {
   $("criticalTickMs").value = String(
     normalizeNumber(config.criticalTickMs ?? 65, 40, 180, 65, true)
   );
+  $("reserveClickIntervalMs").value = String(
+    normalizeNumber(config.reserveClickIntervalMs ?? 65, 40, 1000, 65, true)
+  );
+  $("reserveClickBurstCount").value = String(
+    normalizeNumber(config.reserveClickBurstCount ?? 1, 1, 5, 1, true)
+  );
+  $("reserveClickStartMode").value =
+    String(config.reserveClickStartMode || "").trim() === "always"
+      ? "always"
+      : "edge_once";
   setRunMode(config.scavengeLoopEnabled === true ? "scavenge" : "timed");
   $("scavengeLoopIntervalMin").value = String(
     normalizeScavengeLoopIntervalMin(

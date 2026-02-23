@@ -2,8 +2,11 @@ const STORAGE_KEY = "nolBotConfig";
 const pendingKickTabs = new Set();
 const PRE_ENTER_ALARM = "nolBotPreEnterAlarm";
 const DING_NOTIFY_SENT_KEY = "nolBotDingNotifySent";
+const CALL_NOTIFY_SENT_KEY = "nolBotCallNotifySent";
 const DING_DEDUP_TTL_MS = 5 * 60 * 1000;
+const CALL_DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_OCR_API_URL = "https://api.nexuschat.top/ocr-api/ocr/file";
+const DEFAULT_CALL_API_URL = "http://127.0.0.1:8002";
 const OCR_DEVICE_ID_SYNC_KEY = "nolBotOcrDeviceId";
 const OCR_DEVICE_ID_RE = /^[A-Za-z0-9._:-]{8,128}$/;
 
@@ -54,6 +57,18 @@ async function saveConfig(config) {
       criticalPreSeconds: normalizeCriticalSeconds(config?.criticalPreSeconds, 2.5, 0.5, 10),
       criticalPostSeconds: normalizeCriticalSeconds(config?.criticalPostSeconds, 8, 1, 20),
       criticalTickMs: normalizeCriticalTickMs(config?.criticalTickMs, 65),
+      reserveClickIntervalMs: normalizeReserveClickIntervalMs(
+        config?.reserveClickIntervalMs,
+        65
+      ),
+      reserveClickBurstCount: normalizeReserveClickBurstCount(
+        config?.reserveClickBurstCount,
+        1
+      ),
+      reserveClickStartMode: normalizeReserveClickStartMode(
+        config?.reserveClickStartMode,
+        "edge_once"
+      ),
       scavengeLoopEnabled: config?.scavengeLoopEnabled === true,
       scavengeLoopIntervalSec: normalizeScavengeLoopIntervalSec(
         config?.scavengeLoopIntervalSec,
@@ -91,6 +106,7 @@ async function saveConfig(config) {
       vpnApiUrl: String(config?.vpnApiUrl || "http://127.0.0.1:8000").trim(),
       vpnAutoSwitchEnabled: config?.vpnAutoSwitchEnabled !== false,
       queueVpnNotifyEnabled: config?.queueVpnNotifyEnabled !== false,
+      callApiUrl: String(current?.callApiUrl || DEFAULT_CALL_API_URL).trim(),
       dingTalkWebhookUrl: String(config?.dingTalkWebhookUrl || "").trim(),
       dingTalkSecret: String(config?.dingTalkSecret || "").trim(),
       enabled: true,
@@ -125,6 +141,18 @@ async function saveConfigOnly(config) {
       criticalTickMs: normalizeCriticalTickMs(
         config?.criticalTickMs,
         current.criticalTickMs || 65
+      ),
+      reserveClickIntervalMs: normalizeReserveClickIntervalMs(
+        config?.reserveClickIntervalMs,
+        current.reserveClickIntervalMs || 65
+      ),
+      reserveClickBurstCount: normalizeReserveClickBurstCount(
+        config?.reserveClickBurstCount,
+        current.reserveClickBurstCount || 1
+      ),
+      reserveClickStartMode: normalizeReserveClickStartMode(
+        config?.reserveClickStartMode,
+        current.reserveClickStartMode || "edge_once"
       ),
       scavengeLoopEnabled:
         typeof config?.scavengeLoopEnabled === "boolean"
@@ -196,6 +224,7 @@ async function saveConfigOnly(config) {
         typeof config?.queueVpnNotifyEnabled === "boolean"
           ? config.queueVpnNotifyEnabled
           : current.queueVpnNotifyEnabled !== false,
+      callApiUrl: String(current?.callApiUrl || DEFAULT_CALL_API_URL).trim(),
       dingTalkWebhookUrl: String(
         config?.dingTalkWebhookUrl || current.dingTalkWebhookUrl || ""
       ).trim(),
@@ -312,6 +341,23 @@ function normalizeCriticalTickMs(raw, fallback = 65) {
   const n = Number(raw);
   if (!Number.isFinite(n)) return Math.min(180, Math.max(40, Number(fallback) || 65));
   return Math.min(180, Math.max(40, Math.round(n)));
+}
+
+function normalizeReserveClickIntervalMs(raw, fallback = 65) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return Math.min(1000, Math.max(40, Number(fallback) || 65));
+  return Math.min(1000, Math.max(40, Math.round(n)));
+}
+
+function normalizeReserveClickBurstCount(raw, fallback = 1) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return Math.min(5, Math.max(1, Number(fallback) || 1));
+  return Math.min(5, Math.max(1, Math.round(n)));
+}
+
+function normalizeReserveClickStartMode(raw, fallback = "edge_once") {
+  const mode = String(raw || fallback || "edge_once").trim().toLowerCase();
+  return mode === "always" ? "always" : "edge_once";
 }
 
 function getSaleStartTimestamp(config) {
@@ -634,6 +680,35 @@ async function markDingEventSent(eventKey) {
   const map = all[DING_NOTIFY_SENT_KEY] || {};
   map[key] = Date.now();
   await chrome.storage.local.set({ [DING_NOTIFY_SENT_KEY]: map });
+}
+
+async function hasSentCallEvent(eventKey, ttlMs = CALL_DEDUP_TTL_MS) {
+  const key = String(eventKey || "").trim();
+  if (!key) return false;
+  const now = Date.now();
+  const all = await chrome.storage.local.get(CALL_NOTIFY_SENT_KEY);
+  const map = all[CALL_NOTIFY_SENT_KEY] || {};
+  const cleaned = {};
+  for (const [k, ts] of Object.entries(map)) {
+    const n = Number(ts);
+    if (Number.isFinite(n) && now - n < ttlMs) cleaned[k] = n;
+  }
+  if (cleaned[key]) {
+    if (Object.keys(cleaned).length !== Object.keys(map).length) {
+      await chrome.storage.local.set({ [CALL_NOTIFY_SENT_KEY]: cleaned });
+    }
+    return true;
+  }
+  return false;
+}
+
+async function markCallEventSent(eventKey) {
+  const key = String(eventKey || "").trim();
+  if (!key) return;
+  const all = await chrome.storage.local.get(CALL_NOTIFY_SENT_KEY);
+  const map = all[CALL_NOTIFY_SENT_KEY] || {};
+  map[key] = Date.now();
+  await chrome.storage.local.set({ [CALL_NOTIFY_SENT_KEY]: map });
 }
 
 async function sendDingTalkText(webhookUrl, secret, title, text) {
@@ -1283,6 +1358,9 @@ chrome.runtime.onInstalled.addListener(async () => {
         criticalPreSeconds: 2.5,
         criticalPostSeconds: 8,
         criticalTickMs: 65,
+        reserveClickIntervalMs: 65,
+        reserveClickBurstCount: 1,
+        reserveClickStartMode: "edge_once",
         scavengeLoopEnabled: false,
         scavengeLoopIntervalSec: 600,
         scavengeRoundMaxSec: 0,
@@ -1299,6 +1377,7 @@ chrome.runtime.onInstalled.addListener(async () => {
         vpnApiUrl: "http://127.0.0.1:8000",
         vpnAutoSwitchEnabled: true,
         queueVpnNotifyEnabled: true,
+        callApiUrl: DEFAULT_CALL_API_URL,
         dingTalkWebhookUrl: "",
         dingTalkSecret: ""
       }
@@ -1309,15 +1388,18 @@ chrome.runtime.onInstalled.addListener(async () => {
   const current = all[STORAGE_KEY] || {};
   const normalizedOcrApiUrl = normalizeOcrApiUrl(current?.ocrApiUrl, DEFAULT_OCR_API_URL);
   const normalizedOcrDeviceId = await getOrCreateOcrDeviceId(current?.ocrDeviceId);
+  const normalizedCallApiUrl = String(current?.callApiUrl || DEFAULT_CALL_API_URL).trim();
   if (
     String(current?.ocrApiUrl || "").trim() !== normalizedOcrApiUrl ||
-    String(current?.ocrDeviceId || "").trim() !== normalizedOcrDeviceId
+    String(current?.ocrDeviceId || "").trim() !== normalizedOcrDeviceId ||
+    String(current?.callApiUrl || "").trim() !== normalizedCallApiUrl
   ) {
     await chrome.storage.local.set({
       [STORAGE_KEY]: {
         ...current,
         ocrApiUrl: normalizedOcrApiUrl,
-        ocrDeviceId: normalizedOcrDeviceId
+        ocrDeviceId: normalizedOcrDeviceId,
+        callApiUrl: normalizedCallApiUrl
       }
     });
   }
@@ -1652,6 +1734,53 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           }
         });
         sendResponse({ ok: false, error: String(err?.message || err) });
+      }
+      return;
+    }
+
+    if (message?.type === "ALIYUN_CALL_NOTIFY") {
+      try {
+        const cfg = await getConfig();
+        const eventKey = String(message?.eventKey || "").trim();
+        if (eventKey && (await hasSentCallEvent(eventKey))) {
+          sendResponse({ ok: true, sent: false, dedup: true });
+          return;
+        }
+        const apiUrl = String(cfg?.callApiUrl || DEFAULT_CALL_API_URL).trim();
+        const data = await requestVpnApi(apiUrl, "/notify/aliyun-call", {
+          event_key: eventKey,
+          title: String(message?.title || "NOL BOT 价格页提醒"),
+          text: String(message?.text || ""),
+          called_number: String(message?.calledNumber || cfg?.phoneNumber || "").trim(),
+          source_url: String(message?.sourceUrl || "")
+        });
+        if (data?.ok) {
+          if (eventKey) await markCallEventSent(eventKey);
+          await chrome.storage.local.set({
+            nolBotLastLog: {
+              text: `阿里云电话通知已发送: ${String(message?.title || "通知")}`,
+              ts: Date.now()
+            }
+          });
+          sendResponse({ ok: true, sent: true, data });
+          return;
+        }
+        sendResponse({
+          ok: true,
+          sent: false,
+          skipped: "backend_not_ready",
+          error: String(data?.message || "call_failed"),
+          data
+        });
+      } catch (err) {
+        const msg = String(err?.message || err);
+        await chrome.storage.local.set({
+          nolBotLastLog: {
+            text: `本地电话服务不可用，已跳过: ${msg}`,
+            ts: Date.now()
+          }
+        });
+        sendResponse({ ok: true, sent: false, skipped: "service_unavailable", error: msg });
       }
       return;
     }

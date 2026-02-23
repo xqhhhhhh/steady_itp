@@ -1,0 +1,38 @@
+# Only edit this file. Do not edit Python code.
+
+server:
+  bind_host: "127.0.0.1"
+  port: 8002
+  local_only: true
+
+aliyun_call:
+  # Set true after you fill all required fields below.
+  enabled: false
+
+  # Aliyun AccessKey
+  access_key_id: ""
+  access_key_secret: ""
+
+  # Outbound caller number purchased in Aliyun Dyvms
+  called_show_number: ""
+
+  # Default callee number. Extension can also pass phoneNumber at runtime.
+  called_number: ""
+
+  # TTS template code (required)
+  tts_code: ""
+
+  # Optional region, normally keep default
+  region_id: "cn-hangzhou"
+
+  # 1~3
+  play_times: 2
+
+  out_id_prefix: "nolbot"
+
+  # TTS params. You can use placeholders:
+  # {title} {text} {time} {event_key} {source_url}
+  tts_param:
+    title: "{title}"
+    text: "{text}"
+    time: "{time}"
