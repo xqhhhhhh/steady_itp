@@ -1335,6 +1335,64 @@ async function runLegacySelectSeatInMainWorld(tabId, frameId, payload = {}) {
   }
 }
 
+async function setNativeDialogAutoConfirmInMainWorld(tabId, frameId, enabled = false) {
+  if (!tabId) return { ok: false, error: "no_tab_id" };
+  try {
+    const target = Number.isInteger(frameId) ? { tabId, frameIds: [frameId] } : { tabId };
+    const results = await chrome.scripting.executeScript({
+      target,
+      world: "MAIN",
+      func: (flag) => {
+        const out = {
+          ok: true,
+          enabled: Boolean(flag),
+          patched: false,
+          frameHref: String(location.href || ""),
+          error: ""
+        };
+        try {
+          const w = window;
+          if (!w.__nolNativeDialogAutoPatch) {
+            const origAlert = typeof w.alert === "function" ? w.alert.bind(w) : null;
+            const origConfirm = typeof w.confirm === "function" ? w.confirm.bind(w) : null;
+            const origPrompt = typeof w.prompt === "function" ? w.prompt.bind(w) : null;
+
+            const isAuto = () => Boolean(w.__nolNativeDialogAutoConfirmEnabled);
+
+            w.alert = function (...args) {
+              if (isAuto()) return;
+              if (typeof origAlert === "function") return origAlert(...args);
+            };
+            w.confirm = function (...args) {
+              if (isAuto()) return true;
+              if (typeof origConfirm === "function") return origConfirm(...args);
+              return true;
+            };
+            w.prompt = function (message, defaultValue) {
+              if (isAuto()) return String(defaultValue ?? "");
+              if (typeof origPrompt === "function") return origPrompt(message, defaultValue);
+              return String(defaultValue ?? "");
+            };
+
+            w.__nolNativeDialogAutoPatch = true;
+            out.patched = true;
+          }
+          w.__nolNativeDialogAutoConfirmEnabled = Boolean(flag);
+          out.enabled = Boolean(w.__nolNativeDialogAutoConfirmEnabled);
+        } catch (err) {
+          out.ok = false;
+          out.error = String(err?.message || err);
+        }
+        return out;
+      },
+      args: [Boolean(enabled)]
+    });
+    return results?.[0]?.result || { ok: false, error: "no_result" };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+}
+
 chrome.runtime.onInstalled.addListener(async () => {
   const all = await chrome.storage.local.get(STORAGE_KEY);
   if (!all[STORAGE_KEY]) {
@@ -1626,6 +1684,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         tabId,
         Number.isInteger(frameId) ? frameId : undefined,
         message?.payload && typeof message.payload === "object" ? message.payload : {}
+      );
+      sendResponse({ ok: Boolean(result?.ok), result });
+      return;
+    }
+
+    if (message?.type === "SET_NATIVE_DIALOG_AUTOCONFIRM_MAIN") {
+      const tabId = _sender?.tab?.id;
+      const frameId = _sender?.frameId;
+      const result = await setNativeDialogAutoConfirmInMainWorld(
+        tabId,
+        Number.isInteger(frameId) ? frameId : undefined,
+        message?.enabled === true
       );
       sendResponse({ ok: Boolean(result?.ok), result });
       return;

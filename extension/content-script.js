@@ -109,6 +109,8 @@ const state = {
   humanVerifyAttempted: false,
   humanVerifyAlertActive: false,
   humanVerifyLastNotifyAt: 0,
+  nativeDialogAutoConfirmEnabled: false,
+  nativeDialogAutoConfirmLastSyncAt: 0,
   sliderCaptchaPaused: false,
   sliderCaptchaLastLogAt: 0,
   sliderCaptchaLastNotifyAt: 0,
@@ -129,6 +131,9 @@ const state = {
     100: false,
     10: false
   },
+  newSeatFlowKey: "",
+  newSeatBlockedMap: {},
+  newSeatLastAttemptKey: "",
   legacySeatFlowKey: "",
   legacySeatAreaIndex: 0,
   legacySeatCurrentAreaCode: "",
@@ -138,6 +143,8 @@ const state = {
   legacySeatLastNextAt: 0,
   legacySeatSelectedAssumed: 0,
   legacySeatClickedKeys: [],
+  legacySeatBlockedMap: {},
+  legacySeatLastAttemptKey: "",
   legacySeatAttemptedKeys: {},
   legacySeatNoSeatCycles: 0,
   legacySeatLastLogAt: 0,
@@ -168,7 +175,24 @@ const state = {
 };
 
 const STEP_TEXT = {
-  buyNow: ["立即购买", "立即購買", "buy now", "book now", "예매하기"],
+  buyNow: [
+    "立即购买",
+    "立即購買",
+    "buy now",
+    "book now",
+    "先行订购",
+    "先行訂購",
+    "先行预购",
+    "先行預購",
+    "预售",
+    "預售",
+    "presale",
+    "pre-sale",
+    "advance booking",
+    "선예매",
+    "팬클럽 선예매",
+    "예매하기"
+  ],
   reserveEntry: [
     "预约",
     "預約",
@@ -203,6 +227,7 @@ const QUEUE_KEEP_ALIVE_MAX_MS = 4.8 * 60 * 1000;
 const LEGACY_AREA_SETTLE_MS = 1200;
 const LEGACY_AREA_SWITCH_INTERVAL_MS = 1200;
 const LEGACY_AREA_RANDOM_JITTER_MS = 0;
+const SEAT_BLOCK_TTL_MS = 30 * 1000;
 const IS_TOP_FRAME = window.top === window;
 const BOT_OWNER_KEY = "__nolBotTopOwner";
 const BOT_INSTANCE_ID = `nol_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -583,6 +608,37 @@ function getSaleCountdownMs() {
   return ts - Date.now();
 }
 
+function shouldEnableNativeDialogAutoConfirm() {
+  if (!state.config.enabled) return false;
+  const host = String(location.host || "").toLowerCase();
+  return (
+    host === "tickets.interpark.com" ||
+    host === "gpoticket.globalinterpark.com" ||
+    isLegacyBookingUrl()
+  );
+}
+
+async function syncNativeDialogAutoConfirm(force = false) {
+  const enabled = shouldEnableNativeDialogAutoConfirm();
+  const now = Date.now();
+  if (
+    !force &&
+    state.nativeDialogAutoConfirmEnabled === enabled &&
+    now - Number(state.nativeDialogAutoConfirmLastSyncAt || 0) < 10000
+  ) {
+    return;
+  }
+
+  state.nativeDialogAutoConfirmEnabled = enabled;
+  state.nativeDialogAutoConfirmLastSyncAt = now;
+  try {
+    await chrome.runtime.sendMessage({
+      type: "SET_NATIVE_DIALOG_AUTOCONFIRM_MAIN",
+      enabled
+    });
+  } catch (_) {}
+}
+
 async function sendDingTalkNotify(eventKey, title, text) {
   if (window.top !== window) return false;
   try {
@@ -877,7 +933,7 @@ async function maybeNotifyBuyNowNoResponse() {
   const sent = await sendDingTalkNotify(
     `buy_now_no_response_${state.config.startedAt || state.config.saleStartTime || location.pathname}`,
     "疑似 Cloudflare 验证阻塞",
-    `点击“立即购买”已超过 1 分钟仍无页面放行，疑似出现 Cloudflare Verify you are human，请手动验证后继续。\n页面: ${location.href}`
+    `点击“购买入口（立即购买/先行订购）”已超过 1 分钟仍无页面放行，疑似出现 Cloudflare Verify you are human，请手动验证后继续。\n页面: ${location.href}`
   );
   state.buyNowNoResponseLastNotifyAt = sent ? now : now - 30 * 1000;
 }
@@ -1728,9 +1784,9 @@ function findButtonByClassAndText(words) {
 
 function clickByKeywords(words) {
   const byClass = findButtonByClassAndText(words);
-  if (byClass) return clickElement(byClass);
+  if (byClass) return forceClick(byClass) || clickAtCenter(byClass) || clickElement(byClass);
   const generic = findClickableByText(words);
-  if (generic) return clickElement(generic);
+  if (generic) return forceClick(generic) || clickAtCenter(generic) || clickElement(generic);
   return false;
 }
 
@@ -1762,7 +1818,97 @@ function clickBottomRightPrimaryButton(words) {
 
   const target = candidates[0]?.btn;
   if (!target) return false;
-  return clickElement(target);
+  return forceClick(target) || clickAtCenter(target) || clickElement(target);
+}
+
+function clickConfirmInScope(scopeEl, words = ["確認", "确认", "确定", "ok", "confirm", "확인"]) {
+  const cancelWords = ["取消", "취소", "cancel", "close", "關閉", "关闭", "닫기"];
+  const scope = scopeEl && isDomElement(scopeEl) ? scopeEl : document;
+  const scopeRect = isDomElement(scopeEl)
+    ? scopeEl.getBoundingClientRect()
+    : {
+        left: 0,
+        top: 0,
+        width: window.innerWidth || 1280,
+        height: window.innerHeight || 720
+      };
+  const normalizedWords = words.map((w) => normalizeText(w));
+  const normalizedCancel = cancelWords.map((w) => normalizeText(w));
+  const nodes = Array.from(scope.querySelectorAll("button, [role='button'], a, div, span")).filter(
+    visible
+  );
+  const candidates = nodes
+    .map((el) => {
+      const txt = normalizeText(el.textContent || "");
+      if (!txt || !normalizedWords.some((w) => txt.includes(w))) return null;
+      if (normalizedCancel.some((w) => txt.includes(w))) return null;
+      const cls = normalizeText(el.className?.toString() || "");
+      if (el.disabled || cls.includes("disabled") || el.getAttribute("aria-disabled") === "true") {
+        return null;
+      }
+      const r = el.getBoundingClientRect();
+      let score = 0;
+      if (r.left > scopeRect.left + scopeRect.width * 0.5) score += 4;
+      if (r.top > scopeRect.top + scopeRect.height * 0.58) score += 4;
+      if (cls.includes("primary") || cls.includes("confirm") || cls.includes("joint-rectangle-button")) {
+        score += 3;
+      }
+      if (r.width > 60 && r.height > 24) score += 1;
+      return { el, score };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+
+  const target = candidates[0]?.el || null;
+  if (!target) return false;
+  return forceClick(target) || clickAtCenter(target) || clickElement(target);
+}
+
+function isSeatContextForPopupAutoConfirm() {
+  const host = String(location.host || "").toLowerCase();
+  const path = String(location.pathname || "").toLowerCase();
+  if (isLegacySeatLayerVisible() || isLegacySeatIframeReady()) return true;
+  if (host === "tickets.interpark.com" && path.includes("/onestop/seat")) return true;
+  if (host === "gpoticket.globalinterpark.com" && path.includes("/global/play/book/bookmain.asp")) {
+    return Boolean(document.querySelector("#ifrmSeat, #divBookSeat, #ifrmBookStep"));
+  }
+  const stage = detectCurrentStage();
+  return stage === "seat";
+}
+
+function closeAnySeatConfirmPopupIfPresent() {
+  if (!isSeatContextForPopupAutoConfirm()) return false;
+  const okWords = ["確認", "确认", "确定", "ok", "confirm", "확인"];
+  const dialogSelectors = [
+    "[role='dialog']",
+    ".alertNotice",
+    ".capchaLayer",
+    "div[class*='alert']",
+    "div[class*='modal']",
+    "div[class*='popup']",
+    "div[class*='layer']"
+  ];
+  const dialogs = Array.from(document.querySelectorAll(dialogSelectors.join(",")))
+    .filter(visible)
+    .map((el) => {
+      let z = 0;
+      try {
+        z = Number.parseInt((el.ownerDocument?.defaultView || window).getComputedStyle(el).zIndex, 10);
+      } catch (_) {}
+      if (!Number.isFinite(z)) z = 0;
+      const r = el.getBoundingClientRect();
+      return { el, z, area: r.width * r.height };
+    })
+    .sort((a, b) => b.z - a.z || b.area - a.area);
+
+  if (!dialogs.length) return false;
+  for (const item of dialogs) {
+    if (clickConfirmInScope(item.el, okWords)) {
+      log("选座界面检测到通用确认弹窗，已自动点击确定");
+      return true;
+    }
+  }
+  return false;
 }
 
 function findAllByText(words) {
@@ -2261,6 +2407,57 @@ function clickSeatCandidate(el) {
   return clickElement(el);
 }
 
+function getNewSeatKey(el) {
+  if (!isDomElement(el)) return "";
+  const rect = el.getBoundingClientRect();
+  const blockId = String(findSeatBlockId(el) || "").trim();
+  const clusterId = String(findSeatBlockAndCluster(el)?.clusterId || "").trim();
+  const attrs = [
+    el.id,
+    el.getAttribute("data-seat"),
+    el.getAttribute("data-seat-id"),
+    el.getAttribute("name"),
+    el.getAttribute("title"),
+    el.getAttribute("aria-label"),
+    el.getAttribute("cx"),
+    el.getAttribute("cy"),
+    blockId,
+    clusterId
+  ]
+    .map((x) => String(x || "").trim())
+    .filter(Boolean);
+  const token = attrs.join("|").slice(0, 240) || String(el.tagName || "seat").toLowerCase();
+  const x = Math.round(rect.left + rect.width / 2);
+  const y = Math.round(rect.top + rect.height / 2);
+  return `${token}@${x}:${y}`;
+}
+
+function pruneSeatBlockedMap(rawMap, now = Date.now()) {
+  const src = rawMap && typeof rawMap === "object" ? rawMap : {};
+  const out = {};
+  for (const [k, v] of Object.entries(src)) {
+    const ts = Number(v || 0);
+    if (Number.isFinite(ts) && ts > now) out[k] = ts;
+  }
+  return out;
+}
+
+function hasNewSeatBlockedKey(key) {
+  const k = String(key || "").trim();
+  if (!k) return false;
+  const now = Date.now();
+  state.newSeatBlockedMap = pruneSeatBlockedMap(state.newSeatBlockedMap, now);
+  return Number(state.newSeatBlockedMap[k] || 0) > now;
+}
+
+function rememberNewSeatBlockedKey(key) {
+  const k = String(key || "").trim();
+  if (!k || hasNewSeatBlockedKey(k)) return;
+  const now = Date.now();
+  state.newSeatBlockedMap = pruneSeatBlockedMap(state.newSeatBlockedMap, now);
+  state.newSeatBlockedMap[k] = now + SEAT_BLOCK_TTL_MS;
+}
+
 async function chooseSeatsByClick(quantity) {
   const target = Math.max(1, Number(quantity || 1));
   if (detectSelectedSeatCount() >= target) return true;
@@ -2274,21 +2471,29 @@ async function chooseSeatsByClick(quantity) {
     const remaining = target - current;
     const budget = Math.max(remaining * 12, 14);
     let attempts = 0;
-    const candidates = getSeatCandidates().filter((el) => !tried.has(el));
+    const candidates = getSeatCandidates()
+      .map((el) => ({ el, key: getNewSeatKey(el) }))
+      .filter((item) => !tried.has(item.el))
+      .filter((item) => !hasNewSeatBlockedKey(item.key));
     if (!candidates.length) {
       const totalSeatSvg = document.querySelectorAll("[class*='SeatMap_seatSvg__'], [class*='seatSvg']").length;
       const disabledSeatSvg = document.querySelectorAll("[class*='SeatMap_seatSvg__'][class*='disabled'], [class*='seatSvg'][class*='disabled']").length;
       const customCodes = normalizeNewAreaCustomCodes(state.config.newAreaCustomCodes || []);
       const customText = customCodes.length ? `, custom=${customCodes.join("/")}` : "";
-      log(`未发现可选座位候选 (seatSvg=${totalSeatSvg}, disabled=${disabledSeatSvg}${customText})`);
+      state.newSeatBlockedMap = pruneSeatBlockedMap(state.newSeatBlockedMap, Date.now());
+      const blockedCount = Object.keys(state.newSeatBlockedMap).length;
+      log(
+        `未发现可选座位候选 (seatSvg=${totalSeatSvg}, disabled=${disabledSeatSvg}, blocked=${blockedCount}${customText})`
+      );
       break;
     }
     if (!hintedBlock) {
-      const first = candidates[0];
+      const first = candidates[0]?.el || null;
       const topBlock = findSeatBlockId(first);
       const topCluster = findSeatBlockAndCluster(first)?.clusterId || "";
       const blockMetric = buildSeatBlockMetrics(
-        candidates.map((el) => {
+        candidates.map((item) => {
+          const el = item.el;
           const rect = el.getBoundingClientRect();
           const { blockId, clusterId } = findSeatBlockAndCluster(el);
           return { el, rect, blockId, clusterId };
@@ -2303,20 +2508,30 @@ async function chooseSeatsByClick(quantity) {
       hintedBlock = true;
     }
 
-    for (const seat of candidates) {
+    for (const item of candidates) {
+      const seat = item.el;
+      const seatKey = String(item.key || "").trim();
       if (attempts >= budget) break;
       const before = detectSelectedSeatCount();
       if (before >= target) break;
 
       tried.add(seat);
       attempts += 1;
+      state.newSeatLastAttemptKey = seatKey;
       if (!clickSeatCandidate(seat)) continue;
+      // 被他人锁座弹窗通常在点击后很快出现，先给一次处理窗口。
+      await sleep(120);
+      if (closeSeatUnlockNoticeIfPresent("new")) {
+        await sleep(120);
+        continue;
+      }
       // 选座计数在部分场馆页面会有渲染延迟，等待更久避免超点
-      await sleep(220);
+      await sleep(100);
 
       const after = detectSelectedSeatCount();
       if (after > before) {
         log(`选座进度: ${after}/${target}`);
+        state.newSeatLastAttemptKey = "";
         await sleep(50);
       }
     }
@@ -2389,29 +2604,118 @@ async function trimSelectedSeatsToTarget(target) {
   return changed;
 }
 
-function closeSeatUnlockNoticeIfPresent() {
-  const text = getWholeText();
-  const hit =
-    text.includes("其他客户已选定的座位将被解除锁定") ||
-    text.includes("其他客戶已選定的座位將被解除鎖定") ||
-    text.includes("已经选择的座位") ||
-    text.includes("已經選擇的座位") ||
-    text.includes("selected by another customer") ||
-    text.includes("will be unlocked");
-  if (!hit) return false;
+function closeSeatUnlockNoticeIfPresent(context = "new") {
+  const isSeatLockedText = (rawText) => {
+    const text = normalizeText(rawText || "");
+    if (!text) return false;
+    return (
+      text.includes("其他客户已选定的座位将被解除锁定") ||
+      text.includes("其他客戶已選定的座位將被解除鎖定") ||
+      text.includes("已经选择的座位") ||
+      text.includes("已經選擇的座位") ||
+      text.includes("selected by another customer") ||
+      text.includes("already selected seat") ||
+      text.includes("will be unlocked")
+    );
+  };
 
-  const okWords = ["確認", "确认", "ok", "confirm"];
-  if (clickBottomRightPrimaryButton(okWords) || clickByKeywords(okWords)) {
-    log("已处理座位锁定提示弹窗(確認)");
+  const isNeedSelectSeatText = (rawText) => {
+    const text = normalizeText(rawText || "");
+    if (!text) return false;
+    return (
+      text.includes("请选择您喜欢的座位") ||
+      text.includes("請選擇您喜歡的座位") ||
+      text.includes("请选择您喜歡的座位") ||
+      text.includes("請選擇您喜欢的座位") ||
+      text.includes("please select your seat") ||
+      text.includes("please choose your seat") ||
+      text.includes("좌석을 선택") ||
+      text.includes("선택한 좌석이 없습니다")
+    );
+  };
+
+  const findSeatDialog = (matcher) => {
+    const dialogSelectors = [
+      "[role='dialog']",
+      ".alertNotice",
+      ".capchaLayer",
+      "div[class*='alert']",
+      "div[class*='modal']",
+      "div[class*='popup']",
+      "div[class*='layer']"
+    ];
+    const nodes = Array.from(document.querySelectorAll(dialogSelectors.join(","))).filter(visible);
+    const hitNode = nodes.find((el) => matcher(el.innerText || el.textContent || ""));
+    if (!hitNode) return null;
+    return (
+      hitNode.closest?.(
+        "[role='dialog'], .capchaLayer, div[class*='alert'], div[class*='modal'], div[class*='popup'], div[class*='layer']"
+      ) || hitNode
+    );
+  };
+
+  const whole = getWholeText();
+  const lockDialog = findSeatDialog(isSeatLockedText);
+  const needSeatDialog = lockDialog ? null : findSeatDialog(isNeedSelectSeatText);
+  const lockHit = Boolean(lockDialog) || isSeatLockedText(whole);
+  const needSeatHit = !lockHit && (Boolean(needSeatDialog) || isNeedSelectSeatText(whole));
+  if (!lockHit && !needSeatHit) return false;
+  const dialog = lockDialog || needSeatDialog || null;
+
+  const okWords = ["確認", "确认", "确定", "ok", "confirm", "확인"];
+
+  const clicked =
+    clickConfirmInScope(dialog, okWords) ||
+    clickBottomRightPrimaryButton(okWords) ||
+    clickByKeywords(okWords);
+  if (clicked) {
+    if (lockHit) {
+      if (context === "legacy") {
+        const k = String(state.legacySeatLastAttemptKey || "").trim();
+        if (k) {
+          rememberLegacySeatBlockedKey(k);
+          log("旧版已标记被占座位，后续将跳过该座位");
+        }
+      } else {
+        const k = String(state.newSeatLastAttemptKey || "").trim();
+        if (k) {
+          rememberNewSeatBlockedKey(k);
+          log("新版已标记被占座位，后续将跳过该座位");
+        }
+      }
+      log("已处理座位锁定提示弹窗(確認)");
+    } else {
+      if (context === "legacy") {
+        state.legacySeatSelectedAssumed = 0;
+        state.legacySeatSinglePickPendingUntil = 0;
+        state.legacySeatSubmitTriggeredAt = 0;
+      }
+      state.selectedSeatCountCache = { ts: Date.now(), count: 0 };
+      log("已处理“请选择座位”提示弹窗，继续回到选座流程");
+    }
     return true;
+  }
+  if (lockHit) {
+    log("检测到座位锁定提示弹窗，但未命中确认按钮，下一轮继续重试");
+  } else {
+    log("检测到“请选择座位”提示弹窗，但未命中确认按钮，下一轮继续重试");
   }
   return false;
 }
 
 async function runSeatStep() {
+  const flowKey = `${location.host}${location.pathname}${location.search}`;
+  if (state.newSeatFlowKey !== flowKey) {
+    state.newSeatFlowKey = flowKey;
+    state.newSeatLastAttemptKey = "";
+  }
+  if (closeAnySeatConfirmPopupIfPresent()) {
+    await sleep(120);
+    return;
+  }
   log("开始执行选座步骤");
   const target = normalizeQuantity(state.config.quantity, 1);
-  if (closeSeatUnlockNoticeIfPresent()) {
+  if (closeSeatUnlockNoticeIfPresent("new")) {
     await sleep(140);
     return;
   }
@@ -3845,6 +4149,14 @@ function findBuyNowButtonStrict() {
       if (r.width > 180 && r.height > 40) score += 3;
       if (cls.includes("joint-rectangle-button") || cls.includes("entbutton")) score += 3;
       if (text.startsWith("立即购买") || text.startsWith("立即購買")) score += 2;
+      if (
+        text.startsWith("先行订购") ||
+        text.startsWith("先行訂購") ||
+        text.includes("선예매") ||
+        text.includes("presale")
+      ) {
+        score += 2;
+      }
       return { el, score };
     })
     .filter(Boolean)
@@ -3868,7 +4180,7 @@ function getCachedOrFindBuyNowButton() {
 }
 
 function findReserveEntryButtonStrict() {
-  const strictWords = ["预定", "預定"].map((w) => normalizeText(w));
+  const strictWords = ["预定", "預定", "membership"].map((w) => normalizeText(w));
   const buyWords = STEP_TEXT.buyNow.map((w) => normalizeText(w));
   const nodes = Array.from(
     document.querySelectorAll("button, a, [role='button'], div, span")
@@ -3891,7 +4203,7 @@ function findReserveEntryButtonStrict() {
   const candidates = nodes
     .map((el) => {
       const text = normalizeText(el.textContent || "");
-      // 严格匹配“预定/預定”整词，不允许出现其他字（如“一般预定”）。
+      // 严格匹配“预定/預定/Membership”整词，不允许出现其他字（如“一般预定”）。
       if (!text || !strictWords.includes(text)) return null;
       // 排除“立即购买”类按钮，避免韩文 예매/예매하기 重叠误判
       if (buyWords.some((w) => text.includes(w))) return null;
@@ -3910,7 +4222,7 @@ function findReserveEntryButtonStrict() {
       if (r.top > window.innerHeight * 0.45) score += 3;
       if (r.width > 140 && r.height > 34) score += 3;
       score += 5;
-      if (text === "预定" || text === "預定") score += 4;
+      if (text === "预定" || text === "預定" || text === "membership") score += 4;
       if (cls.includes("primary") || cls.includes("button")) score += 2;
       return { el, score };
     })
@@ -4035,7 +4347,7 @@ async function runProductStep() {
       setTickMode("fast");
     }
     if (clickBuyNowAggressive()) {
-      log("商品页已点击立即购买，优先进入 Interpark gates 待命");
+      log("商品页已点击购买入口（立即购买/先行订购），优先进入 Interpark gates 待命");
       await sleep(state.tickMode === "critical" ? 35 : 140);
       return;
     }
@@ -4056,7 +4368,7 @@ async function runProductStep() {
   }
 
   if (clickBuyNowAggressive()) {
-    log("已点击 立即购买");
+    log("已点击购买入口（立即购买/先行订购）");
     await sleep(state.tickMode === "critical" ? 35 : 140);
     return;
   }
@@ -5192,12 +5504,12 @@ async function runNewInterparkTick() {
     state.reserveEntryLastPresent = false;
     state.reserveEntryClickedOnce = false;
     if (clickBuyNowAggressive()) {
-      log("Interpark gates: 已点击立即购买，进入带 bizCode 的一般预订页");
+      log("Interpark gates: 已点击购买入口（立即购买/先行订购），进入带 bizCode 的预订页");
       await sleep(140);
       return;
     }
     if (Date.now() - state.productLastCountdownLogAt > 4000) {
-      log("Interpark gates: 等待进入带 bizCode 的一般预订页（未命中立即购买按钮）");
+      log("Interpark gates: 等待进入带 bizCode 的预订页（未命中购买入口按钮）");
       state.productLastCountdownLogAt = Date.now();
     }
     return;
@@ -5221,7 +5533,7 @@ async function runNewInterparkTick() {
       return;
     }
     if (clickReserveEntryAggressive()) {
-      log("Interpark gates: 已点击一般预订");
+      log("Interpark gates: 已点击预定入口（预定/Membership）");
       await sleep(state.tickMode === "critical" ? 40 : 160);
       return;
     }
@@ -6318,6 +6630,7 @@ function resetLegacySeatRuntime() {
   state.legacySeatLastNextAt = 0;
   state.legacySeatSelectedAssumed = 0;
   state.legacySeatClickedKeys = [];
+  state.legacySeatLastAttemptKey = "";
   state.legacySeatAttemptedKeys = {};
   state.legacySeatNoSeatCycles = 0;
   state.legacySeatLastLogAt = 0;
@@ -6662,6 +6975,14 @@ function hasLegacySeatClickedKey(key) {
   return state.legacySeatClickedKeys.includes(String(key || ""));
 }
 
+function hasLegacySeatBlockedKey(key) {
+  const k = String(key || "").trim();
+  if (!k) return false;
+  const now = Date.now();
+  state.legacySeatBlockedMap = pruneSeatBlockedMap(state.legacySeatBlockedMap, now);
+  return Number(state.legacySeatBlockedMap[k] || 0) > now;
+}
+
 function rememberLegacySeatClickedKey(key) {
   const k = String(key || "").trim();
   if (!k || hasLegacySeatClickedKey(k)) return;
@@ -6669,6 +6990,14 @@ function rememberLegacySeatClickedKey(key) {
   if (state.legacySeatClickedKeys.length > 800) {
     state.legacySeatClickedKeys = state.legacySeatClickedKeys.slice(-500);
   }
+}
+
+function rememberLegacySeatBlockedKey(key) {
+  const k = String(key || "").trim();
+  if (!k || hasLegacySeatBlockedKey(k)) return;
+  const now = Date.now();
+  state.legacySeatBlockedMap = pruneSeatBlockedMap(state.legacySeatBlockedMap, now);
+  state.legacySeatBlockedMap[k] = now + SEAT_BLOCK_TTL_MS;
 }
 
 function rememberLegacySeatAttemptKey(key) {
@@ -6800,6 +7129,7 @@ function getLegacyAvailableSeatCandidates(preferredDoc = null) {
       if (!isLegacySeatSpanAvailable(el)) continue;
       const key = getLegacySeatKey(el);
       if (!key) continue;
+      if (hasLegacySeatBlockedKey(key)) continue;
       const rect = el.getBoundingClientRect();
       out.push({
         el,
@@ -6927,7 +7257,10 @@ async function clickLegacySeatCandidate(candidate, target) {
   const seat = candidate?.el;
   if (!seat) return false;
   const key = candidate.key || getLegacySeatKey(seat);
-  if (key) rememberLegacySeatAttemptKey(key);
+  if (key) {
+    rememberLegacySeatAttemptKey(key);
+    state.legacySeatLastAttemptKey = key;
+  }
 
   const before = getLegacySelectedSeatCount();
   const main = await triggerLegacySeatSelectMainWorld(candidate);
@@ -6962,6 +7295,14 @@ async function runLegacySeatStep() {
   if (state.legacySeatFlowKey !== flowKey) {
     resetLegacySeatRuntime();
     state.legacySeatFlowKey = flowKey;
+  }
+  if (closeAnySeatConfirmPopupIfPresent()) {
+    await sleep(120);
+    return;
+  }
+  if (closeSeatUnlockNoticeIfPresent("legacy")) {
+    await sleep(140);
+    return;
   }
 
   const seatDoc = getLegacySeatFrameDocument();
@@ -7219,6 +7560,7 @@ async function tick() {
   if (!state.config.enabled || state.busy) return;
   state.busy = true;
   try {
+    await syncNativeDialogAutoConfirm(false);
     await maybeNotifySale3Minutes();
     if (await maybeAbortScavengeRoundByTimeout()) {
       return;
@@ -7306,6 +7648,11 @@ function stopLoop(reason = "") {
   if (ownerBeforeStop || !window[BOT_OWNER_KEY]) {
     setBadge("NOL BOT 已停止", false);
   }
+  state.nativeDialogAutoConfirmEnabled = false;
+  state.nativeDialogAutoConfirmLastSyncAt = Date.now();
+  chrome.runtime
+    .sendMessage({ type: "SET_NATIVE_DIALOG_AUTOCONFIRM_MAIN", enabled: false })
+    .catch(() => {});
 }
 
 async function loadConfig() {
@@ -7430,6 +7777,9 @@ async function loadConfig() {
   state.notifyQueueThresholdSent = { 1000: false, 100: false, 10: false };
   state.queueTop50FastestSwitchDone = false;
   state.queueLastRemaining = null;
+  state.newSeatFlowKey = "";
+  state.newSeatBlockedMap = {};
+  state.newSeatLastAttemptKey = "";
   state.legacySeatFlowKey = "";
   state.legacySeatAreaIndex = 0;
   state.legacySeatCurrentAreaCode = "";
@@ -7439,6 +7789,8 @@ async function loadConfig() {
   state.legacySeatLastNextAt = 0;
   state.legacySeatSelectedAssumed = 0;
   state.legacySeatClickedKeys = [];
+  state.legacySeatBlockedMap = {};
+  state.legacySeatLastAttemptKey = "";
   state.legacySeatAttemptedKeys = {};
   state.legacySeatNoSeatCycles = 0;
   state.legacySeatLastLogAt = 0;
@@ -7459,6 +7811,7 @@ async function loadConfig() {
   state.captcha.candidates = [];
   state.captcha.candidateIndex = 0;
   state.captcha.legacyFirstInputDelayDone = false;
+  await syncNativeDialogAutoConfirm(true);
   if (state.config.enabled) {
     if (state.intervalId) {
       clearInterval(state.intervalId);

@@ -1,0 +1,16 @@
+# Only edit this file. Do not edit Python code.
+
+server:
+  bind_host: "127.0.0.1"
+  port: 8002
+  local_only: true
+
+alarm:
+  # Set false to disable local alarm.
+  enabled: true
+
+  # Alarm repeat interval (seconds)
+  repeat_interval_sec: 1.5
+
+  # Max alarm duration (seconds), 0 means no auto stop.
+  max_duration_sec: 0
