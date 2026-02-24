@@ -4285,13 +4285,14 @@ function isScavengeRoundWarmupWindow(windowMs = 20000) {
 function clickBuyNowAggressive() {
   const inScavengeWarmup = isScavengeRoundWarmupWindow(20000);
   const now = Date.now();
-  const minGap = inScavengeWarmup
+  const minGapBase = inScavengeWarmup
     ? state.tickMode === "critical"
       ? 60
       : 90
     : state.tickMode === "critical"
       ? 110
       : 320;
+  const minGap = minGapBase * 4;
   if (now - state.productBuyClickedAt < minGap) return false;
   const target = getCachedOrFindBuyNowButton();
   if (!target) {
@@ -7111,7 +7112,7 @@ function getLegacySelectedSeatCount() {
 
   const seatNodes = docs.flatMap((doc) => Array.from(doc.querySelectorAll("span#Seats, span[name='Seats']")));
   const domSelected = seatNodes.filter((el) => isLegacySeatSpanSelected(el)).length;
-  return Math.max(textCount, domSelected, Number(state.legacySeatSelectedAssumed) || 0);
+  return Math.max(textCount, domSelected);
 }
 
 function getLegacyAvailableSeatCandidates(preferredDoc = null) {
@@ -7315,16 +7316,45 @@ async function runLegacySeatStep() {
   }
 
   const target = normalizeQuantity(state.config.quantity, 1);
-  const selected = Math.max(getLegacySelectedSeatCount(), Number(state.legacySeatSelectedAssumed) || 0);
+  const now = Date.now();
+  let selectedDom = getLegacySelectedSeatCount();
+  const selectedAssumed = Math.max(0, Number(state.legacySeatSelectedAssumed) || 0);
+  const staleAnchor = Math.max(
+    0,
+    Number(state.legacySeatLastSeatClickAt) || 0,
+    Number(state.legacySeatSubmitTriggeredAt) || 0
+  );
+  const staleElapsed = staleAnchor ? now - staleAnchor : Number.POSITIVE_INFINITY;
+  if (selectedAssumed > selectedDom && staleElapsed > 2200) {
+    state.legacySeatSelectedAssumed = selectedDom;
+    if (selectedDom < target) {
+      state.legacySeatSinglePickPendingUntil = 0;
+      state.legacySeatSubmitTriggeredAt = 0;
+    }
+    if (selectedDom === 0 && now - state.legacySeatLastLogAt > 1200) {
+      log("旧版选座: 检测到已选座位已失效，恢复继续找座");
+      state.legacySeatLastLogAt = now;
+    }
+  }
+  let selected = Math.max(selectedDom, Number(state.legacySeatSelectedAssumed) || 0);
   if (selected >= target) {
     state.legacySeatSinglePickPendingUntil = 0;
     if (Date.now() - state.legacySeatLastNextAt < 900) return;
-    if (await clickLegacySeatCompleteButton()) {
+    const submitOk = await clickLegacySeatCompleteButton();
+    if (submitOk) {
       state.legacySeatLastNextAt = Date.now();
       markLegacySeatSubmitTriggered(selected, target);
       log(`旧版座位已满足目标(${selected}/${target})，尝试提交座位确认`);
+      return;
     }
-    return;
+    selectedDom = getLegacySelectedSeatCount();
+    if (selectedDom >= target) return;
+    state.legacySeatSelectedAssumed = selectedDom;
+    selected = selectedDom;
+    if (Date.now() - state.legacySeatLastLogAt > 1200) {
+      log("旧版选座: completed 未生效且已选座位不足，回退到找座流程");
+      state.legacySeatLastLogAt = Date.now();
+    }
   }
 
   const customLegacyCodes =
@@ -7381,14 +7411,11 @@ async function runLegacySeatStep() {
   const cooled = candidates.filter((x) => !hasLegacySeatRecentAttempt(x.key, 6000));
   const untried = cooled.filter((x) => !hasLegacySeatClickedKey(x.key));
   const clickPool = untried.length ? untried : cooled;
-  const now = Date.now();
 
   if (target === 1 && state.legacySeatSinglePickPendingUntil > now) {
     if (now - state.legacySeatLastNextAt > 900) {
       if (await clickLegacySeatCompleteButton()) {
         state.legacySeatLastNextAt = Date.now();
-        // Keep single-seat lock during transition latency to prevent any second seat click.
-        state.legacySeatSinglePickPendingUntil = Date.now() + 5000;
         markLegacySeatSubmitTriggered(1, target);
         log("旧版单票模式: 已触发 Seat selection completed，等待页面切换");
       }
