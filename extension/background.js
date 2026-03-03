@@ -274,6 +274,23 @@ async function openOrUpdateTab(url) {
   return updated?.id;
 }
 
+async function broadcastStopInpageAlarm() {
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({});
+  } catch (_) {
+    tabs = [];
+  }
+  const jobs = tabs
+    .filter((tab) => tab?.id && isSupportedTicketUrl(tab?.url || ""))
+    .map((tab) =>
+      chrome.tabs.sendMessage(tab.id, { type: "STOP_INPAGE_ALARM" }).catch(() => null)
+    );
+  if (jobs.length) {
+    await Promise.all(jobs);
+  }
+}
+
 function normalizePreEnterSeconds(raw, fallback = 30) {
   const n = Number(raw);
   if (!Number.isFinite(n)) return Math.min(300, Math.max(5, Number(fallback) || 30));
@@ -1512,6 +1529,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   (async () => {
     if (message?.type === "START_BOT") {
       const config = message.config || {};
+      await broadcastStopInpageAlarm().catch(() => {});
       await saveConfig(config);
       const saved = await getConfig();
       const scheduleResult = await schedulePreEnterAlarmIfNeeded(saved);
@@ -1548,6 +1566,27 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === "STOP_BOT") {
       await disableConfig();
       await clearPreEnterAlarm();
+      await broadcastStopInpageAlarm().catch(() => {});
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (message?.type === "START_INPAGE_ALARM_FROM_FRAME") {
+      const tabId = _sender?.tab?.id;
+      if (!tabId) {
+        sendResponse({ ok: false, error: "NO_TAB" });
+        return;
+      }
+      await chrome.tabs
+        .sendMessage(
+          tabId,
+          {
+            type: "START_INPAGE_ALARM",
+            reason: String(message?.reason || "iframe转发")
+          },
+          { frameId: 0 }
+        )
+        .catch(() => null);
       sendResponse({ ok: true });
       return;
     }

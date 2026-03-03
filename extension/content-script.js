@@ -71,6 +71,7 @@ const state = {
   priceLastPreorderClickAt: 0,
   dateLastDayClickAt: 0,
   dateLastSlotClickAt: 0,
+  dateTimeDebugLastLogAt: 0,
   dateLastNextAt: 0,
   legacyNextPendingUntil: 0,
   legacyNextWaitLogAt: 0,
@@ -119,6 +120,10 @@ const state = {
   notifySale3mSent: false,
   notifyPriceEnteredSent: false,
   notifyLegacySeatCompletedSent: false,
+  inpageTicketAlarmActive: false,
+  inpageTicketAlarmTimerId: 0,
+  inpageTicketAlarmAudioCtx: null,
+  inpageTicketAlarmLastWarnAt: 0,
   scavengeLoopSuccess: false,
   scavengeLoopNextRestartAt: 0,
   scavengeLoopLastRestartAt: 0,
@@ -222,6 +227,7 @@ const STEP_TEXT = {
 const TICK_MS_FAST = 180;
 const TICK_MS_NORMAL = 480;
 const TICK_MS_CRITICAL_DEFAULT = 65;
+const INPAGE_TICKET_ALARM_INTERVAL_MS = 1200;
 const QUEUE_KEEP_ALIVE_MIN_MS = 2.2 * 60 * 1000;
 const QUEUE_KEEP_ALIVE_MAX_MS = 4.8 * 60 * 1000;
 const LEGACY_AREA_SETTLE_MS = 1200;
@@ -275,6 +281,42 @@ function buildNewAreaOrderMap() {
 
 function isDomElement(el) {
   return Boolean(el && el.nodeType === 1 && typeof el.getBoundingClientRect === "function");
+}
+
+function escapeRegExp(text) {
+  return String(text || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function hasTokenBoundary(text, token) {
+  const src = normalizeText(text);
+  const tk = normalizeText(token);
+  if (!src || !tk) return false;
+  const re = new RegExp(`(^|[^a-z0-9])${escapeRegExp(tk)}([^a-z0-9]|$)`, "i");
+  return re.test(src);
+}
+
+function hasAnyTokenBoundary(text, tokens = []) {
+  return tokens.some((token) => hasTokenBoundary(text, token));
+}
+
+function isElementLikelySelected(el, extraBag = "") {
+  if (!isDomElement(el)) return false;
+  if (
+    el.getAttribute("aria-selected") === "true" ||
+    el.getAttribute("aria-pressed") === "true" ||
+    el.getAttribute("aria-checked") === "true"
+  ) {
+    return true;
+  }
+  const classText = String(el.className?.toString?.() || "");
+  if (hasAnyTokenBoundary(classText, ["selected", "active", "checked", "choice", "picked", "on"])) {
+    return true;
+  }
+  // extraBag 可能拼接了 id/style/script，仅保留强语义状态词，避免 "option/button" 误伤。
+  if (hasAnyTokenBoundary(extraBag, ["selected", "active", "checked", "choice", "picked"])) {
+    return true;
+  }
+  return false;
 }
 
 function visible(el) {
@@ -390,8 +432,7 @@ function isCheckboxLikeChecked(el) {
   }
   const aria = String(el.getAttribute?.("aria-checked") || "").toLowerCase();
   if (aria === "true") return true;
-  const cls = normalizeText(el.className?.toString?.() || "");
-  if (cls.includes("checked") || cls.includes("selected")) return true;
+  if (isElementLikelySelected(el)) return true;
   return false;
 }
 
@@ -695,6 +736,120 @@ async function sendLocalAlarmNotify(eventKey, title, text) {
   return false;
 }
 
+function stopInpageTicketAlarm(reason = "") {
+  if (state.inpageTicketAlarmTimerId) {
+    clearTimeout(state.inpageTicketAlarmTimerId);
+    state.inpageTicketAlarmTimerId = 0;
+  }
+  state.inpageTicketAlarmActive = false;
+
+  const ctx = state.inpageTicketAlarmAudioCtx;
+  state.inpageTicketAlarmAudioCtx = null;
+  if (ctx && typeof ctx.close === "function") {
+    ctx.close().catch(() => {});
+  }
+
+  if (reason) {
+    log(`插件内到票响铃已停止 (${reason})`);
+  }
+}
+
+function getInpageTicketAlarmAudioContext() {
+  const Ctor = window.AudioContext || window.webkitAudioContext;
+  if (!Ctor) return null;
+  const cached = state.inpageTicketAlarmAudioCtx;
+  if (cached && cached.state !== "closed") return cached;
+  try {
+    const ctx = new Ctor();
+    state.inpageTicketAlarmAudioCtx = ctx;
+    return ctx;
+  } catch (_) {
+    return null;
+  }
+}
+
+function playInpageTicketAlarmSpeechFallback() {
+  const synth = window.speechSynthesis;
+  const Utterance = window.SpeechSynthesisUtterance;
+  if (!synth || typeof synth.speak !== "function" || !Utterance) return false;
+  try {
+    synth.cancel();
+    const utter = new Utterance("抢票成功");
+    utter.rate = 1.1;
+    utter.pitch = 1.0;
+    utter.volume = 1.0;
+    synth.speak(utter);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function playInpageTicketAlarmOnce() {
+  const ctx = getInpageTicketAlarmAudioContext();
+  if (!ctx) return false;
+
+  if (ctx.state === "suspended") {
+    try {
+      await ctx.resume();
+    } catch (_) {}
+  }
+  if (ctx.state !== "running") return false;
+
+  const base = ctx.currentTime + 0.01;
+  const notes = [1460, 1080, 1460];
+  for (let i = 0; i < notes.length; i += 1) {
+    const t = base + i * 0.2;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "square";
+    osc.frequency.setValueAtTime(notes[i], t);
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(0.35, t + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.16);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(t);
+    osc.stop(t + 0.17);
+  }
+  return true;
+}
+
+function scheduleInpageTicketAlarmTick(delayMs = INPAGE_TICKET_ALARM_INTERVAL_MS) {
+  if (!state.inpageTicketAlarmActive) return;
+  if (state.inpageTicketAlarmTimerId) {
+    clearTimeout(state.inpageTicketAlarmTimerId);
+  }
+  state.inpageTicketAlarmTimerId = window.setTimeout(async () => {
+    if (!state.inpageTicketAlarmActive) return;
+    const played = await playInpageTicketAlarmOnce();
+    const spoken = !played ? playInpageTicketAlarmSpeechFallback() : false;
+    if (!played && !spoken && Date.now() - Number(state.inpageTicketAlarmLastWarnAt || 0) > 4000) {
+      log("到票提醒音频未能播放，请点击页面任意位置后继续");
+      state.inpageTicketAlarmLastWarnAt = Date.now();
+    }
+    scheduleInpageTicketAlarmTick(INPAGE_TICKET_ALARM_INTERVAL_MS);
+  }, Math.max(0, Number(delayMs) || 0));
+}
+
+function startInpageTicketAlarm(reason = "") {
+  const shouldForwardTop = !IS_TOP_FRAME;
+  if (shouldForwardTop) {
+    try {
+      chrome.runtime.sendMessage({
+        type: "START_INPAGE_ALARM_FROM_FRAME",
+        reason: String(reason || "")
+      });
+    } catch (_) {}
+  }
+  if (state.inpageTicketAlarmActive) return true;
+  state.inpageTicketAlarmActive = true;
+  state.inpageTicketAlarmLastWarnAt = 0;
+  scheduleInpageTicketAlarmTick(0);
+  log(`已触发插件内持续响铃提醒${reason ? ` (${reason})` : ""}`);
+  return true;
+}
+
 function parseQueueRemaining() {
   const raw = (document.body?.innerText || "").replace(/\u00a0/g, " ");
   const patterns = [
@@ -943,6 +1098,7 @@ async function maybeNotifyEnteredPrice() {
   state.notifyPriceEnteredSent = true;
   const selected = detectSelectedSeatCount();
   const detailText = `已进入价格页(step=price)，当前检测已选座位数: ${selected}。`;
+  startInpageTicketAlarm("已进入价格页");
   await sendDingTalkNotify(
     `entered_price_${state.config.saleStartTime || location.pathname}${location.search}`,
     "已进入价格页",
@@ -989,6 +1145,7 @@ async function maybeNotifyLegacySeatCompletedOnTransition() {
   const target = Math.max(1, Number(state.legacySeatSubmitTargetAtTrigger) || 1);
   const eventKey = `legacy_seat_done_${state.config.saleStartTime || "unknown"}_${location.pathname}_${location.search}`;
   const detailText = `已选座并点击 completed，已进入下一界面。数量: ${selected}/${target}，step=${stepNo || "unknown"}，时间: ${new Date().toLocaleString()}`;
+  startInpageTicketAlarm("已提交座位");
   const sent = await sendDingTalkNotify(
     eventKey,
     "抢票成功：已提交座位",
@@ -3175,6 +3332,49 @@ function tryAdjustCalendarMonth() {
 }
 
 function getDateDayCandidates() {
+  const entCalendarButtons = Array.from(
+    document.querySelectorAll(
+      "li[class*='EntCalendar_dateItem'] > button[class*='EntCalendar_dateButton']"
+    )
+  ).filter((el) => isDomElement(el) && visible(el));
+
+  if (entCalendarButtons.length) {
+    const entCandidates = entCalendarButtons
+      .map((btn) => {
+        const text = String(
+          btn.querySelector("[class*='EntCalendar_number']")?.textContent || btn.textContent || ""
+        ).trim();
+        if (!/^\d{1,2}$/.test(text)) return null;
+        const day = Number(text);
+        if (!Number.isFinite(day) || day < 1 || day > 31) return null;
+
+        const disabled =
+          btn.disabled ||
+          btn.hasAttribute("disabled") ||
+          btn.getAttribute("aria-disabled") === "true";
+        if (disabled) return null;
+
+        const selected = btn.getAttribute("aria-pressed") === "true";
+        const r = btn.getBoundingClientRect();
+        if (r.left > window.innerWidth * 0.68) return null;
+        if (r.top < 90 || r.top > window.innerHeight * 0.9) return null;
+        if (r.width < 18 || r.width > 120 || r.height < 18 || r.height > 120) return null;
+
+        let score = 20;
+        if (selected) score += 6;
+        return { el: btn, day, selected, score, r };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.day - b.day || b.score - a.score || a.r.top - b.r.top || a.r.left - b.r.left);
+
+    const byDay = new Map();
+    for (const item of entCandidates) {
+      const prev = byDay.get(item.day);
+      if (!prev || item.score > prev.score) byDay.set(item.day, item);
+    }
+    return Array.from(byDay.values()).sort((a, b) => a.day - b.day);
+  }
+
   const nodes = Array.from(
     document.querySelectorAll("button, [role='button'], td, div, span, li")
   ).filter(visible);
@@ -3185,34 +3385,59 @@ function getDateDayCandidates() {
       if (!/^\d{1,2}$/.test(text)) return null;
       const day = Number(text);
       if (!Number.isFinite(day) || day < 1 || day > 31) return null;
-      const cls = normalizeText(el.className?.toString() || "");
+
+      const actionEl = el.closest?.("button, [role='button'], a, td") || el;
+      if (!isDomElement(actionEl) || !visible(actionEl)) return null;
+
+      const classParts = [];
+      let probe = el;
+      for (let i = 0; i < 4 && isDomElement(probe); i += 1) {
+        classParts.push(String(probe.className?.toString() || ""));
+        probe = probe.parentElement;
+      }
+      const bag = normalizeText(
+        [
+          ...classParts,
+          actionEl.getAttribute("aria-label"),
+          actionEl.getAttribute("title"),
+          actionEl.getAttribute("data-testid")
+        ]
+          .filter(Boolean)
+          .join(" ")
+      );
+      const cls = normalizeText(actionEl.className?.toString() || "");
       const disabled =
+        actionEl.disabled ||
         el.disabled ||
         cls.includes("disabled") ||
         cls.includes("disable") ||
         cls.includes("unavailable") ||
         cls.includes("sold") ||
         cls.includes("closed") ||
+        bag.includes("disabled") ||
+        bag.includes("unavailable") ||
+        bag.includes("sold") ||
+        actionEl.getAttribute("aria-disabled") === "true" ||
         el.getAttribute("aria-disabled") === "true";
       if (disabled) return null;
-      const r = el.getBoundingClientRect();
+      const r = actionEl.getBoundingClientRect();
       if (r.left > window.innerWidth * 0.68) return null;
       if (r.top < 90 || r.top > window.innerHeight * 0.9) return null;
       if (r.width < 18 || r.width > 90 || r.height < 18 || r.height > 90) return null;
 
-      const selected =
-        cls.includes("selected") ||
-        cls.includes("active") ||
-        cls.includes("on") ||
-        cls.includes("checked") ||
-        el.getAttribute("aria-selected") === "true" ||
-        el.getAttribute("aria-pressed") === "true";
+      const selected = isElementLikelySelected(actionEl, bag) || isElementLikelySelected(el, bag);
+      const calendarLike =
+        bag.includes("calendar") ||
+        bag.includes("datebutton") ||
+        bag.includes("dateitem") ||
+        Boolean(el.closest?.("[class*='Calendar'], [class*='calendar']"));
 
       let score = 0;
       if (selected) score += 6;
-      if (el.tagName.toLowerCase() === "button" || el.tagName.toLowerCase() === "td") score += 2;
+      if (calendarLike) score += 8;
+      if (actionEl.tagName.toLowerCase() === "button" || actionEl.tagName.toLowerCase() === "td") score += 2;
       if (r.width >= 24 && r.width <= 64 && r.height >= 24 && r.height <= 64) score += 2;
-      return { el, day, selected, score, r };
+      return { el: actionEl, day, selected, score, r };
     })
     .filter(Boolean)
     .sort((a, b) => a.day - b.day || b.score - a.score || a.r.top - b.r.top || a.r.left - b.r.left);
@@ -3228,9 +3453,10 @@ function getDateDayCandidates() {
 
 function clickDateDayCandidate(candidate, reason = "") {
   if (!candidate?.el) return false;
-  forceClick(candidate.el);
-  clickAtCenter(candidate.el);
-  clickElement(candidate.el);
+  const actionEl = candidate.el.closest?.("button, [role='button'], a, td") || candidate.el;
+  forceClick(actionEl);
+  clickAtCenter(actionEl);
+  clickElement(actionEl);
   state.dateLastDayClickAt = Date.now();
   log(reason || `已选择日期: ${candidate.day}`);
   return true;
@@ -3324,26 +3550,44 @@ function getDateTimeOptionCandidates(sortMode = "score") {
       const text = (el.textContent || "").trim();
       if (!text || text.length > 120) return null;
       if (!timePattern.test(text)) return null;
-      const cls = normalizeText(el.className?.toString() || "");
+
+      const actionEl = el.closest?.("button, [role='button'], a, li, td") || el;
+      if (!isDomElement(actionEl) || !visible(actionEl)) return null;
+
+      const classParts = [];
+      let probe = el;
+      for (let i = 0; i < 4 && isDomElement(probe); i += 1) {
+        classParts.push(String(probe.className?.toString() || ""));
+        probe = probe.parentElement;
+      }
+      const bag = normalizeText(
+        [
+          ...classParts,
+          actionEl.getAttribute("aria-label"),
+          actionEl.getAttribute("title"),
+          actionEl.getAttribute("data-testid")
+        ]
+          .filter(Boolean)
+          .join(" ")
+      );
+      const cls = normalizeText(actionEl.className?.toString() || "");
       const disabled =
+        actionEl.disabled ||
         el.disabled ||
         cls.includes("disabled") ||
         cls.includes("disable") ||
         cls.includes("unavailable") ||
+        bag.includes("disabled") ||
+        bag.includes("unavailable") ||
+        actionEl.getAttribute("aria-disabled") === "true" ||
         el.getAttribute("aria-disabled") === "true";
       if (disabled) return null;
-      const r = el.getBoundingClientRect();
+      const r = actionEl.getBoundingClientRect();
       if (r.left < window.innerWidth * 0.35) return null;
       if (r.top < 70 || r.top > window.innerHeight * 0.85) return null;
       if (r.width < 100 || r.height < 30) return null;
 
-      const selected =
-        cls.includes("selected") ||
-        cls.includes("active") ||
-        cls.includes("on") ||
-        cls.includes("checked") ||
-        el.getAttribute("aria-selected") === "true" ||
-        el.getAttribute("aria-pressed") === "true";
+      const selected = isElementLikelySelected(actionEl, bag) || isElementLikelySelected(el, bag);
 
       let score = 0;
       if (selected) score += 8;
@@ -3351,7 +3595,7 @@ function getDateTimeOptionCandidates(sortMode = "score") {
       if (r.width > 160 && r.height > 36) score += 3;
       if (text.toLowerCase().includes("standing")) score += 2;
       const timeMinutes = parseTimeMinutes(text);
-      return { el, text, r, selected, score, timeMinutes };
+      return { el: actionEl, text, r, selected, score, timeMinutes };
     })
     .filter(Boolean);
 
@@ -3377,6 +3621,45 @@ function getDateTimeOptionCandidates(sortMode = "score") {
 function isDateTimeSelectedLikely() {
   const options = getDateTimeOptionCandidates();
   return options.some((x) => x.selected);
+}
+
+function isDateTimeSelectionConfirmed() {
+  if (isDateTimeSelectedLikely()) return true;
+
+  // 某些新版页面不会给场次卡片打 selected/aria 状态，只在可提交时去掉“请选择场次”提示。
+  const hint = hasNeedChooseSessionHint();
+  const options = getDateTimeOptionCandidates("time");
+  if (!options.length) return false;
+  if (!hint) return true;
+
+  // 提示还在时，仅在“刚点击场次”窗口内给一次容错，避免误卡死。
+  const clickedRecently = Date.now() - state.dateLastSlotClickAt < 1800;
+  if (clickedRecently && options.length === 1) return true;
+  return false;
+}
+
+function logDateTimeSelectionDebug(reason = "") {
+  const now = Date.now();
+  if (now - Number(state.dateTimeDebugLastLogAt || 0) < 1200) return;
+  state.dateTimeDebugLastLogAt = now;
+
+  const options = getDateTimeOptionCandidates("time").slice(0, 4);
+  const summary = options
+    .map((item, idx) => {
+      const el = item.el;
+      const cls = String(el?.className?.toString?.() || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 80);
+      const pressed = String(el?.getAttribute?.("aria-pressed") || "");
+      const selected = String(el?.getAttribute?.("aria-selected") || "");
+      return `${idx + 1}) ${String(item.text || "").trim()} [sel=${item.selected ? "Y" : "N"} ap=${pressed || "-"} as=${selected || "-"} cls=${cls || "-"}]`;
+    })
+    .join(" | ");
+
+  log(
+    `场次选中诊断${reason ? `(${reason})` : ""}: hint=${hasNeedChooseSessionHint() ? "Y" : "N"}, options=${options.length}, detail=${summary || "-"}`
+  );
 }
 
 function selectAnyDateTimeOption() {
@@ -3423,25 +3706,48 @@ function selectConfiguredDateTime() {
       const text = (el.textContent || "").trim();
       if (!text || text.length > 80) return null;
       if (!isConfiguredTimeMatch(targetRaw, text)) return null;
-      const cls = normalizeText(el.className?.toString() || "");
+
+      const actionEl = el.closest?.("button, [role='button'], a, li, td") || el;
+      if (!isDomElement(actionEl) || !visible(actionEl)) return null;
+
+      const classParts = [];
+      let probe = el;
+      for (let i = 0; i < 4 && isDomElement(probe); i += 1) {
+        classParts.push(String(probe.className?.toString() || ""));
+        probe = probe.parentElement;
+      }
+      const bag = normalizeText(
+        [
+          ...classParts,
+          actionEl.getAttribute("aria-label"),
+          actionEl.getAttribute("title"),
+          actionEl.getAttribute("data-testid")
+        ]
+          .filter(Boolean)
+          .join(" ")
+      );
+      const cls = normalizeText(actionEl.className?.toString() || "");
       const disabled =
+        actionEl.disabled ||
         el.disabled ||
         cls.includes("disabled") ||
         cls.includes("disable") ||
+        bag.includes("disabled") ||
+        actionEl.getAttribute("aria-disabled") === "true" ||
         el.getAttribute("aria-disabled") === "true";
       if (disabled) return null;
-      const r = el.getBoundingClientRect();
+      const r = actionEl.getBoundingClientRect();
       let score = 0;
       if (r.left > window.innerWidth * 0.42) score += 6;
       if (r.top > 90 && r.top < window.innerHeight * 0.72) score += 3;
       if (r.width > 120 && r.height > 34) score += 4;
-      if (cls.includes("selected") || cls.includes("active")) score += 1;
+      if (isElementLikelySelected(actionEl, bag) || isElementLikelySelected(el, bag)) score += 1;
       const timeMinutes = parseTimeMinutes(text);
       const targetMinutes = parseTimeMinutes(targetRaw);
       if (Number.isFinite(timeMinutes) && Number.isFinite(targetMinutes) && timeMinutes === targetMinutes) {
         score += 5;
       }
-      return { el, score };
+      return { el: actionEl, score };
     })
     .filter(Boolean)
     .sort((a, b) => b.score - a.score);
@@ -3510,7 +3816,8 @@ async function runDateStep() {
       if (Date.now() - state.dateLastSlotClickAt > 900) {
         selectEarliestDateTimeOption();
       }
-      if (hasNeedChooseSessionHint() || !isDateTimeSelectedLikely()) {
+      if (!isDateTimeSelectionConfirmed()) {
+        logDateTimeSelectionDebug("default");
         log("场次尚未确认选中，暂停点击下一步");
         return;
       }
@@ -3534,7 +3841,8 @@ async function runDateStep() {
       }
     }
     // 有些页面选中态会延迟渲染，给它一点时间，不急着点下一步
-    if (hasNeedChooseSessionHint() || !isDateTimeSelectedLikely()) {
+    if (!isDateTimeSelectionConfirmed()) {
+      logDateTimeSelectionDebug("configured");
       log("场次尚未确认选中，暂停点击下一步");
       return;
     }
@@ -5797,15 +6105,7 @@ function getLegacyDayCandidates(frameDoc) {
         continue;
       }
       const r = el.getBoundingClientRect();
-      const selected =
-        classBag.includes("selected") ||
-        classBag.includes("choice") ||
-        classBag.includes("active") ||
-        classBag.includes("picked") ||
-        classBag.includes("on") ||
-        bag.includes("selected") ||
-        bag.includes("choice") ||
-        el.getAttribute("aria-selected") === "true";
+      const selected = isElementLikelySelected(el, bag);
       fnOut.push({ el, day, selected, top: r.top, left: r.left, from: "fn" });
     }
 
@@ -5832,15 +6132,7 @@ function getLegacyDayCandidates(frameDoc) {
       }
       const r = el.getBoundingClientRect();
       if (r.width < 8 || r.height < 8) continue;
-      const selected =
-        classBag.includes("selected") ||
-        classBag.includes("choice") ||
-        classBag.includes("active") ||
-        classBag.includes("picked") ||
-        classBag.includes("on") ||
-        bag.includes("selected") ||
-        bag.includes("choice") ||
-        el.getAttribute("aria-selected") === "true";
+      const selected = isElementLikelySelected(el, bag);
       textOut.push({ el, day, selected, top: r.top, left: r.left, from: "text" });
     }
   }
@@ -5898,15 +6190,7 @@ function getLegacyTimeCandidates(frameDoc) {
       ) {
         continue;
       }
-      const selected =
-        classBag.includes("selected") ||
-        classBag.includes("choice") ||
-        classBag.includes("active") ||
-        classBag.includes("picked") ||
-        classBag.includes("on") ||
-        bag.includes("selected") ||
-        bag.includes("choice") ||
-        el.getAttribute("aria-selected") === "true";
+      const selected = isElementLikelySelected(el, bag);
       fnOut.push({ el, text, selected, minutes: parseTimeMinutes(text), from: "fn" });
     }
 
@@ -5929,15 +6213,7 @@ function getLegacyTimeCandidates(frameDoc) {
       ) {
         continue;
       }
-      const selected =
-        classBag.includes("selected") ||
-        classBag.includes("choice") ||
-        classBag.includes("active") ||
-        classBag.includes("picked") ||
-        classBag.includes("on") ||
-        bag.includes("selected") ||
-        bag.includes("choice") ||
-        el.getAttribute("aria-selected") === "true";
+      const selected = isElementLikelySelected(el, bag);
       textOut.push({ el, text, selected, minutes: parseTimeMinutes(text), from: "text" });
     }
   }
@@ -7862,6 +8138,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       .then(() => sendResponse({ ok: true }))
       .catch((err) => sendResponse({ ok: false, error: String(err) }));
     return true;
+  }
+  if (message?.type === "STOP_INPAGE_ALARM") {
+    stopInpageTicketAlarm("后台指令");
+    sendResponse({ ok: true });
+    return;
+  }
+  if (message?.type === "START_INPAGE_ALARM") {
+    startInpageTicketAlarm(String(message?.reason || "后台转发"));
+    sendResponse({ ok: true });
+    return;
   }
   if (message?.type === "PING_BOT") {
     sendResponse({
