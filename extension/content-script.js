@@ -1,12 +1,16 @@
 const STORAGE_KEY = "nolBotConfig";
 const EXIMBAY_ACTIVE_KEY = "nolBotEximbayActive";
 const DEFAULT_OCR_API_URL = "https://api.nexuschat.top/ocr-api/ocr/file";
+const SLIDER_CAPTCHA_DRAG_COOLDOWN_MS = 2600;
+const SLIDER_CAPTCHA_DEBUG_DISTANCE_TTL_MS = 30000;
+const SLIDER_CAPTCHA_FALLBACK_DISTANCE = 220;
 
 const state = {
   config: {
     enabled: false,
     startedAt: 0,
     eventUrl: "",
+    sliderAutoDragSecretEnabled: false,
     fullFlowEnabled: true,
     saleStartTime: "",
     preEnterSeconds: 30,
@@ -77,10 +81,14 @@ const state = {
   legacyNextWaitLogAt: 0,
   productFlowKey: "",
   productBuyClickedAt: 0,
+  productNoticeCloseLastClickAt: 0,
+  productNoticeCloseLastLogAt: 0,
   reserveEntryLastClickAt: 0,
   reserveEntryFlowKey: "",
   reserveEntryLastPresent: false,
   reserveEntryClickedOnce: false,
+  reserveEntryTargetLogSig: "",
+  reserveEntryTargetLastLogAt: 0,
   productLastCountdownLogAt: 0,
   queueLastLogAt: 0,
   queueActive: false,
@@ -110,11 +118,23 @@ const state = {
   humanVerifyAttempted: false,
   humanVerifyAlertActive: false,
   humanVerifyLastNotifyAt: 0,
+  humanVerifyLocalClickLastAt: 0,
+  humanVerifyLocalClickLastLogAt: 0,
   nativeDialogAutoConfirmEnabled: false,
   nativeDialogAutoConfirmLastSyncAt: 0,
   sliderCaptchaPaused: false,
   sliderCaptchaLastLogAt: 0,
   sliderCaptchaLastNotifyAt: 0,
+  sliderCaptchaAutoDragLastAt: 0,
+  sliderCaptchaAutoDragCount: 0,
+  sliderCaptchaTargetDistance: 0,
+  sliderCaptchaTargetDistanceAt: 0,
+  sliderCaptchaTargetDistanceSource: "",
+  sliderCaptchaDebugHookEnabled: false,
+  sliderCaptchaDebugHookLastSyncAt: 0,
+  sliderCaptchaDebugBridgeReady: false,
+  sliderCaptchaDebugLastEventAt: 0,
+  sliderCaptchaDebugLastSig: "",
   lastStage: "unknown",
   lastBookingPageVariant: "unknown",
   notifySale3mSent: false,
@@ -167,6 +187,7 @@ const state = {
     ts: 0,
     count: 0
   },
+  crossFrameDialogSweepLastAt: 0,
   captcha: {
     lastImageSig: "",
     lastAttemptAt: 0,
@@ -189,11 +210,6 @@ const STEP_TEXT = {
     "先行訂購",
     "先行预购",
     "先行預購",
-    "预售",
-    "預售",
-    "presale",
-    "pre-sale",
-    "advance booking",
     "선예매",
     "팬클럽 선예매",
     "예매하기"
@@ -312,7 +328,6 @@ function isElementLikelySelected(el, extraBag = "") {
   if (hasAnyTokenBoundary(classText, ["selected", "active", "checked", "choice", "picked", "on"])) {
     return true;
   }
-  // extraBag 可能拼接了 id/style/script，仅保留强语义状态词，避免 "option/button" 误伤。
   if (hasAnyTokenBoundary(extraBag, ["selected", "active", "checked", "choice", "picked"])) {
     return true;
   }
@@ -651,12 +666,8 @@ function getSaleCountdownMs() {
 
 function shouldEnableNativeDialogAutoConfirm() {
   if (!state.config.enabled) return false;
-  const host = String(location.host || "").toLowerCase();
-  return (
-    host === "tickets.interpark.com" ||
-    host === "gpoticket.globalinterpark.com" ||
-    isLegacyBookingUrl()
-  );
+  // 仅在选座上下文启用，避免日期页被弹窗自动确认/iframe guard 影响状态流转。
+  return isSeatContextForPopupAutoConfirm();
 }
 
 async function syncNativeDialogAutoConfirm(force = false) {
@@ -675,6 +686,131 @@ async function syncNativeDialogAutoConfirm(force = false) {
   try {
     await chrome.runtime.sendMessage({
       type: "SET_NATIVE_DIALOG_AUTOCONFIRM_MAIN",
+      enabled
+    });
+  } catch (_) {}
+}
+
+function shouldEnableSliderCaptchaDebugHook() {
+  if (!state.config.enabled) return false;
+  const host = String(location.host || "").toLowerCase();
+  return host === "gpoticket.globalinterpark.com" || isLegacyBookingUrl();
+}
+
+function formatSliderCaptchaDebugSource(raw) {
+  const src = String(raw || "").trim();
+  if (!src) return "-";
+  if (src.length <= 120) return src;
+  return `${src.slice(0, 88)}...${src.slice(-24)}`;
+}
+
+function handleSliderCaptchaDebugPayload(raw, source = "event") {
+  if (!raw || typeof raw !== "object") return;
+  const phase = String(raw.phase || "").trim().toLowerCase();
+  if (!phase) return;
+
+  const now = Date.now();
+  const sig = [
+    phase,
+    Number(raw.x || 0),
+    Number(raw.blockLeft || 0),
+    Number(raw.delta || 0),
+    Number(raw.trailLen || 0),
+    String(raw.src || "")
+  ].join("|");
+  if (sig === state.sliderCaptchaDebugLastSig && now - state.sliderCaptchaDebugLastEventAt < 700) {
+    return;
+  }
+  state.sliderCaptchaDebugLastSig = sig;
+  state.sliderCaptchaDebugLastEventAt = now;
+
+  if (phase === "x_generated") {
+    const x = Number(raw.x || 0);
+    const width = Number(raw.width || 0);
+    const blockTargetLeft = Number.isFinite(Number(raw.blockTargetLeft))
+      ? Number(raw.blockTargetLeft)
+      : x - 3;
+    const sliderTargetDistanceRaw = Number.isFinite(Number(raw.sliderTargetDistance))
+      ? Number(raw.sliderTargetDistance)
+      : Number.isFinite(width) && width > 80
+        ? (blockTargetLeft * (width - 40)) / (width - 60)
+        : NaN;
+    const sliderTargetDistance = Number.isFinite(sliderTargetDistanceRaw)
+      ? Math.max(0, Math.round(sliderTargetDistanceRaw * 10) / 10)
+      : 0;
+    if (sliderTargetDistance > 0) {
+      state.sliderCaptchaTargetDistance = sliderTargetDistance;
+      state.sliderCaptchaTargetDistanceAt = now;
+      state.sliderCaptchaTargetDistanceSource = source;
+    }
+    log(
+      `滑块参数(${source}): x=${x}, y=${Number(raw.y || 0)}, offset=${Number(raw.offset || 0)}, src=${formatSliderCaptchaDebugSource(raw.src)}`
+    );
+    log(`滑块需要移动的像素距离(${source}): ≈${sliderTargetDistance}px`);
+    return;
+  }
+
+  if (phase === "verify") {
+    log(
+      `滑块校验采样(${source}): blockLeft=${Number(raw.blockLeft || 0)}, x=${Number(raw.x || 0)}, delta=${Number(raw.delta || 0)}, offset=${Number(raw.offset || 0)}, trail=${Number(raw.trailLen || 0)}`
+    );
+    return;
+  }
+
+  if (phase === "set_src") {
+    if (now - Number(state.sliderCaptchaDebugHookLastSyncAt || 0) < 900) return;
+    log(`滑块图片源(${source}): ${formatSliderCaptchaDebugSource(raw.src)}`);
+    return;
+  }
+
+  if (phase === "hook_error") {
+    log(`滑块调试Hook异常(${source}): ${String(raw.error || raw.msg || "unknown")}`);
+  }
+}
+
+function ensureSliderCaptchaDebugBridge() {
+  if (!IS_TOP_FRAME || state.sliderCaptchaDebugBridgeReady) return;
+  state.sliderCaptchaDebugBridgeReady = true;
+
+  window.addEventListener(
+    "__NOL_SLIDER_CAPTCHA_DEBUG",
+    (event) => {
+      handleSliderCaptchaDebugPayload(event?.detail || {}, "custom");
+    },
+    true
+  );
+
+  window.addEventListener(
+    "message",
+    (event) => {
+      const data = event?.data;
+      if (!data || typeof data !== "object") return;
+      const payload = data.__NOL_SLIDER_CAPTCHA_DEBUG;
+      if (!payload || payload.__nolTag !== "slider_debug") return;
+      handleSliderCaptchaDebugPayload(payload, "postMessage");
+    },
+    true
+  );
+}
+
+async function syncSliderCaptchaDebugHook(force = false) {
+  if (!IS_TOP_FRAME) return;
+  const enabled = shouldEnableSliderCaptchaDebugHook();
+  const now = Date.now();
+  if (
+    !force &&
+    state.sliderCaptchaDebugHookEnabled === enabled &&
+    now - Number(state.sliderCaptchaDebugHookLastSyncAt || 0) < 10000
+  ) {
+    return;
+  }
+
+  ensureSliderCaptchaDebugBridge();
+  state.sliderCaptchaDebugHookEnabled = enabled;
+  state.sliderCaptchaDebugHookLastSyncAt = now;
+  try {
+    await chrome.runtime.sendMessage({
+      type: "SET_SLIDER_CAPTCHA_DEBUG_HOOK_MAIN",
       enabled
     });
   } catch (_) {}
@@ -737,6 +873,7 @@ async function sendLocalAlarmNotify(eventKey, title, text) {
 }
 
 function stopInpageTicketAlarm(reason = "") {
+  if (!IS_TOP_FRAME) return;
   if (state.inpageTicketAlarmTimerId) {
     clearTimeout(state.inpageTicketAlarmTimerId);
     state.inpageTicketAlarmTimerId = 0;
@@ -768,23 +905,6 @@ function getInpageTicketAlarmAudioContext() {
   }
 }
 
-function playInpageTicketAlarmSpeechFallback() {
-  const synth = window.speechSynthesis;
-  const Utterance = window.SpeechSynthesisUtterance;
-  if (!synth || typeof synth.speak !== "function" || !Utterance) return false;
-  try {
-    synth.cancel();
-    const utter = new Utterance("抢票成功");
-    utter.rate = 1.1;
-    utter.pitch = 1.0;
-    utter.volume = 1.0;
-    synth.speak(utter);
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
 async function playInpageTicketAlarmOnce() {
   const ctx = getInpageTicketAlarmAudioContext();
   if (!ctx) return false;
@@ -805,7 +925,7 @@ async function playInpageTicketAlarmOnce() {
     osc.type = "square";
     osc.frequency.setValueAtTime(notes[i], t);
     gain.gain.setValueAtTime(0.0001, t);
-    gain.gain.exponentialRampToValueAtTime(0.35, t + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.2, t + 0.012);
     gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.16);
     osc.connect(gain);
     gain.connect(ctx.destination);
@@ -823,8 +943,7 @@ function scheduleInpageTicketAlarmTick(delayMs = INPAGE_TICKET_ALARM_INTERVAL_MS
   state.inpageTicketAlarmTimerId = window.setTimeout(async () => {
     if (!state.inpageTicketAlarmActive) return;
     const played = await playInpageTicketAlarmOnce();
-    const spoken = !played ? playInpageTicketAlarmSpeechFallback() : false;
-    if (!played && !spoken && Date.now() - Number(state.inpageTicketAlarmLastWarnAt || 0) > 4000) {
+    if (!played && Date.now() - Number(state.inpageTicketAlarmLastWarnAt || 0) > 4000) {
       log("到票提醒音频未能播放，请点击页面任意位置后继续");
       state.inpageTicketAlarmLastWarnAt = Date.now();
     }
@@ -833,21 +952,41 @@ function scheduleInpageTicketAlarmTick(delayMs = INPAGE_TICKET_ALARM_INTERVAL_MS
 }
 
 function startInpageTicketAlarm(reason = "") {
-  const shouldForwardTop = !IS_TOP_FRAME;
-  if (shouldForwardTop) {
-    try {
-      chrome.runtime.sendMessage({
-        type: "START_INPAGE_ALARM_FROM_FRAME",
-        reason: String(reason || "")
-      });
-    } catch (_) {}
-  }
+  if (!IS_TOP_FRAME) return false;
   if (state.inpageTicketAlarmActive) return true;
   state.inpageTicketAlarmActive = true;
   state.inpageTicketAlarmLastWarnAt = 0;
   scheduleInpageTicketAlarmTick(0);
   log(`已触发插件内持续响铃提醒${reason ? ` (${reason})` : ""}`);
   return true;
+}
+
+async function triggerLocalCloudflareClick(reason = "") {
+  if (window.top !== window) return false;
+  if (String(location.host || "").toLowerCase() !== "world.nol.com") return false;
+  const now = Date.now();
+  if (now - Number(state.humanVerifyLocalClickLastAt || 0) < 1400) return false;
+  state.humanVerifyLocalClickLastAt = now;
+  try {
+    const resp = await chrome.runtime.sendMessage({
+      type: "LOCAL_CLOUDFLARE_CLICK",
+      title: "Cloudflare Verify 自动点击",
+      text: "检测到商品页 Verify you are human，已触发本地点击助手。",
+      sourceUrl: location.href,
+      reason: String(reason || "").trim(),
+      timeoutMs: 1600
+    });
+    if (resp?.ok && resp?.sent) {
+      if (now - Number(state.humanVerifyLocalClickLastLogAt || 0) > 2500) {
+        log("已触发本地 Cloudflare 点击助手");
+        state.humanVerifyLocalClickLastLogAt = now;
+      }
+      return true;
+    }
+    return false;
+  } catch (_) {
+    return false;
+  }
 }
 
 function parseQueueRemaining() {
@@ -1051,6 +1190,7 @@ function hasBuyNowFlowReacted() {
 
   if (
     host === "tickets.interpark.com" ||
+    host === "ticket.globalinterpark.com" ||
     host === "gpoticket.globalinterpark.com" ||
     isLegacyBookingUrl()
   ) {
@@ -1271,17 +1411,20 @@ async function maybeAbortScavengeRoundByTimeout() {
   }
   const maxMs = getScavengeRoundMaxMs();
   if (!maxMs) return false;
+  if (Number(state.scavengeLoopNextRestartAt || 0) > 0) return false;
 
   const host = String(location.host || "").toLowerCase();
-  const inBookingHost =
+  const inRoundHost =
+    isWorldProductPageForRoundTimeout() ||
     host === "tickets.interpark.com" ||
+    host === "ticket.globalinterpark.com" ||
     host === "gpoticket.globalinterpark.com" ||
     isLegacyBookingUrl();
-  if (!inBookingHost) return false;
+  if (!inRoundHost) return false;
 
   const now = Date.now();
   if (!state.scavengeLoopTimeoutBaseAt) {
-    // 单轮超时从“进入订票域名后”开始计算，避免把 product 页跳转耗时算进来。
+    // 单轮超时从“本轮首次进入关键站点(world商品页/tickets/gpoticket)”开始计算。
     state.scavengeLoopTimeoutBaseAt = now;
   }
 
@@ -1552,21 +1695,83 @@ function isSliderCaptchaWidgetPresent(preferredDoc = null) {
   });
 }
 
+function getSliderCaptchaAutoDragDistance(preferredDoc = null) {
+  const now = Date.now();
+  const debugDistance = Number(state.sliderCaptchaTargetDistance || 0);
+  if (
+    debugDistance > 0 &&
+    now - Number(state.sliderCaptchaTargetDistanceAt || 0) <= SLIDER_CAPTCHA_DEBUG_DISTANCE_TTL_MS
+  ) {
+    return {
+      distance: Math.max(0, Math.round(debugDistance * 10) / 10),
+      source: `debug:${state.sliderCaptchaTargetDistanceSource || "-"}`
+    };
+  }
+
+  const docs = getCaptchaSearchDocuments(preferredDoc);
+  for (const doc of docs) {
+    const slider = Array.from(
+      doc.querySelectorAll("#captchSlider .slider, .captchSliderLayer .slider, .sliderContainer .slider")
+    ).find((el) => isDomElement(el) && visible(el));
+    if (!slider) continue;
+    const root =
+      slider.closest("#captchSlider, .sliderContainer, .captchSliderInner, .captchSliderLayer") ||
+      slider.parentElement;
+    if (!isDomElement(root)) continue;
+    const sliderRect = slider.getBoundingClientRect();
+    const rootRect = root.getBoundingClientRect();
+    const estimated = rootRect.width - sliderRect.width - 4;
+    if (estimated > 20) {
+      return {
+        distance: Math.round(estimated * 10) / 10,
+        source: "dom"
+      };
+    }
+  }
+  return {
+    distance: SLIDER_CAPTCHA_FALLBACK_DISTANCE,
+    source: "fallback"
+  };
+}
+
 async function runSliderCaptchaPauseGuard() {
   const active = isSliderCaptchaWidgetPresent();
   if (!active) {
     if (state.sliderCaptchaPaused) {
       state.sliderCaptchaPaused = false;
       state.sliderCaptchaLastLogAt = 0;
+      state.sliderCaptchaAutoDragLastAt = 0;
+      state.sliderCaptchaAutoDragCount = 0;
+      state.sliderCaptchaTargetDistance = 0;
+      state.sliderCaptchaTargetDistanceAt = 0;
+      state.sliderCaptchaTargetDistanceSource = "";
       log("滑块验证码已完成，恢复自动流程");
     }
     return false;
   }
 
   const now = Date.now();
+  const autoDragEnabled = state.config.sliderAutoDragSecretEnabled === true;
+  if (
+    autoDragEnabled &&
+    now - Number(state.sliderCaptchaAutoDragLastAt || 0) >= SLIDER_CAPTCHA_DRAG_COOLDOWN_MS
+  ) {
+    const target = getSliderCaptchaAutoDragDistance();
+    if (dragCaptchaSlider(target.distance)) {
+      state.sliderCaptchaAutoDragLastAt = now;
+      state.sliderCaptchaAutoDragCount = Number(state.sliderCaptchaAutoDragCount || 0) + 1;
+      log(
+        `检测到滑块验证码，已尝试自动拖动(第${state.sliderCaptchaAutoDragCount}次，距离≈${target.distance}px，source=${target.source})`
+      );
+    }
+  }
   if (!state.sliderCaptchaPaused) {
     state.sliderCaptchaPaused = true;
-    log("检测到滑块验证码，自动流程暂停，请手动完成滑块验证");
+    log(
+      autoDragEnabled
+        ? "检测到滑块验证码，自动流程暂停；已启用自动拖动尝试，如未通过请手动完成滑块验证"
+        : "检测到滑块验证码，自动流程暂停，请手动完成滑块验证"
+    );
   } else if (now - state.sliderCaptchaLastLogAt > 3500) {
     log("滑块验证码处理中，等待人工完成后自动继续");
   }
@@ -1634,6 +1839,7 @@ async function runHumanVerifyStep() {
     state.humanVerifyAlertActive = false;
     return false;
   }
+  triggerLocalCloudflareClick("verify_widget_detected").catch(() => {});
 
   const now = Date.now();
   const shouldNotifyNow =
@@ -2027,7 +2233,9 @@ function isSeatContextForPopupAutoConfirm() {
   if (isLegacySeatLayerVisible() || isLegacySeatIframeReady()) return true;
   if (host === "tickets.interpark.com" && path.includes("/onestop/seat")) return true;
   if (host === "gpoticket.globalinterpark.com" && path.includes("/global/play/book/bookmain.asp")) {
-    return Boolean(document.querySelector("#ifrmSeat, #divBookSeat, #ifrmBookStep"));
+    const stepNo = getLegacyActiveStepNumber();
+    if (stepNo === 2) return true;
+    return isLegacySeatLayerVisible() || isLegacySeatIframeReady();
   }
   const stage = detectCurrentStage();
   return stage === "seat";
@@ -2065,6 +2273,27 @@ function closeAnySeatConfirmPopupIfPresent() {
       return true;
     }
   }
+  return false;
+}
+
+async function closeAnySeatConfirmPopupCrossFrameIfPresent() {
+  if (!isSeatContextForPopupAutoConfirm()) return false;
+  const now = Date.now();
+  if (now - Number(state.crossFrameDialogSweepLastAt || 0) < 420) return false;
+  state.crossFrameDialogSweepLastAt = now;
+  try {
+    const resp = await chrome.runtime.sendMessage({
+      type: "SWEEP_CONFIRM_DIALOGS_GLOBAL"
+    });
+    if (resp?.ok && resp?.result?.clicked) {
+      const clickedTabs = Number(resp?.result?.clickedTabs || 0);
+      const scannedTabs = Number(resp?.result?.scannedTabs || 0);
+      log(
+        `选座界面检测到跨窗口确认弹窗，已自动点击确定 (clickedTabs=${clickedTabs}, scannedTabs=${scannedTabs})`
+      );
+      return true;
+    }
+  } catch (_) {}
   return false;
 }
 
@@ -2866,7 +3095,7 @@ async function runSeatStep() {
     state.newSeatFlowKey = flowKey;
     state.newSeatLastAttemptKey = "";
   }
-  if (closeAnySeatConfirmPopupIfPresent()) {
+  if (closeAnySeatConfirmPopupIfPresent() || (await closeAnySeatConfirmPopupCrossFrameIfPresent())) {
     await sleep(120);
     return;
   }
@@ -3124,11 +3353,25 @@ function getPreorderButtonStrict() {
 
 function isElementDisabledLike(el) {
   if (!el) return true;
-  const cls = normalizeText(el.className?.toString() || "");
-  return (
-    Boolean(el.disabled) ||
-    cls.includes("disabled") ||
-    el.getAttribute("aria-disabled") === "true"
+  const ariaDisabled = String(el.getAttribute?.("aria-disabled") || "").toLowerCase() === "true";
+  if (ariaDisabled) return true;
+  try {
+    if (typeof el.matches === "function" && el.matches(":disabled")) return true;
+  } catch (_) {}
+  if (Boolean(el.disabled)) return true;
+
+  // 对原生可交互控件仅以真实禁用状态为准，避免误判如 "disabled:cursor_not-allowed"。
+  const tag = String(el.tagName || "").toLowerCase();
+  if (tag === "button" || tag === "input" || tag === "select" || tag === "textarea") {
+    return false;
+  }
+
+  const classTokens = String(el.className?.toString?.() || "")
+    .split(/\s+/)
+    .map((s) => normalizeText(s))
+    .filter(Boolean);
+  return classTokens.some(
+    (t) => t === "disabled" || t === "is-disabled" || t.endsWith("--disabled")
   );
 }
 
@@ -3442,7 +3685,6 @@ function getDateDayCandidates() {
     .filter(Boolean)
     .sort((a, b) => a.day - b.day || b.score - a.score || a.r.top - b.r.top || a.r.left - b.r.left);
 
-  // 同一天可能命中多个节点，只保留最优一个
   const byDay = new Map();
   for (const item of raw) {
     const prev = byDay.get(item.day);
@@ -3626,13 +3868,11 @@ function isDateTimeSelectedLikely() {
 function isDateTimeSelectionConfirmed() {
   if (isDateTimeSelectedLikely()) return true;
 
-  // 某些新版页面不会给场次卡片打 selected/aria 状态，只在可提交时去掉“请选择场次”提示。
   const hint = hasNeedChooseSessionHint();
   const options = getDateTimeOptionCandidates("time");
   if (!options.length) return false;
   if (!hint) return true;
 
-  // 提示还在时，仅在“刚点击场次”窗口内给一次容错，避免误卡死。
   const clickedRecently = Date.now() - state.dateLastSlotClickAt < 1800;
   if (clickedRecently && options.length === 1) return true;
   return false;
@@ -4436,14 +4676,14 @@ async function runInfoStep() {
 // ======================================================================
 
 function findBuyNowButtonStrict() {
-  const words = STEP_TEXT.buyNow.map((w) => normalizeText(w));
+  const strictWords = STEP_TEXT.buyNow.map((w) => normalizeText(w));
   const nodes = Array.from(
     document.querySelectorAll("button, a, [role='button'], div, span")
   ).filter(visible);
   const candidates = nodes
     .map((el) => {
       const text = normalizeText(el.textContent || "");
-      if (!text || !words.some((w) => text.includes(w))) return null;
+      if (!text || !strictWords.includes(text)) return null;
       const cls = normalizeText(el.className?.toString() || "");
       const disabled =
         el.disabled ||
@@ -4476,67 +4716,160 @@ function isBuyNowElement(el) {
   if (!isDomElement(el) || !visible(el)) return false;
   const text = normalizeText(el.textContent || "");
   if (!text) return false;
-  return STEP_TEXT.buyNow.some((w) => text.includes(normalizeText(w)));
+  const strictWords = STEP_TEXT.buyNow.map((w) => normalizeText(w));
+  return strictWords.includes(text);
 }
 
 function getCachedOrFindBuyNowButton() {
   const cached = state.buyNowCachedEl;
   if (isBuyNowElement(cached)) return cached;
-  const found = findBuyNowButtonStrict() || findButtonByClassAndText(STEP_TEXT.buyNow);
+  const found = findBuyNowButtonStrict();
   state.buyNowCachedEl = found || null;
   return found || null;
 }
 
-function findReserveEntryButtonStrict() {
-  const strictWords = ["预定", "預定", "membership"].map((w) => normalizeText(w));
-  const buyWords = STEP_TEXT.buyNow.map((w) => normalizeText(w));
-  const nodes = Array.from(
-    document.querySelectorAll("button, a, [role='button'], div, span")
-  ).filter(visible);
-  const isLikelyInteractive = (el) => {
-    if (!isDomElement(el)) return false;
-    const tag = String(el.tagName || "").toLowerCase();
-    if (tag === "button" || tag === "a" || tag === "input") return true;
-    if (el.getAttribute("role") === "button") return true;
-    if (el.hasAttribute("onclick")) return true;
-    if (String(el.getAttribute("href") || "").trim()) return true;
-    const cls = normalizeText(el.className?.toString() || "");
-    if (cls.includes("button") || cls.includes("btn") || cls.includes("primary")) return true;
-    try {
-      const style = (el.ownerDocument?.defaultView || window).getComputedStyle(el);
-      if (style.cursor === "pointer") return true;
-    } catch (_) {}
-    return false;
-  };
-  const candidates = nodes
-    .map((el) => {
-      const text = normalizeText(el.textContent || "");
-      // 严格匹配“预定/預定/Membership”整词，不允许出现其他字（如“一般预定”）。
-      if (!text || !strictWords.includes(text)) return null;
-      // 排除“立即购买”类按钮，避免韩文 예매/예매하기 重叠误判
-      if (buyWords.some((w) => text.includes(w))) return null;
-      // 避免误点价格页“预购”
-      if (text.includes("预购") || text.includes("預購")) return null;
-      const cls = normalizeText(el.className?.toString() || "");
+function findProductBottomSheetCloseButton() {
+  const closeWords = ["关闭", "關閉", "close", "닫기"];
+  const normalizedCloseWords = closeWords.map((w) => normalizeText(w));
+  const candidates = Array.from(
+    document.querySelectorAll(
+      ".joint-modal-bottom-sheet__footer button.joint-modal-bottom-sheet__actionButton, .joint-modal-bottom-sheet__footer button"
+    )
+  )
+    .filter(visible)
+    .map((btn) => {
+      const txt = normalizeText(btn.textContent || "");
+      if (!txt || !normalizedCloseWords.some((w) => txt.includes(w))) return null;
+      const cls = normalizeText(btn.className || "");
       const disabled =
-        el.disabled ||
-        el.getAttribute("aria-disabled") === "true" ||
-        cls.includes("disabled");
+        btn.disabled ||
+        cls.includes("disabled") ||
+        btn.getAttribute("aria-disabled") === "true";
       if (disabled) return null;
-      if (!isLikelyInteractive(el)) return null;
-      const r = el.getBoundingClientRect();
+      const r = btn.getBoundingClientRect();
       let score = 0;
-      if (r.left > window.innerWidth * 0.5) score += 3;
-      if (r.top > window.innerHeight * 0.45) score += 3;
-      if (r.width > 140 && r.height > 34) score += 3;
-      score += 5;
-      if (text === "预定" || text === "預定" || text === "membership") score += 4;
-      if (cls.includes("primary") || cls.includes("button")) score += 2;
-      return { el, score };
+      if (cls.includes("joint-modal-bottom-sheet__actionbutton")) score += 6;
+      if (cls.includes("joint-rectangle-button")) score += 4;
+      if (r.width >= 200) score += 2;
+      if (r.height >= 40) score += 2;
+      if (r.top > window.innerHeight * 0.6) score += 3;
+      return { btn, score };
     })
     .filter(Boolean)
     .sort((a, b) => b.score - a.score);
-  return candidates[0]?.el || null;
+  return candidates[0]?.btn || null;
+}
+
+function clickProductBottomSheetCloseAggressive() {
+  const now = Date.now();
+  const minGap = state.tickMode === "critical" ? 55 : 120;
+  if (now - Number(state.productNoticeCloseLastClickAt || 0) < minGap) return false;
+  const target = findProductBottomSheetCloseButton();
+  if (!target) return false;
+
+  const bursts = state.tickMode === "critical" ? 3 : 2;
+  for (let i = 0; i < bursts; i += 1) {
+    clickAtCenter(target);
+  }
+  forceClick(target);
+  state.productNoticeCloseLastClickAt = now;
+  if (now - Number(state.productNoticeCloseLastLogAt || 0) > 1200) {
+    log("商品页检测到公告弹窗，已点击关闭");
+    state.productNoticeCloseLastLogAt = now;
+  }
+  return true;
+}
+
+function findBizCodeGateRootUniqueButton() {
+  if (!isInterparkGateWithBizCode()) return null;
+
+  const root = document.querySelector("#root");
+  if (!root) return null;
+
+  const allButtons = Array.from(root.querySelectorAll("button")).filter((el) => visible(el));
+  if (!allButtons.length) return null;
+
+  const getSpanText = (btn) =>
+    String(btn?.querySelector?.("span")?.textContent || "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  // 新版 gates(bizCode) 优先: #root 下 span 文本严格等于“预订/预定”的按钮。
+  const reserveStrict = allButtons.find((btn) => {
+    const text = getSpanText(btn);
+    return text === "预订" || text === "预定" || text === "預訂" || text === "預定";
+  });
+  if (reserveStrict) return reserveStrict;
+
+  // 次优先: 历史兼容文案（Membership / Membership Member）。
+  const fallbackByText = allButtons.find((btn) => {
+    const text = getSpanText(btn);
+    return text === "Membership" || text === "membership" || text === "Membership Member";
+  });
+  if (fallbackByText) return fallbackByText;
+
+  // 最后回退旧逻辑: #root .buttons 内第一个可见按钮。
+  const preferredWrap = root.querySelector(".buttons");
+  if (!preferredWrap) return null;
+  const wrapButtons = Array.from(preferredWrap.querySelectorAll("button")).filter((el) => visible(el));
+  if (!wrapButtons.length) return null;
+  return wrapButtons[0];
+}
+
+function findReserveEntryButtonStrict() {
+  return findBizCodeGateRootUniqueButton();
+}
+
+function getReserveEntrySpanTexts(target) {
+  if (!isDomElement(target)) return [];
+  const spans = Array.from(target.querySelectorAll("span"));
+  if (!spans.length) return [];
+  const texts = spans
+    .map((span) => String(span.textContent || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  return Array.from(new Set(texts));
+}
+
+function isReserveEntrySpanTextReady(spanTextOrTexts) {
+  const candidates = Array.isArray(spanTextOrTexts) ? spanTextOrTexts : [spanTextOrTexts];
+  return candidates.some((raw) => {
+    const text = String(raw || "").trim();
+    return (
+      text === "预订" ||
+      text === "预定" ||
+      text === "預訂" ||
+      text === "預定" ||
+      text === "Membership" ||
+      text === "membership" ||
+      text === "Membership Member"
+    );
+  });
+}
+
+function logReserveEntryTargetResult(status, target = null) {
+  const spanTexts = getReserveEntrySpanTexts(target);
+  const text = (spanTexts.join(" | ") || String(target?.textContent || "").trim() || "-")
+    .replace(/\s+/g, " ")
+    .slice(0, 80);
+  const sig = `${status}|${text}`;
+  const now = Date.now();
+  if (
+    state.reserveEntryTargetLogSig === sig &&
+    now - Number(state.reserveEntryTargetLastLogAt || 0) < 1200
+  ) {
+    return;
+  }
+  state.reserveEntryTargetLogSig = sig;
+  state.reserveEntryTargetLastLogAt = now;
+  if (status === "not_found") {
+    log("ReserveTarget: 未在 #root .buttons 内找到 button");
+    return;
+  }
+  if (status === "text_not_ready") {
+    log(`ReserveTarget: 已锁定目标按钮(文本未命中) span="${text}"`);
+    return;
+  }
+  log(`ReserveTarget: 已锁定目标按钮(文本命中可点击) span="${text}"`);
 }
 
 function clickReserveEntryAggressive() {
@@ -4553,15 +4886,33 @@ function clickReserveEntryAggressive() {
   const target = findReserveEntryButtonStrict();
   if (!target) {
     state.reserveEntryLastPresent = false;
+    logReserveEntryTargetResult("not_found");
     return false;
   }
+  const spanTexts = getReserveEntrySpanTexts(target);
+  if (!isReserveEntrySpanTextReady(spanTexts)) {
+    // 目标按钮始终锁定；仅当任一 span 文本严格命中白名单时才点击。
+    state.reserveEntryLastPresent = true;
+    logReserveEntryTargetResult("text_not_ready", target);
+    return false;
+  }
+  logReserveEntryTargetResult("ready", target);
   if (startMode === "edge_once") {
-    if (state.reserveEntryClickedOnce) {
+    const retryGap = Math.max(500, minGap * 4);
+    if (state.reserveEntryClickedOnce && now - state.reserveEntryLastClickAt < retryGap) {
       state.reserveEntryLastPresent = true;
       return false;
     }
-    // 卡点模式：仅在目标按钮“刚出现”的边沿触发一次。
-    if (state.reserveEntryLastPresent) return false;
+    if (state.reserveEntryClickedOnce && now - state.reserveEntryLastClickAt >= retryGap) {
+      // 单次点击无响应时允许重试，避免 edge_once 锁死。
+      state.reserveEntryClickedOnce = false;
+    }
+    if (
+      state.reserveEntryLastPresent &&
+      now - state.reserveEntryLastClickAt < Math.max(220, minGap * 2)
+    ) {
+      return false;
+    }
   } else {
     state.reserveEntryClickedOnce = false;
     if (now - state.reserveEntryLastClickAt < minGap) {
@@ -4571,7 +4922,7 @@ function clickReserveEntryAggressive() {
   }
 
   for (let i = 0; i < burstCount; i += 1) {
-    clickElement(target);
+    clickAtCenter(target);
   }
   state.reserveEntryLastClickAt = now;
   state.reserveEntryLastPresent = true;
@@ -4593,14 +4944,13 @@ function isScavengeRoundWarmupWindow(windowMs = 20000) {
 function clickBuyNowAggressive() {
   const inScavengeWarmup = isScavengeRoundWarmupWindow(20000);
   const now = Date.now();
-  const minGapBase = inScavengeWarmup
+  const minGap = inScavengeWarmup
     ? state.tickMode === "critical"
       ? 60
       : 90
     : state.tickMode === "critical"
       ? 110
       : 320;
-  const minGap = minGapBase * 4;
   if (now - state.productBuyClickedAt < minGap) return false;
   const target = getCachedOrFindBuyNowButton();
   if (!target) {
@@ -4616,18 +4966,7 @@ function clickBuyNowAggressive() {
       ? 2
       : 3;
   for (let i = 0; i < bursts; i += 1) {
-    forceClick(target);
     clickAtCenter(target);
-    clickElement(target);
-    try {
-      target.focus();
-      target.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true })
-      );
-      target.dispatchEvent(
-        new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true })
-      );
-    } catch (_) {}
   }
   state.productBuyClickedAt = now;
   if (!state.firstBuyNowClickAt) {
@@ -4642,6 +4981,8 @@ async function runProductStep() {
   if (state.productFlowKey !== flowKey) {
     state.productFlowKey = flowKey;
     state.productBuyClickedAt = 0;
+    state.productNoticeCloseLastClickAt = 0;
+    state.productNoticeCloseLastLogAt = 0;
     state.productLastCountdownLogAt = 0;
     state.buyNowCachedEl = null;
     state.firstBuyNowClickAt = 0;
@@ -5652,7 +5993,13 @@ function isLegacyBookingUrl() {
 function isInterparkGatePage() {
   const host = String(location.host || "").toLowerCase();
   const path = String(location.pathname || "").toLowerCase();
-  return host === "tickets.interpark.com" && path.includes("/gates/");
+  const search = String(location.search || "").toLowerCase();
+  const isTicketsGate = host === "tickets.interpark.com" && path.includes("/gates/");
+  const isGlobalPlayGate =
+    host === "ticket.globalinterpark.com" &&
+    path.includes("/global/play") &&
+    search.includes("gate/");
+  return isTicketsGate || isGlobalPlayGate;
 }
 
 function isInterparkSchedulePage() {
@@ -5663,6 +6010,11 @@ function isInterparkSchedulePage() {
 
 function isInterparkGateWithoutBizCode() {
   if (!isInterparkGatePage()) return false;
+  const host = String(location.host || "").toLowerCase();
+  if (host === "ticket.globalinterpark.com") {
+    // CBTLoginGate 采用 gate/k 参数形态，按“有 gate token”处理。
+    return false;
+  }
   try {
     const params = new URLSearchParams(String(location.search || ""));
     return !String(params.get("bizCode") || "").trim();
@@ -5675,6 +6027,13 @@ function isInterparkGateWithBizCode() {
   return isInterparkGatePage() && !isInterparkGateWithoutBizCode();
 }
 
+function isWorldProductPageForRoundTimeout() {
+  const host = String(location.host || "").toLowerCase();
+  if (host !== "world.nol.com") return false;
+  const path = String(location.pathname || "").toLowerCase();
+  return path.includes("/products/");
+}
+
 function detectInterparkBookingVariant() {
   const host = String(location.host || "").toLowerCase();
   const path = String(location.pathname || "").toLowerCase();
@@ -5682,7 +6041,7 @@ function detectInterparkBookingVariant() {
   if (host === "gpoticket.globalinterpark.com") return "legacy";
   if (isLegacyBookingUrl()) return "legacy";
 
-  if (host === "tickets.interpark.com") {
+  if (host === "tickets.interpark.com" || host === "ticket.globalinterpark.com") {
     if (path.includes("/onestop/seat")) return "new";
     return "new";
   }
@@ -5807,11 +6166,15 @@ async function runNewInterparkTick() {
     state.reserveEntryLastPresent = false;
     state.reserveEntryClickedOnce = false;
     state.reserveEntryLastClickAt = 0;
+    state.reserveEntryTargetLogSig = "";
+    state.reserveEntryTargetLastLogAt = 0;
   }
 
   if (isInterparkGateWithoutBizCode()) {
     state.reserveEntryLastPresent = false;
     state.reserveEntryClickedOnce = false;
+    state.reserveEntryTargetLogSig = "";
+    state.reserveEntryTargetLastLogAt = 0;
     if (clickBuyNowAggressive()) {
       log("Interpark gates: 已点击购买入口（立即购买/先行订购），进入带 bizCode 的预订页");
       await sleep(140);
@@ -5825,26 +6188,17 @@ async function runNewInterparkTick() {
   }
 
   if (isInterparkGateWithBizCode()) {
-    const countdownMs = getSaleCountdownMs();
-    if (Number.isFinite(countdownMs) && countdownMs > 0) {
-      if (countdownMs <= getCriticalPreMs()) {
-        setTickMode("critical");
-      } else {
-        setTickMode("fast");
-      }
-      const now = Date.now();
-      const remainSec = Math.ceil(countdownMs / 1000);
-      const logInterval = countdownMs <= 10000 ? 500 : 4000;
-      if (now - state.productLastCountdownLogAt >= logInterval) {
-        log(`Interpark gates 距一般预订 ${remainSec}s，待命中`);
-        state.productLastCountdownLogAt = now;
-      }
-      return;
-    }
+    // bizCode gate 仅以页面按钮状态为准，不依赖本地 saleStartTime 倒计时。
+    setTickMode("critical");
     if (clickReserveEntryAggressive()) {
       log("Interpark gates: 已点击预定入口（预定/Membership）");
       await sleep(state.tickMode === "critical" ? 40 : 160);
       return;
+    }
+    const now = Date.now();
+    if (now - state.productLastCountdownLogAt >= 1200) {
+      log("Interpark gates: 等待“预定/Membership”按钮出现并严格命中");
+      state.productLastCountdownLogAt = now;
     }
   }
 
@@ -6088,7 +6442,8 @@ function getLegacyDayCandidates(frameDoc) {
       const text = String(el.textContent || "").trim();
       const textDay = /^\d{1,2}$/.test(text) ? Number(text) : null;
       const codeDay = extractLegacyDayFromHandler(code);
-      const day = Number.isFinite(textDay) ? textDay : codeDay;
+      // 旧版节点上常见“展示文本与onclick参数不一致”，优先信任 handler 中的日期参数。
+      const day = Number.isFinite(codeDay) ? codeDay : textDay;
       if (!Number.isFinite(day) || day < 1 || day > 31) continue;
       const classBag = normalizeText(el.className?.toString() || "");
       const bag = normalizeText(
@@ -6105,7 +6460,15 @@ function getLegacyDayCandidates(frameDoc) {
         continue;
       }
       const r = el.getBoundingClientRect();
-      const selected = isElementLikelySelected(el, bag);
+      const selected =
+        classBag.includes("selected") ||
+        classBag.includes("choice") ||
+        classBag.includes("active") ||
+        classBag.includes("picked") ||
+        classBag.includes("on") ||
+        bag.includes("selected") ||
+        bag.includes("choice") ||
+        el.getAttribute("aria-selected") === "true";
       fnOut.push({ el, day, selected, top: r.top, left: r.left, from: "fn" });
     }
 
@@ -6132,7 +6495,15 @@ function getLegacyDayCandidates(frameDoc) {
       }
       const r = el.getBoundingClientRect();
       if (r.width < 8 || r.height < 8) continue;
-      const selected = isElementLikelySelected(el, bag);
+      const selected =
+        classBag.includes("selected") ||
+        classBag.includes("choice") ||
+        classBag.includes("active") ||
+        classBag.includes("picked") ||
+        classBag.includes("on") ||
+        bag.includes("selected") ||
+        bag.includes("choice") ||
+        el.getAttribute("aria-selected") === "true";
       textOut.push({ el, day, selected, top: r.top, left: r.left, from: "text" });
     }
   }
@@ -6190,7 +6561,15 @@ function getLegacyTimeCandidates(frameDoc) {
       ) {
         continue;
       }
-      const selected = isElementLikelySelected(el, bag);
+      const selected =
+        classBag.includes("selected") ||
+        classBag.includes("choice") ||
+        classBag.includes("active") ||
+        classBag.includes("picked") ||
+        classBag.includes("on") ||
+        bag.includes("selected") ||
+        bag.includes("choice") ||
+        el.getAttribute("aria-selected") === "true";
       fnOut.push({ el, text, selected, minutes: parseTimeMinutes(text), from: "fn" });
     }
 
@@ -6213,7 +6592,15 @@ function getLegacyTimeCandidates(frameDoc) {
       ) {
         continue;
       }
-      const selected = isElementLikelySelected(el, bag);
+      const selected =
+        classBag.includes("selected") ||
+        classBag.includes("choice") ||
+        classBag.includes("active") ||
+        classBag.includes("picked") ||
+        classBag.includes("on") ||
+        bag.includes("selected") ||
+        bag.includes("choice") ||
+        el.getAttribute("aria-selected") === "true";
       textOut.push({ el, text, selected, minutes: parseTimeMinutes(text), from: "text" });
     }
   }
@@ -6242,6 +6629,27 @@ function getLegacyBookingFormState() {
     myPlayDate: String(document.querySelector("#MyPlayDate")?.textContent || "").trim(),
     myCancelableDate: String(document.querySelector("#MyCancelableDate")?.textContent || "").trim()
   };
+}
+
+function extractLegacySelectedDayFromBookingState(stateObj) {
+  const s = stateObj || getLegacyBookingFormState();
+  const textCandidates = [s.playDate, s.myPlayDate];
+  for (const raw of textCandidates) {
+    const text = String(raw || "").trim();
+    if (!text) continue;
+    const ymd = text.match(/(20\d{2})\D*(0[1-9]|1[0-2])\D*(0[1-9]|[12]\d|3[01])/);
+    if (ymd) {
+      const day = Number(ymd[3]);
+      if (Number.isFinite(day) && day >= 1 && day <= 31) return day;
+    }
+    const compact = text.replace(/[^\d]/g, "");
+    const compactYmd = compact.match(/(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])/);
+    if (compactYmd) {
+      const day = Number(compactYmd[3]);
+      if (Number.isFinite(day) && day >= 1 && day <= 31) return day;
+    }
+  }
+  return null;
 }
 
 function isLegacyMyPlayDateReady(stateObj) {
@@ -6600,6 +7008,117 @@ function isLegacyNextProcessing() {
   return false;
 }
 
+function dragCaptchaSlider(distance) {
+  const docs = getCaptchaSearchDocuments();
+  let slider = null;
+  for (const doc of docs) {
+    const found = Array.from(
+      doc.querySelectorAll("#captchSlider .slider, .captchSliderLayer .slider, .sliderContainer .slider")
+    ).find((el) => isDomElement(el) && visible(el));
+    if (found) {
+      slider = found;
+      break;
+    }
+  }
+  if (!slider) {
+    return false;
+  }
+
+  const doc = slider.ownerDocument || document;
+  const view = doc.defaultView || window;
+  const sliderRect = slider.getBoundingClientRect();
+  const root =
+    slider.closest("#captchSlider, .sliderContainer, .captchSliderInner, .captchSliderLayer") ||
+    slider.parentElement;
+  const rootRect = isDomElement(root) ? root.getBoundingClientRect() : null;
+  const maxDistance = rootRect
+    ? Math.max(0, Math.round((rootRect.width - sliderRect.width - 4) * 10) / 10)
+    : Number.POSITIVE_INFINITY;
+  const rawDistance = Number(distance || 0);
+  let finalDistance = Number.isFinite(rawDistance) ? rawDistance : 0;
+  if (maxDistance !== Number.POSITIVE_INFINITY) {
+    finalDistance = Math.min(maxDistance, finalDistance > 0 ? finalDistance : maxDistance);
+  } else if (!(finalDistance > 0)) {
+    finalDistance = SLIDER_CAPTCHA_FALLBACK_DISTANCE;
+  }
+  if (!(finalDistance > 0)) return false;
+
+  const startX = sliderRect.left + sliderRect.width / 2;
+  const startY = sliderRect.top + sliderRect.height / 2 + 1;
+  const dispatchMove = (x, y, buttons = 1) => {
+    doc.dispatchEvent(
+      new view.MouseEvent("mousemove", {
+        clientX: x,
+        clientY: y,
+        bubbles: true,
+        cancelable: true,
+        buttons
+      })
+    );
+  };
+  const dispatchUp = (x, y) => {
+    doc.dispatchEvent(
+      new view.MouseEvent("mouseup", {
+        clientX: x,
+        clientY: y,
+        bubbles: true,
+        cancelable: true
+      })
+    );
+  };
+
+  slider.dispatchEvent(
+    new view.MouseEvent("mousedown", {
+      clientX: startX,
+      clientY: startY,
+      bubbles: true,
+      cancelable: true,
+      buttons: 1
+    })
+  );
+
+  const targetX = startX + finalDistance;
+  const holdMs = 55 + Math.floor(Math.random() * 70);
+  const settleMs = 35 + Math.floor(Math.random() * 55);
+  const durationMs = Math.max(460, Math.min(1100, Math.round(430 + finalDistance * 1.9)));
+  const stepCount = Math.max(30, Math.min(95, Math.round(durationMs / 12)));
+  const overshoot = Math.min(2.6, Math.max(0.8, finalDistance * 0.012));
+  const nearEndX = targetX + overshoot;
+  const easeInOutCubic = (t) =>
+    t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+  let idx = 0;
+  let currentX = startX;
+  const runStep = () => {
+    if (idx >= stepCount) {
+      dispatchMove(nearEndX, startY + (Math.random() * 0.6 - 0.3), 1);
+      view.setTimeout(() => {
+        dispatchMove(targetX, startY + (Math.random() * 0.4 - 0.2), 1);
+        view.setTimeout(() => {
+          dispatchUp(targetX, startY);
+        }, settleMs);
+      }, 26 + Math.floor(Math.random() * 24));
+      return;
+    }
+
+    const t = (idx + 1) / stepCount;
+    const eased = easeInOutCubic(t);
+    const jitter = (Math.random() * 0.8 - 0.4) * (t > 0.85 ? 0.35 : 1);
+    let nextX = startX + (nearEndX - startX) * eased + jitter;
+    if (nextX < currentX + 0.25) nextX = currentX + 0.25;
+    if (nextX > nearEndX) nextX = nearEndX;
+    currentX = nextX;
+    const y = startY + (Math.random() * 0.8 - 0.4) + Math.sin(t * Math.PI) * 0.2;
+    dispatchMove(currentX, y, 1);
+    idx += 1;
+    const delayMs = 8 + Math.floor(Math.random() * 8);
+    view.setTimeout(runStep, delayMs);
+  };
+
+  view.setTimeout(runStep, holdMs);
+  return true;
+}
+
 async function waitLegacyNextTransition(timeoutMs = 8000, intervalMs = 250) {
   const startedAt = Date.now();
   let seenProcessing = false;
@@ -6780,21 +7299,38 @@ async function runLegacyDateStep() {
       // 右侧已显示完整日期时间时，场次列表可能被折叠/异步隐藏，可直接进入下一步。
       bookingState = getLegacyBookingFormState();
     } else {
-    if (Date.now() - state.dateLastDayClickAt > 700 && dayCandidates.length) {
-      const selected = dayCandidates.find((x) => x.selected);
-      let fallback = selected || dayCandidates[0];
-      if (!dayRaw && dayCandidates.length > 1) {
-        const idx = selected ? dayCandidates.findIndex((x) => x.day === selected.day) : -1;
-        if (idx >= 0) {
-          fallback = dayCandidates[(idx + 1) % dayCandidates.length] || fallback;
+      if (dayRaw) {
+        const targetDay = Number(dayRaw);
+        const target = dayCandidates.find((x) => x.day === targetDay);
+        if (target) {
+          if (Date.now() - state.dateLastDayClickAt > 900) {
+            clickLegacyDayCandidate(target);
+            log(`旧版日期页未发现场次，重触发配置日期: ${target.day}`);
+          } else if (Date.now() - state.queueLastLogAt > 1200) {
+            log(`旧版日期页配置日期(${target.day})场次尚未加载，等待下一轮`);
+            state.queueLastLogAt = Date.now();
+          }
+        } else if (Date.now() - state.queueLastLogAt > 1200) {
+          log(`旧版日期页未命中配置日期: ${dayRaw}`);
+          state.queueLastLogAt = Date.now();
         }
+        return;
       }
-      clickLegacyDayCandidate(fallback);
-      log(`旧版日期页未发现场次，重触发日期点击: ${fallback.day}`);
+      if (Date.now() - state.dateLastDayClickAt > 700 && dayCandidates.length) {
+        const selected = dayCandidates.find((x) => x.selected);
+        let fallback = selected || dayCandidates[0];
+        if (!dayRaw && dayCandidates.length > 1) {
+          const idx = selected ? dayCandidates.findIndex((x) => x.day === selected.day) : -1;
+          if (idx >= 0) {
+            fallback = dayCandidates[(idx + 1) % dayCandidates.length] || fallback;
+          }
+        }
+        clickLegacyDayCandidate(fallback);
+        log(`旧版日期页未发现场次，重触发日期点击: ${fallback.day}`);
+        return;
+      }
+      log("旧版日期页当前日期无可选场次，等待下一轮");
       return;
-    }
-    log("旧版日期页当前日期无可选场次，等待下一轮");
-    return;
     }
   }
 
@@ -6844,6 +7380,24 @@ async function runLegacyDateStep() {
       `旧版日期状态检查: PlayDate=${bookingState.playDate || "-"}, PlaySeq=${bookingState.playSeq || "-"}, PlayTime=${bookingState.playTime || "-"}, MyPlayDate=${bookingState.myPlayDate || "-"}`
     );
     state.lastInfoStepAt = Date.now();
+  }
+
+  if (dayRaw) {
+    const targetDay = Number(dayRaw);
+    if (Number.isFinite(targetDay) && targetDay >= 1 && targetDay <= 31) {
+      const activeDay = extractLegacySelectedDayFromBookingState(bookingState);
+      if (Number.isFinite(activeDay) && activeDay !== targetDay) {
+        if (Date.now() - state.queueLastLogAt > 1200) {
+          log(`旧版日期校验未通过: 期望=${targetDay}, 当前=${activeDay}，继续等待`);
+          state.queueLastLogAt = Date.now();
+        }
+        const target = dayCandidates.find((x) => x.day === targetDay);
+        if (target && Date.now() - state.dateLastDayClickAt > 700) {
+          clickLegacyDayCandidate(target);
+        }
+        return;
+      }
+    }
   }
 
   if (!isLegacyNextReady()) {
@@ -7573,7 +8127,7 @@ async function runLegacySeatStep() {
     resetLegacySeatRuntime();
     state.legacySeatFlowKey = flowKey;
   }
-  if (closeAnySeatConfirmPopupIfPresent()) {
+  if (closeAnySeatConfirmPopupIfPresent() || (await closeAnySeatConfirmPopupCrossFrameIfPresent())) {
     await sleep(120);
     return;
   }
@@ -7864,6 +8418,7 @@ async function tick() {
   state.busy = true;
   try {
     await syncNativeDialogAutoConfirm(false);
+    await syncSliderCaptchaDebugHook(false);
     await maybeNotifySale3Minutes();
     if (await maybeAbortScavengeRoundByTimeout()) {
       return;
@@ -7899,6 +8454,10 @@ async function tick() {
         setBadge("请先登录 NOL 账号", false);
         return;
       }
+      if (clickProductBottomSheetCloseAggressive()) {
+        await sleep(state.tickMode === "critical" ? 35 : 90);
+        return;
+      }
       if (shouldHoldOnWorldForScavengeWaiting()) {
         return;
       }
@@ -7906,6 +8465,7 @@ async function tick() {
       await runProductStep();
     } else if (
       host === "tickets.interpark.com" ||
+      host === "ticket.globalinterpark.com" ||
       host === "gpoticket.globalinterpark.com" ||
       isLegacyBookingUrl()
     ) {
@@ -7956,6 +8516,11 @@ function stopLoop(reason = "") {
   chrome.runtime
     .sendMessage({ type: "SET_NATIVE_DIALOG_AUTOCONFIRM_MAIN", enabled: false })
     .catch(() => {});
+  state.sliderCaptchaDebugHookEnabled = false;
+  state.sliderCaptchaDebugHookLastSyncAt = Date.now();
+  chrome.runtime
+    .sendMessage({ type: "SET_SLIDER_CAPTCHA_DEBUG_HOOK_MAIN", enabled: false })
+    .catch(() => {});
 }
 
 async function loadConfig() {
@@ -7966,6 +8531,7 @@ async function loadConfig() {
     enabled: Boolean(config.enabled),
     startedAt: Number(config.startedAt || 0),
     eventUrl: config.eventUrl || "",
+    sliderAutoDragSecretEnabled: config.sliderAutoDragSecretEnabled === true,
     fullFlowEnabled: config.fullFlowEnabled !== false,
     saleStartTime: String(config.saleStartTime || "").trim(),
     preEnterSeconds: normalizePreEnterSeconds(config.preEnterSeconds, 30),
@@ -8034,19 +8600,30 @@ async function loadConfig() {
   state.queueHealth.switching = false;
   state.buyNowCachedEl = null;
   state.firstBuyNowClickAt = 0;
+  state.productNoticeCloseLastClickAt = 0;
+  state.productNoticeCloseLastLogAt = 0;
   state.reserveEntryLastClickAt = 0;
   state.reserveEntryFlowKey = "";
   state.reserveEntryLastPresent = false;
   state.reserveEntryClickedOnce = false;
+  state.reserveEntryTargetLogSig = "";
+  state.reserveEntryTargetLastLogAt = 0;
   state.buyNowNoResponseLastNotifyAt = 0;
   state.lastStage = "unknown";
   state.lastBookingPageVariant = "unknown";
   state.humanVerifyAttempted = false;
   state.humanVerifyAlertActive = false;
   state.humanVerifyLastNotifyAt = 0;
+  state.humanVerifyLocalClickLastAt = 0;
+  state.humanVerifyLocalClickLastLogAt = 0;
   state.sliderCaptchaPaused = false;
   state.sliderCaptchaLastLogAt = 0;
   state.sliderCaptchaLastNotifyAt = 0;
+  state.sliderCaptchaAutoDragLastAt = 0;
+  state.sliderCaptchaAutoDragCount = 0;
+  state.sliderCaptchaTargetDistance = 0;
+  state.sliderCaptchaTargetDistanceAt = 0;
+  state.sliderCaptchaTargetDistanceSource = "";
   state.legacyNextPendingUntil = 0;
   state.legacyNextWaitLogAt = 0;
   state.notifySale3mSent = false;
@@ -8115,6 +8692,7 @@ async function loadConfig() {
   state.captcha.candidateIndex = 0;
   state.captcha.legacyFirstInputDelayDone = false;
   await syncNativeDialogAutoConfirm(true);
+  await syncSliderCaptchaDebugHook(true);
   if (state.config.enabled) {
     if (state.intervalId) {
       clearInterval(state.intervalId);
@@ -8141,11 +8719,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   if (message?.type === "STOP_INPAGE_ALARM") {
     stopInpageTicketAlarm("后台指令");
-    sendResponse({ ok: true });
-    return;
-  }
-  if (message?.type === "START_INPAGE_ALARM") {
-    startInpageTicketAlarm(String(message?.reason || "后台转发"));
     sendResponse({ ok: true });
     return;
   }

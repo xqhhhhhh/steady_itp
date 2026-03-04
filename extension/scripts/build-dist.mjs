@@ -61,17 +61,17 @@ async function collectJsFiles(dir, out = []) {
 async function minifyJsFiles(files) {
   for (const file of files) {
     const code = await fs.readFile(file, "utf8");
-    const result = await minify(code, {
+    const minified = await minify(code, {
       module: false,
       compress: {
-        passes: 1,
+        passes: 2,
         drop_console: false,
         drop_debugger: false
       },
       mangle: {
-        toplevel: false,
-        keep_classnames: true,
-        keep_fnames: true,
+        toplevel: true,
+        keep_classnames: false,
+        keep_fnames: false,
         safari10: true
       },
       format: {
@@ -79,10 +79,11 @@ async function minifyJsFiles(files) {
         ascii_only: true
       }
     });
-    if (!result.code) {
+    if (!minified.code) {
       throw new Error(`Minify failed for ${path.relative(distRoot, file)}`);
     }
-    await fs.writeFile(file, result.code, "utf8");
+
+    await fs.writeFile(file, minified.code, "utf8");
   }
 }
 

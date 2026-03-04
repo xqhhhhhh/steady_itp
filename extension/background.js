@@ -7,8 +7,11 @@ const DING_DEDUP_TTL_MS = 5 * 60 * 1000;
 const ALARM_DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_OCR_API_URL = "https://api.nexuschat.top/ocr-api/ocr/file";
 const DEFAULT_ALARM_API_URL = "http://127.0.0.1:8002";
+const DEFAULT_CLOUDFLARE_CLICK_API_URL = "http://127.0.0.1:8003";
 const OCR_DEVICE_ID_SYNC_KEY = "nolBotOcrDeviceId";
 const OCR_DEVICE_ID_RE = /^[A-Za-z0-9._:-]{8,128}$/;
+const DEBUGGER_PROTOCOL_VERSION = "1.3";
+const nativeDialogDebuggerTabs = new Set();
 
 function normalizeOcrApiUrl(raw, fallback = DEFAULT_OCR_API_URL) {
   const candidate = String(raw || "").trim();
@@ -34,10 +37,87 @@ function isSupportedTicketUrl(rawUrl = "") {
     return (
       host === "world.nol.com" ||
       host === "tickets.interpark.com" ||
+      host === "ticket.globalinterpark.com" ||
       host === "gpoticket.globalinterpark.com"
     );
   } catch (_) {
     return false;
+  }
+}
+
+async function ensureNativeDialogDebugger(tabId) {
+  const id = Number(tabId);
+  if (!Number.isInteger(id) || id <= 0) return { ok: false, error: "invalid_tab_id" };
+  const target = { tabId: id };
+
+  if (nativeDialogDebuggerTabs.has(id)) {
+    try {
+      await chrome.debugger.sendCommand(target, "Page.enable");
+      return { ok: true, attached: true, reused: true };
+    } catch (_) {
+      nativeDialogDebuggerTabs.delete(id);
+    }
+  }
+
+  let attachErr = "";
+  try {
+    await chrome.debugger.attach(target, DEBUGGER_PROTOCOL_VERSION);
+  } catch (err) {
+    attachErr = String(err?.message || err);
+  }
+
+  try {
+    await chrome.debugger.sendCommand(target, "Page.enable");
+    nativeDialogDebuggerTabs.add(id);
+    return { ok: true, attached: !attachErr, reused: Boolean(attachErr), error: attachErr };
+  } catch (err) {
+    const cmdErr = String(err?.message || err);
+    if (!attachErr) {
+      try {
+        await chrome.debugger.detach(target);
+      } catch (_) {}
+    }
+    return { ok: false, error: cmdErr || attachErr || "debugger_attach_failed" };
+  }
+}
+
+async function tryAcceptNativeDialogByDebugger(tabId) {
+  const id = Number(tabId);
+  if (!Number.isInteger(id) || id <= 0) return { ok: false, error: "invalid_tab_id" };
+  try {
+    await chrome.debugger.sendCommand(
+      { tabId: id },
+      "Page.handleJavaScriptDialog",
+      { accept: true, promptText: "" }
+    );
+    return { ok: true, accepted: true };
+  } catch (err) {
+    const msg = String(err?.message || err);
+    if (
+      /no dialog is showing|no dialog to handle|javascript dialog is not open|not open|cannot find context/i.test(
+        msg
+      )
+    ) {
+      return { ok: true, accepted: false };
+    }
+    return { ok: false, error: msg };
+  }
+}
+
+async function detachNativeDialogDebugger(tabId) {
+  const id = Number(tabId);
+  if (!Number.isInteger(id) || id <= 0) return;
+  const target = { tabId: id };
+  try {
+    await chrome.debugger.detach(target);
+  } catch (_) {}
+  nativeDialogDebuggerTabs.delete(id);
+}
+
+async function detachAllNativeDialogDebuggers() {
+  const ids = Array.from(nativeDialogDebuggerTabs);
+  for (const tabId of ids) {
+    await detachNativeDialogDebugger(tabId);
   }
 }
 
@@ -69,6 +149,10 @@ async function saveConfig(config) {
         config?.reserveClickStartMode,
         "edge_once"
       ),
+      sliderAutoDragSecretEnabled:
+        typeof config?.sliderAutoDragSecretEnabled === "boolean"
+          ? config.sliderAutoDragSecretEnabled
+          : current?.sliderAutoDragSecretEnabled === true,
       scavengeLoopEnabled: config?.scavengeLoopEnabled === true,
       scavengeLoopIntervalSec: normalizeScavengeLoopIntervalSec(
         config?.scavengeLoopIntervalSec,
@@ -107,6 +191,9 @@ async function saveConfig(config) {
       vpnAutoSwitchEnabled: config?.vpnAutoSwitchEnabled !== false,
       queueVpnNotifyEnabled: config?.queueVpnNotifyEnabled !== false,
       alarmApiUrl: String(current?.alarmApiUrl || current?.callApiUrl || DEFAULT_ALARM_API_URL).trim(),
+      cloudflareClickApiUrl: String(
+        current?.cloudflareClickApiUrl || DEFAULT_CLOUDFLARE_CLICK_API_URL
+      ).trim(),
       dingTalkWebhookUrl: String(config?.dingTalkWebhookUrl || "").trim(),
       dingTalkSecret: String(config?.dingTalkSecret || "").trim(),
       enabled: true,
@@ -154,6 +241,10 @@ async function saveConfigOnly(config) {
         config?.reserveClickStartMode,
         current.reserveClickStartMode || "edge_once"
       ),
+      sliderAutoDragSecretEnabled:
+        typeof config?.sliderAutoDragSecretEnabled === "boolean"
+          ? config.sliderAutoDragSecretEnabled
+          : current.sliderAutoDragSecretEnabled === true,
       scavengeLoopEnabled:
         typeof config?.scavengeLoopEnabled === "boolean"
           ? config.scavengeLoopEnabled
@@ -227,6 +318,9 @@ async function saveConfigOnly(config) {
       alarmApiUrl: String(
         current?.alarmApiUrl || current?.callApiUrl || DEFAULT_ALARM_API_URL
       ).trim(),
+      cloudflareClickApiUrl: String(
+        current?.cloudflareClickApiUrl || DEFAULT_CLOUDFLARE_CLICK_API_URL
+      ).trim(),
       dingTalkWebhookUrl: String(
         config?.dingTalkWebhookUrl || current.dingTalkWebhookUrl || ""
       ).trim(),
@@ -246,6 +340,7 @@ async function disableConfig() {
       stoppedAt: Date.now()
     }
   });
+  await detachAllNativeDialogDebuggers();
 }
 
 async function pingActiveTabBot() {
@@ -641,6 +736,25 @@ async function requestVpnApi(baseUrl, path, payload = {}) {
   });
   if (!resp.ok) throw new Error(`VPN API HTTP ${resp.status}`);
   return await resp.json();
+}
+
+async function requestLocalApi(baseUrl, path, payload = {}, timeoutMs = 1800) {
+  const base = String(baseUrl || "").trim() || "http://127.0.0.1:8003";
+  const url = new URL(path, base.endsWith("/") ? base : `${base}/`).toString();
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(new Error("local_api_timeout")), Math.max(300, timeoutMs));
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload || {}),
+      signal: ctl.signal
+    });
+    if (!resp.ok) throw new Error(`LOCAL API HTTP ${resp.status}`);
+    return await resp.json();
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function u8ToBase64(u8) {
@@ -1355,7 +1469,11 @@ async function runLegacySelectSeatInMainWorld(tabId, frameId, payload = {}) {
 async function setNativeDialogAutoConfirmInMainWorld(tabId, frameId, enabled = false) {
   if (!tabId) return { ok: false, error: "no_tab_id" };
   try {
-    const target = Number.isInteger(frameId) ? { tabId, frameIds: [frameId] } : { tabId };
+    if (enabled) {
+      await ensureNativeDialogDebugger(tabId).catch(() => ({}));
+      await tryAcceptNativeDialogByDebugger(tabId).catch(() => ({}));
+    }
+    const target = { tabId, allFrames: true };
     const results = await chrome.scripting.executeScript({
       target,
       world: "MAIN",
@@ -1364,6 +1482,8 @@ async function setNativeDialogAutoConfirmInMainWorld(tabId, frameId, enabled = f
           ok: true,
           enabled: Boolean(flag),
           patched: false,
+          seatIframeGuardEnabled: false,
+          seatIframeGuardStarted: false,
           frameHref: String(location.href || ""),
           error: ""
         };
@@ -1396,6 +1516,131 @@ async function setNativeDialogAutoConfirmInMainWorld(tabId, frameId, enabled = f
           }
           w.__nolNativeDialogAutoConfirmEnabled = Boolean(flag);
           out.enabled = Boolean(w.__nolNativeDialogAutoConfirmEnabled);
+
+          const isTop = (() => {
+            try {
+              return w.top === w;
+            } catch (_) {
+              return false;
+            }
+          })();
+
+          // Top-frame guard for legacy #ifrmSeat dialogs:
+          // 1) override iframe confirm/alert directly in iframe window context
+          // 2) poll iframe DOM and click confirm-like buttons as fallback
+          if (isTop) {
+            const normalizeText = (text) => String(text || "").replace(/\s+/g, " ").trim().toLowerCase();
+            const isVisible = (el) => {
+              if (!el || el.nodeType !== 1) return false;
+              try {
+                const style = (el.ownerDocument?.defaultView || w).getComputedStyle(el);
+                if (style.display === "none" || style.visibility === "hidden") return false;
+                if (Number(style.opacity || 1) <= 0.01) return false;
+              } catch (_) {}
+              const rect = el.getBoundingClientRect();
+              return rect.width >= 2 && rect.height >= 2;
+            };
+            const triggerClick = (el) => {
+              if (!el) return false;
+              try {
+                el.focus?.();
+              } catch (_) {}
+              try {
+                el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+                el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+                el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+              } catch (_) {}
+              try {
+                if (typeof el.click === "function") el.click();
+              } catch (_) {}
+              return true;
+            };
+            const okWords = [
+              "确定",
+              "确认",
+              "ok",
+              "yes",
+              "예",
+              "확인",
+              "login info"
+            ].map(normalizeText);
+            const cancelWords = ["取消", "cancel", "close", "아니오", "no", "취소"].map(normalizeText);
+
+            const runSeatIframeDialogGuardOnIframe = (seatIframe) => {
+              if (!seatIframe) return false;
+              let iframeWin = null;
+              let iframeDoc = null;
+              try {
+                iframeWin = seatIframe.contentWindow;
+                iframeDoc = iframeWin?.document || null;
+              } catch (_) {
+                return false;
+              }
+              if (!iframeWin || !iframeDoc) return false;
+
+              if (!iframeWin.__nolSeatDialogNativePatched) {
+                const origConfirm =
+                  typeof iframeWin.confirm === "function" ? iframeWin.confirm.bind(iframeWin) : null;
+                const origAlert =
+                  typeof iframeWin.alert === "function" ? iframeWin.alert.bind(iframeWin) : null;
+                iframeWin.confirm = function (...args) {
+                  if (w.__nolSeatIframeDialogGuardEnabled || w.__nolNativeDialogAutoConfirmEnabled) {
+                    return true;
+                  }
+                  if (typeof origConfirm === "function") return origConfirm(...args);
+                  return true;
+                };
+                iframeWin.alert = function (...args) {
+                  if (w.__nolSeatIframeDialogGuardEnabled || w.__nolNativeDialogAutoConfirmEnabled) {
+                    return;
+                  }
+                  if (typeof origAlert === "function") return origAlert(...args);
+                };
+                iframeWin.__nolSeatDialogNativePatched = true;
+              }
+
+              const nodes = Array.from(
+                iframeDoc.querySelectorAll(
+                  "button, input[type='button'], input[type='submit'], a, [role='button']"
+                )
+              ).filter(isVisible);
+              const target = nodes.find((el) => {
+                const text = normalizeText(el.textContent || el.value || el.getAttribute("aria-label") || "");
+                if (!text) return false;
+                if (cancelWords.some((w2) => text.includes(w2))) return false;
+                return okWords.some((w2) => text.includes(w2));
+              });
+              if (!target) return false;
+              triggerClick(target);
+              return true;
+            };
+
+            const runSeatIframeDialogGuard = () => {
+              if (!w.__nolSeatIframeDialogGuardEnabled) return;
+              const seatIframe = document.querySelector("#ifrmSeat");
+              if (runSeatIframeDialogGuardOnIframe(seatIframe)) return;
+              const allIframes = Array.from(document.querySelectorAll("iframe"));
+              for (const iframe of allIframes) {
+                if (seatIframe && iframe === seatIframe) continue;
+                if (runSeatIframeDialogGuardOnIframe(iframe)) break;
+              }
+            };
+
+            w.__nolSeatIframeDialogGuardEnabled = Boolean(flag);
+            out.seatIframeGuardEnabled = Boolean(w.__nolSeatIframeDialogGuardEnabled);
+            if (w.__nolSeatIframeDialogGuardEnabled) {
+              if (!w.__nolSeatIframeDialogGuardTimer) {
+                w.__nolSeatIframeDialogGuardTimer = w.setInterval(runSeatIframeDialogGuard, 120);
+                out.seatIframeGuardStarted = true;
+              }
+              runSeatIframeDialogGuard();
+            } else if (w.__nolSeatIframeDialogGuardTimer) {
+              try {
+                w.clearInterval(w.__nolSeatIframeDialogGuardTimer);
+              } catch (_) {}
+              w.__nolSeatIframeDialogGuardTimer = 0;
+            }
+          }
         } catch (err) {
           out.ok = false;
           out.error = String(err?.message || err);
@@ -1404,7 +1649,523 @@ async function setNativeDialogAutoConfirmInMainWorld(tabId, frameId, enabled = f
       },
       args: [Boolean(enabled)]
     });
-    return results?.[0]?.result || { ok: false, error: "no_result" };
+    const mapped = Array.isArray(results) ? results.map((x) => x?.result || {}) : [];
+    if (!mapped.length) return { ok: false, error: "no_result" };
+    const firstErr = mapped.find((x) => x?.ok === false);
+    return {
+      ok: !firstErr,
+      enabled: Boolean(enabled),
+      frameCount: mapped.length,
+      patchedCount: mapped.filter((x) => x?.patched).length,
+      seatIframeGuardStarted: mapped.filter((x) => x?.seatIframeGuardStarted).length,
+      error: firstErr?.error ? String(firstErr.error) : ""
+    };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+}
+
+async function clickConfirmDialogInMainWorld(tabId) {
+  if (!tabId) return { ok: false, error: "no_tab_id" };
+  try {
+    const target = { tabId, allFrames: true };
+    const results = await chrome.scripting.executeScript({
+      target,
+      world: "MAIN",
+      func: () => {
+        const out = {
+          ok: true,
+          clicked: false,
+          frameHref: String(location.href || ""),
+          reason: "",
+          error: ""
+        };
+        try {
+          const normalizeText = (text) => String(text || "").replace(/\s+/g, " ").trim().toLowerCase();
+          const visible = (el) => {
+            if (!el || el.nodeType !== 1) return false;
+            const style = (el.ownerDocument?.defaultView || window).getComputedStyle(el);
+            if (style.display === "none" || style.visibility === "hidden") return false;
+            if (Number(style.opacity || 1) <= 0.01) return false;
+            if (el.getAttribute("aria-hidden") === "true") return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width >= 2 && rect.height >= 2;
+          };
+          const triggerClick = (el) => {
+            if (!el || typeof el.dispatchEvent !== "function") return false;
+            try {
+              el.focus?.();
+            } catch (_) {}
+            const events = ["pointerdown", "mousedown", "pointerup", "mouseup", "click"];
+            for (const type of events) {
+              try {
+                el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true }));
+              } catch (_) {}
+            }
+            try {
+              if (typeof el.click === "function") el.click();
+            } catch (_) {}
+            return true;
+          };
+
+          const okWords = [
+            "確認",
+            "确认",
+            "确定",
+            "ok",
+            "confirm",
+            "yes",
+            "동의",
+            "네",
+            "확인",
+            "다음"
+          ].map(normalizeText);
+          const cancelWords = [
+            "取消",
+            "취소",
+            "cancel",
+            "close",
+            "關閉",
+            "关闭",
+            "닫기",
+            "아니오",
+            "no"
+          ].map(normalizeText);
+
+          const scoreButton = (el, scopeRect) => {
+            if (!visible(el)) return null;
+            const text = normalizeText(el.textContent || el.innerText || el.getAttribute("aria-label") || "");
+            if (!text || !okWords.some((w) => text.includes(w))) return null;
+            if (cancelWords.some((w) => text.includes(w))) return null;
+            if (el.disabled || el.getAttribute("aria-disabled") === "true") return null;
+            const cls = normalizeText(el.className?.toString() || "");
+            const rect = el.getBoundingClientRect();
+            let score = 0;
+            if (rect.left > scopeRect.left + scopeRect.width * 0.48) score += 4;
+            if (rect.top > scopeRect.top + scopeRect.height * 0.56) score += 4;
+            if (cls.includes("primary") || cls.includes("confirm") || cls.includes("ok")) score += 3;
+            if (rect.width >= 56 && rect.height >= 24) score += 1;
+            return { el, score };
+          };
+
+          const pickConfirmButton = (scopeEl, scopeRect) => {
+            const scope = scopeEl && scopeEl.nodeType === 1 ? scopeEl : document;
+            const nodes = Array.from(
+              scope.querySelectorAll("button, [role='button'], a, input[type='button'], input[type='submit'], div, span")
+            );
+            const scored = nodes
+              .map((el) => scoreButton(el, scopeRect))
+              .filter(Boolean)
+              .sort((a, b) => b.score - a.score);
+            return scored[0]?.el || null;
+          };
+
+          const dialogSelectors = [
+            "[role='dialog']",
+            ".alertNotice",
+            ".capchaLayer",
+            "div[class*='alert']",
+            "div[class*='modal']",
+            "div[class*='popup']",
+            "div[class*='layer']"
+          ];
+          const dialogs = Array.from(document.querySelectorAll(dialogSelectors.join(",")))
+            .filter(visible)
+            .map((el) => {
+              const rect = el.getBoundingClientRect();
+              let z = 0;
+              try {
+                z = Number.parseInt((el.ownerDocument?.defaultView || window).getComputedStyle(el).zIndex, 10);
+              } catch (_) {}
+              if (!Number.isFinite(z)) z = 0;
+              return { el, rect, z, area: rect.width * rect.height };
+            })
+            .sort((a, b) => b.z - a.z || b.area - a.area);
+
+          for (const dialog of dialogs) {
+            const btn = pickConfirmButton(dialog.el, dialog.rect);
+            if (btn && triggerClick(btn)) {
+              out.clicked = true;
+              out.reason = "dialog";
+              return out;
+            }
+          }
+
+          const viewport = {
+            left: 0,
+            top: 0,
+            width: window.innerWidth || 1280,
+            height: window.innerHeight || 720
+          };
+          const fallbackBtn = pickConfirmButton(document, viewport);
+          if (fallbackBtn && triggerClick(fallbackBtn)) {
+            out.clicked = true;
+            out.reason = "global";
+            return out;
+          }
+        } catch (err) {
+          out.ok = false;
+          out.error = String(err?.message || err);
+        }
+        return out;
+      }
+    });
+    const mapped = Array.isArray(results) ? results.map((x) => x?.result || {}) : [];
+    if (!mapped.length) return { ok: false, error: "no_result" };
+    const firstErr = mapped.find((x) => x?.ok === false);
+    const clickedRows = mapped.filter((x) => x?.clicked);
+    return {
+      ok: !firstErr,
+      clicked: clickedRows.length > 0,
+      frameCount: mapped.length,
+      clickedCount: clickedRows.length,
+      clickedFrameHref: String(clickedRows[0]?.frameHref || ""),
+      reason: String(clickedRows[0]?.reason || ""),
+      error: firstErr?.error ? String(firstErr.error) : ""
+    };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+}
+
+function parseHostFromUrl(url) {
+  try {
+    return String(new URL(String(url || "")).host || "").toLowerCase();
+  } catch (_) {
+    return "";
+  }
+}
+
+function isLikelyBookingHost(host) {
+  const h = String(host || "").toLowerCase();
+  return (
+    h.includes("interpark.com") ||
+    h.includes("globalinterpark.com") ||
+    h.includes("world.nol.com") ||
+    h.includes("eximbay.com")
+  );
+}
+
+function isAboutBlankUrl(rawUrl = "") {
+  const u = String(rawUrl || "").trim().toLowerCase();
+  return !u || u === "about:blank" || u.startsWith("about:blank#");
+}
+
+function shouldAutoAttachDebuggerForTab(tab) {
+  const tabId = Number(tab?.id);
+  if (!Number.isInteger(tabId) || tabId <= 0) return false;
+  if (nativeDialogDebuggerTabs.has(tabId)) return true;
+
+  const openerId = Number(tab?.openerTabId);
+  if (Number.isInteger(openerId) && nativeDialogDebuggerTabs.has(openerId)) return true;
+
+  const host = parseHostFromUrl(tab?.url || "");
+  if (isLikelyBookingHost(host)) return true;
+
+  if (Number.isInteger(openerId) && isAboutBlankUrl(tab?.url || "")) return true;
+  return false;
+}
+
+async function maybeAutoAttachNativeDialogDebuggerForTab(tab) {
+  const tabId = Number(tab?.id);
+  if (!Number.isInteger(tabId) || tabId <= 0) return { ok: false, error: "invalid_tab_id" };
+
+  let cfg = {};
+  try {
+    cfg = await getConfig();
+  } catch (_) {}
+  if (!cfg?.enabled) return { ok: false, skipped: true, reason: "bot_disabled" };
+  if (!shouldAutoAttachDebuggerForTab(tab)) return { ok: false, skipped: true, reason: "tab_not_related" };
+
+  const attached = await ensureNativeDialogDebugger(tabId);
+  await tryAcceptNativeDialogByDebugger(tabId).catch(() => ({}));
+  return attached;
+}
+
+async function primeNativeDialogDebuggersForEnabledTabs() {
+  let cfg = {};
+  try {
+    cfg = await getConfig();
+  } catch (_) {}
+  if (!cfg?.enabled) return { ok: false, skipped: true, reason: "bot_disabled" };
+
+  const allTabs = await chrome.tabs.query({});
+  let attachedCount = 0;
+  for (const tab of allTabs || []) {
+    if (!shouldAutoAttachDebuggerForTab(tab)) continue;
+    const res = await ensureNativeDialogDebugger(tab?.id);
+    if (res?.ok) attachedCount += 1;
+    await tryAcceptNativeDialogByDebugger(tab?.id).catch(() => ({}));
+  }
+  return { ok: true, attachedCount };
+}
+
+async function collectRelatedDialogSweepTabIds(originTabId) {
+  const ids = new Set();
+  const addId = (id) => {
+    if (Number.isInteger(id) && id > 0) ids.add(id);
+  };
+
+  let originTab = null;
+  try {
+    originTab = await chrome.tabs.get(originTabId);
+  } catch (_) {}
+  if (originTab?.id) addId(originTab.id);
+
+  if (Number.isInteger(originTab?.windowId)) {
+    try {
+      const sameWindowTabs = await chrome.tabs.query({ windowId: originTab.windowId });
+      for (const tab of sameWindowTabs || []) addId(tab?.id);
+    } catch (_) {}
+  }
+
+  let allTabs = [];
+  try {
+    allTabs = await chrome.tabs.query({});
+  } catch (_) {}
+  const relatedOpenerIds = new Set([originTabId]);
+  for (let i = 0; i < 3; i += 1) {
+    let expanded = false;
+    for (const tab of allTabs) {
+      const openerId = Number(tab?.openerTabId);
+      const tabId = Number(tab?.id);
+      if (!Number.isInteger(tabId) || tabId <= 0) continue;
+      if (relatedOpenerIds.has(openerId) && !relatedOpenerIds.has(tabId)) {
+        relatedOpenerIds.add(tabId);
+        expanded = true;
+      }
+    }
+    if (!expanded) break;
+  }
+  for (const id of relatedOpenerIds) addId(id);
+
+  for (const tab of allTabs) {
+    const tabId = Number(tab?.id);
+    if (!Number.isInteger(tabId) || tabId <= 0) continue;
+    const host = parseHostFromUrl(tab?.url || "");
+    if (isLikelyBookingHost(host)) addId(tabId);
+  }
+
+  return Array.from(ids);
+}
+
+async function sweepConfirmDialogsAroundOriginTab(originTabId) {
+  if (!Number.isInteger(originTabId) || originTabId <= 0) {
+    return { ok: false, error: "no_origin_tab_id" };
+  }
+  try {
+    const tabIds = await collectRelatedDialogSweepTabIds(originTabId);
+    if (!tabIds.length) {
+      return { ok: false, error: "no_related_tabs" };
+    }
+
+    let patchedTabs = 0;
+    let clickedTabs = 0;
+    let lastClickedHref = "";
+    for (const tabId of tabIds) {
+      await ensureNativeDialogDebugger(tabId).catch(() => ({}));
+      await tryAcceptNativeDialogByDebugger(tabId).catch(() => ({}));
+      try {
+        const patchRes = await setNativeDialogAutoConfirmInMainWorld(tabId, undefined, true);
+        if (patchRes?.ok) patchedTabs += 1;
+      } catch (_) {}
+      try {
+        const clickRes = await clickConfirmDialogInMainWorld(tabId);
+        if (clickRes?.ok && clickRes?.clicked) {
+          clickedTabs += 1;
+          if (!lastClickedHref) lastClickedHref = String(clickRes?.clickedFrameHref || "");
+        }
+      } catch (_) {}
+    }
+
+    return {
+      ok: true,
+      scannedTabs: tabIds.length,
+      patchedTabs,
+      clickedTabs,
+      clicked: clickedTabs > 0,
+      clickedFrameHref: lastClickedHref
+    };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+}
+
+async function setSliderCaptchaDebugHookInMainWorld(tabId, enabled = false) {
+  if (!tabId) return { ok: false, error: "no_tab_id" };
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: "MAIN",
+      func: (flag) => {
+        const out = {
+          ok: true,
+          enabled: Boolean(flag),
+          patched: false,
+          frameHref: String(location.href || ""),
+          error: ""
+        };
+        try {
+          const w = window;
+          const EVENT_NAME = "__NOL_SLIDER_CAPTCHA_DEBUG";
+          const emit = (detail = {}) => {
+            const payload = {
+              ...detail,
+              __nolTag: "slider_debug",
+              href: String(location.href || ""),
+              ts: Date.now()
+            };
+            try {
+              w.dispatchEvent(new CustomEvent(EVENT_NAME, { detail: payload }));
+            } catch (_) {}
+            try {
+              (w.top || w).postMessage({ __NOL_SLIDER_CAPTCHA_DEBUG: payload }, "*");
+            } catch (_) {}
+          };
+
+          const patchConstructor = (Ctor) => {
+            if (!Ctor || !Ctor.prototype) return false;
+            if (Ctor.__nolSliderCaptchaDebugPatched) return false;
+
+            const proto = Ctor.prototype;
+            const oldInitImg = typeof proto.initImg === "function" ? proto.initImg : null;
+            const oldVerify = typeof proto.verify === "function" ? proto.verify : null;
+            const oldReset = typeof proto.reset === "function" ? proto.reset : null;
+
+            if (oldInitImg) {
+              proto.initImg = function (...args) {
+                const ret = oldInitImg.apply(this, args);
+                try {
+                  const img = this.img;
+                  if (img && typeof img.setSrc === "function" && !img.__nolDbgSetSrcWrapped) {
+                    const oldSetSrc = img.setSrc;
+                    img.setSrc = function (...setArgs) {
+                      const setRet = oldSetSrc.apply(this, setArgs);
+                      try {
+                        const ref = this;
+                        w.setTimeout(() => {
+                          emit({
+                            phase: "set_src",
+                            src: String(ref.currentSrc || ref.src || "")
+                          });
+                        }, 0);
+                      } catch (_) {}
+                      return setRet;
+                    };
+                    img.__nolDbgSetSrcWrapped = true;
+                  }
+                  if (img && typeof img.onload === "function" && !img.__nolDbgOnloadWrapped) {
+                    const oldOnload = img.onload;
+                    const self = this;
+                    img.onload = function (...onloadArgs) {
+                      const onloadRet = oldOnload.apply(this, onloadArgs);
+                      const x = Number(self.x || 0);
+                      const width = Number(self.options?.width || 0);
+                      const blockTargetLeft = x - 3;
+                      const sliderTargetDistance =
+                        Number.isFinite(width) && width > 80
+                          ? (blockTargetLeft * (width - 40)) / (width - 60)
+                          : null;
+                      emit({
+                        phase: "x_generated",
+                        x,
+                        y: Number(self.y || 0),
+                        offset: Number(self.options?.offset || 0),
+                        width,
+                        blockTargetLeft,
+                        sliderTargetDistance,
+                        src: String(img.currentSrc || img.src || "")
+                      });
+                      return onloadRet;
+                    };
+                    img.__nolDbgOnloadWrapped = true;
+                  }
+                } catch (err) {
+                  emit({
+                    phase: "hook_error",
+                    msg: String(err?.message || err)
+                  });
+                }
+                return ret;
+              };
+            }
+
+            if (oldVerify) {
+              proto.verify = function (...args) {
+                try {
+                  const x = Number(this.x || 0);
+                  const offset = Number(this.options?.offset || 0);
+                  const blockLeft = Number.parseInt(String(this.block?.style?.left || "0"), 10) || 0;
+                  const sliderLeft = Number.parseInt(String(this.slider?.style?.left || "0"), 10) || 0;
+                  const trailLen = Array.isArray(this.trail) ? this.trail.length : 0;
+                  emit({
+                    phase: "verify",
+                    x,
+                    offset,
+                    blockLeft,
+                    sliderLeft,
+                    sliderMovedDistance: sliderLeft + 1,
+                    delta: blockLeft + 3 - x,
+                    trailLen
+                  });
+                } catch (_) {}
+                return oldVerify.apply(this, args);
+              };
+            }
+
+            if (oldReset) {
+              proto.reset = function (...args) {
+                const resetRet = oldReset.apply(this, args);
+                emit({ phase: "reset" });
+                return resetRet;
+              };
+            }
+
+            Ctor.__nolSliderCaptchaDebugPatched = true;
+            emit({ phase: "hook_ready" });
+            return true;
+          };
+
+          if (!w.__nolSliderCaptchaDebugTimer) {
+            w.__nolSliderCaptchaDebugTimer = w.setInterval(() => {
+              if (!w.__nolSliderCaptchaDebugEnabled) return;
+              try {
+                const ctor = w.sliderCaptcha?.Constructor;
+                if (ctor) patchConstructor(ctor);
+              } catch (_) {}
+            }, 500);
+          }
+
+          w.__nolSliderCaptchaDebugEnabled = Boolean(flag);
+          out.enabled = Boolean(w.__nolSliderCaptchaDebugEnabled);
+          const ctor = w.sliderCaptcha?.Constructor;
+          if (ctor) {
+            out.patched = Boolean(
+              patchConstructor(ctor) || ctor.__nolSliderCaptchaDebugPatched
+            );
+          }
+          emit({ phase: "hook_toggle", enabled: out.enabled, patched: out.patched });
+        } catch (err) {
+          out.ok = false;
+          out.error = String(err?.message || err);
+        }
+        return out;
+      },
+      args: [Boolean(enabled)]
+    });
+    const rows = Array.isArray(results) ? results : [];
+    const mapped = rows
+      .map((row) => row?.result)
+      .filter(Boolean);
+    if (!mapped.length) return { ok: false, error: "no_result" };
+    const anyOk = mapped.some((x) => x.ok);
+    return {
+      ok: anyOk,
+      enabled: Boolean(enabled),
+      frames: mapped.length,
+      patchedFrames: mapped.filter((x) => x.patched).length,
+      results: mapped
+    };
   } catch (err) {
     return { ok: false, error: String(err?.message || err) };
   }
@@ -1438,6 +2199,7 @@ chrome.runtime.onInstalled.addListener(async () => {
         reserveClickIntervalMs: 65,
         reserveClickBurstCount: 1,
         reserveClickStartMode: "edge_once",
+        sliderAutoDragSecretEnabled: false,
         scavengeLoopEnabled: false,
         scavengeLoopIntervalSec: 600,
         scavengeRoundMaxSec: 0,
@@ -1455,6 +2217,7 @@ chrome.runtime.onInstalled.addListener(async () => {
         vpnAutoSwitchEnabled: true,
         queueVpnNotifyEnabled: true,
         alarmApiUrl: DEFAULT_ALARM_API_URL,
+        cloudflareClickApiUrl: DEFAULT_CLOUDFLARE_CLICK_API_URL,
         dingTalkWebhookUrl: "",
         dingTalkSecret: ""
       }
@@ -1468,17 +2231,22 @@ chrome.runtime.onInstalled.addListener(async () => {
   const normalizedAlarmApiUrl = String(
     current?.alarmApiUrl || current?.callApiUrl || DEFAULT_ALARM_API_URL
   ).trim();
+  const normalizedCloudflareClickApiUrl = String(
+    current?.cloudflareClickApiUrl || DEFAULT_CLOUDFLARE_CLICK_API_URL
+  ).trim();
   if (
     String(current?.ocrApiUrl || "").trim() !== normalizedOcrApiUrl ||
     String(current?.ocrDeviceId || "").trim() !== normalizedOcrDeviceId ||
-    String(current?.alarmApiUrl || current?.callApiUrl || "").trim() !== normalizedAlarmApiUrl
+    String(current?.alarmApiUrl || current?.callApiUrl || "").trim() !== normalizedAlarmApiUrl ||
+    String(current?.cloudflareClickApiUrl || "").trim() !== normalizedCloudflareClickApiUrl
   ) {
     await chrome.storage.local.set({
       [STORAGE_KEY]: {
         ...current,
         ocrApiUrl: normalizedOcrApiUrl,
         ocrDeviceId: normalizedOcrDeviceId,
-        alarmApiUrl: normalizedAlarmApiUrl
+        alarmApiUrl: normalizedAlarmApiUrl,
+        cloudflareClickApiUrl: normalizedCloudflareClickApiUrl
       }
     });
   }
@@ -1525,11 +2293,52 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
 });
 
+chrome.tabs.onRemoved.addListener((tabId) => {
+  nativeDialogDebuggerTabs.delete(Number(tabId));
+});
+
+chrome.debugger.onDetach.addListener((source) => {
+  const tabId = Number(source?.tabId);
+  if (!Number.isInteger(tabId) || tabId <= 0) return;
+  nativeDialogDebuggerTabs.delete(tabId);
+});
+
+chrome.debugger.onEvent.addListener(async (source, method, params) => {
+  if (method !== "Page.javascriptDialogOpening") return;
+  const tabId = Number(source?.tabId);
+  if (!Number.isInteger(tabId) || tabId <= 0) return;
+  if (!nativeDialogDebuggerTabs.has(tabId)) return;
+  try {
+    await chrome.debugger.sendCommand(
+      { tabId },
+      "Page.handleJavaScriptDialog",
+      {
+        accept: true,
+        promptText: String(params?.defaultPrompt ?? "")
+      }
+    );
+    await chrome.storage.local.set({
+      nolBotLastLog: {
+        text: `已通过Debugger自动确认原生弹窗: ${String(params?.type || "unknown")}`,
+        ts: Date.now()
+      }
+    });
+  } catch (err) {
+    await chrome.storage.local.set({
+      nolBotLastLog: {
+        text: `Debugger处理原生弹窗失败: ${String(err?.message || err)}`,
+        ts: Date.now()
+      }
+    });
+  }
+});
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   (async () => {
     if (message?.type === "START_BOT") {
       const config = message.config || {};
       await broadcastStopInpageAlarm().catch(() => {});
+      await detachAllNativeDialogDebuggers().catch(() => {});
       await saveConfig(config);
       const saved = await getConfig();
       const scheduleResult = await schedulePreEnterAlarmIfNeeded(saved);
@@ -1563,30 +2372,23 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return;
     }
 
+    if (message?.type === "SET_SECRET_FEATURE_FLAGS") {
+      const flags = message.flags && typeof message.flags === "object" ? message.flags : {};
+      const current = await getConfig();
+      const next = {
+        ...current,
+        sliderAutoDragSecretEnabled: flags.sliderAutoDragSecretEnabled === true,
+        savedAt: Date.now()
+      };
+      await chrome.storage.local.set({ [STORAGE_KEY]: next });
+      sendResponse({ ok: true, config: next });
+      return;
+    }
+
     if (message?.type === "STOP_BOT") {
       await disableConfig();
       await clearPreEnterAlarm();
       await broadcastStopInpageAlarm().catch(() => {});
-      sendResponse({ ok: true });
-      return;
-    }
-
-    if (message?.type === "START_INPAGE_ALARM_FROM_FRAME") {
-      const tabId = _sender?.tab?.id;
-      if (!tabId) {
-        sendResponse({ ok: false, error: "NO_TAB" });
-        return;
-      }
-      await chrome.tabs
-        .sendMessage(
-          tabId,
-          {
-            type: "START_INPAGE_ALARM",
-            reason: String(message?.reason || "iframe转发")
-          },
-          { frameId: 0 }
-        )
-        .catch(() => null);
       sendResponse({ ok: true });
       return;
     }
@@ -1602,7 +2404,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         ok: true,
         config: cfg,
         lastLog: all.nolBotLastLog || null,
-        contentReady: all.nolBotContentReady || null
+        contentReady: all.nolBotContentReady || null,
+        nativeDialogDebugger: {
+          attachedTabCount: nativeDialogDebuggerTabs.size,
+          attachedTabs: Array.from(nativeDialogDebuggerTabs)
+        }
       });
       return;
     }
@@ -1731,9 +2537,37 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === "SET_NATIVE_DIALOG_AUTOCONFIRM_MAIN") {
       const tabId = _sender?.tab?.id;
       const frameId = _sender?.frameId;
+      const enabled = message?.enabled === true;
       const result = await setNativeDialogAutoConfirmInMainWorld(
         tabId,
         Number.isInteger(frameId) ? frameId : undefined,
+        enabled
+      );
+      if (!enabled && Number.isInteger(Number(tabId)) && Number(tabId) > 0) {
+        await detachNativeDialogDebugger(tabId).catch(() => {});
+      }
+      sendResponse({ ok: Boolean(result?.ok), result });
+      return;
+    }
+
+    if (message?.type === "CLICK_CONFIRM_DIALOG_MAIN") {
+      const tabId = _sender?.tab?.id;
+      const result = await clickConfirmDialogInMainWorld(tabId);
+      sendResponse({ ok: Boolean(result?.ok), result });
+      return;
+    }
+
+    if (message?.type === "SWEEP_CONFIRM_DIALOGS_GLOBAL") {
+      const originTabId = _sender?.tab?.id;
+      const result = await sweepConfirmDialogsAroundOriginTab(originTabId);
+      sendResponse({ ok: Boolean(result?.ok), result });
+      return;
+    }
+
+    if (message?.type === "SET_SLIDER_CAPTCHA_DEBUG_HOOK_MAIN") {
+      const tabId = _sender?.tab?.id;
+      const result = await setSliderCaptchaDebugHookInMainWorld(
+        tabId,
         message?.enabled === true
       );
       sendResponse({ ok: Boolean(result?.ok), result });
@@ -1895,6 +2729,46 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           }
         });
         sendResponse({ ok: true, sent: false, skipped: "service_unavailable", error: msg });
+      }
+      return;
+    }
+
+    if (message?.type === "LOCAL_CLOUDFLARE_CLICK") {
+      try {
+        const cfg = await getConfig();
+        const apiUrl = String(
+          message?.apiUrl || cfg?.cloudflareClickApiUrl || DEFAULT_CLOUDFLARE_CLICK_API_URL
+        ).trim();
+        const data = await requestLocalApi(
+          apiUrl,
+          "/notify/cloudflare-click",
+          {
+            event_key: String(message?.eventKey || "").trim(),
+            title: String(message?.title || "Cloudflare helper trigger"),
+            text: String(message?.text || ""),
+            source_url: String(message?.sourceUrl || ""),
+            reason: String(message?.reason || "")
+          },
+          Number(message?.timeoutMs || 1800)
+        );
+        if (data?.ok) {
+          sendResponse({ ok: true, sent: true, data });
+          return;
+        }
+        sendResponse({
+          ok: true,
+          sent: false,
+          skipped: "backend_not_ready",
+          error: String(data?.message || "cloudflare_click_failed"),
+          data
+        });
+      } catch (err) {
+        sendResponse({
+          ok: true,
+          sent: false,
+          skipped: "service_unavailable",
+          error: String(err?.message || err)
+        });
       }
       return;
     }

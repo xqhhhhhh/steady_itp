@@ -29,6 +29,7 @@
       "matches": [
         "https://world.nol.com/*",
         "https://tickets.interpark.com/*",
+        "https://ticket.globalinterpark.com/*",
         "https://secureapi.ext.eximbay.com/*",
         "https://gpoticket.globalinterpark.com/*" 
       ],
