@@ -8,7 +8,16 @@
   </head>
   <body>
     <main class="app">
-      <h1>NOL 抢票助手</h1>
+      <div class="topbar">
+        <h1 data-i18n="appTitle">NOL 抢票助手</h1>
+        <label class="lang-switch" for="uiLanguage">
+          <span class="sr-only" data-i18n="language.label">界面语言</span>
+          <select id="uiLanguage" aria-label="UI Language">
+            <option value="zh-CN">中文</option>
+            <option value="en">English</option>
+          </select>
+        </label>
+      </div>
 
       <section id="licenseBar" class="license-bar">
         <input
@@ -17,197 +26,296 @@
           type="text"
           value=""
           placeholder="请输入激活码"
+          data-i18n-placeholder="ocrActivationPlaceholder"
         />
-        <button id="activateOcrBtn" class="license-btn" type="button">激活</button>
+        <button id="activateOcrBtn" class="license-btn" type="button" data-i18n="activate">
+          激活
+        </button>
       </section>
-      <p id="ocrLicenseStatus" class="license-status">未激活</p>
+      <p id="ocrLicenseStatus" class="license-status" data-i18n="license.inactive">未激活</p>
+      <p id="licenseGateNotice" class="hint license-gate-note" data-i18n="license.inactiveHint">
+        请输入并激活有效激活码后显示主要功能。
+      </p>
 
+      <div id="licensedContent" class="hidden">
       <section class="panel">
-        <h2>模式设置</h2>
-        <div class="hint">抢票与捡漏必须二选一</div>
+        <h2 data-i18n="section.mode">模式设置</h2>
+        <div class="hint" data-i18n="modeHintExclusive">抢票与捡漏必须二选一</div>
 
-        <div class="mode-row" role="radiogroup" aria-label="运行模式">
+        <div class="mode-row" role="radiogroup" aria-label="运行模式" data-i18n-aria-label="runModeGroupLabel">
           <label class="mode-option">
             <input id="runModeTimed" type="radio" name="runMode" value="timed" checked />
-            <span>按时抢票模式</span>
+            <span data-i18n="runMode.timed">按时抢票模式</span>
           </label>
           <label class="mode-option">
             <input id="runModeScavenge" type="radio" name="runMode" value="scavenge" />
-            <span>捡漏模式</span>
+            <span data-i18n="runMode.scavenge">捡漏模式</span>
           </label>
         </div>
 
         <label class="field">
-          <span>演唱会 URL</span>
+          <span data-i18n="eventUrl">演唱会 URL</span>
           <input id="eventUrl" type="url" placeholder="https://world.nol.com/..." />
         </label>
 
         <div id="timedModeFields" class="subpanel">
-          <h3>按时抢票专用</h3>
+          <h3 data-i18n="timedOnly">按时抢票专用</h3>
           <label class="field">
-            <span>开抢时间</span>
+            <span data-i18n="saleStartTime">开抢时间</span>
             <input id="saleStartTime" type="datetime-local" />
           </label>
 
           <label class="field">
-            <span>提前进场秒数</span>
+            <span data-i18n="preEnterSeconds">提前进场秒数</span>
             <input id="preEnterSeconds" type="number" min="5" max="300" value="30" />
           </label>
 
           <label class="field">
-            <span>临界前置秒数</span>
+            <span data-i18n="criticalPreSeconds">临界前置秒数</span>
             <input id="criticalPreSeconds" type="number" min="0.5" max="10" step="0.1" value="2.5" />
           </label>
 
           <label class="field">
-            <span>临界后置秒数</span>
+            <span data-i18n="criticalPostSeconds">临界后置秒数</span>
             <input id="criticalPostSeconds" type="number" min="1" max="20" step="0.1" value="8" />
           </label>
 
           <label class="field">
-            <span>临界轮询毫秒</span>
+            <span data-i18n="criticalTickMs">临界轮询毫秒</span>
             <input id="criticalTickMs" type="number" min="40" max="180" step="1" value="65" />
           </label>
 
           <label class="field">
-            <span>预定点击间隔(ms)</span>
+            <span data-i18n="reserveClickIntervalMs">预定点击间隔(ms)</span>
             <input id="reserveClickIntervalMs" type="number" min="40" max="1000" step="1" value="65" />
           </label>
 
           <label class="field">
-            <span>预定触发策略</span>
+            <span data-i18n="reserveClickStartMode">预定触发策略</span>
             <select id="reserveClickStartMode">
-              <option value="edge_once">卡点出现时只点一次</option>
-              <option value="always">到点后持续点击</option>
+              <option value="edge_once" data-i18n="reserveMode.edgeOnce">卡点出现时只点一次</option>
+              <option value="always" data-i18n="reserveMode.always">到点后持续点击</option>
             </select>
           </label>
 
           <label class="field">
-            <span>每轮预定点击次数</span>
+            <span data-i18n="reserveClickBurstCount">每轮预定点击次数</span>
             <input id="reserveClickBurstCount" type="number" min="1" max="5" step="1" value="1" />
           </label>
         </div>
 
         <div id="scavengeModeFields" class="subpanel hidden">
-          <h3>捡漏专用</h3>
+          <h3 data-i18n="scavengeOnly">捡漏专用</h3>
           <label id="scavengeLoopIntervalWrap" class="field">
-            <span>捡漏重跑间隔（分钟）(建议10分钟以上)</span>
+            <span data-i18n="scavengeLoopIntervalMin">捡漏重跑间隔（分钟）(建议10分钟以上)</span>
             <input id="scavengeLoopIntervalMin" type="number" min="1" max="120" step="1" value="10" />
           </label>
           <label class="field">
-            <span>单次循环时长上限（分钟，0=不限制，建议1-3分钟，过长请求过多可能短暂封号）</span>
-            <input id="scavengeRoundMaxMin" type="number" min="0" max="180" step="1" value="0" />
+            <span data-i18n="scavengeRoundMaxMin">单次循环时长上限（分钟，0=不限制，建议1-3分钟，过长请求过多可能短暂封号）</span>
+            <input id="scavengeRoundMaxMin" type="number" min="0" max="180" step="1" value="8" />
           </label>
         </div>
       </section>
 
       <section class="panel">
-        <h2>通用配置</h2>
+        <h2 data-i18n="section.general">通用配置</h2>
 
         <label class="field">
-          <span>票数</span>
+          <span data-i18n="quantity">票数</span>
           <input id="quantity" type="number" min="1" max="4" value="1" />
         </label>
 
         <label class="field">
-          <span>日期-月 (可选)</span>
+          <span data-i18n="dateMonth">日期-月 (可选)</span>
           <select id="dateMonth"></select>
         </label>
 
         <label class="field">
-          <span>日期-日 (可选)</span>
+          <span data-i18n="dateDay">日期-日 (可选)</span>
           <select id="dateDay"></select>
         </label>
 
         <label class="field">
-          <span>日期-时间 (可选)</span>
+          <span data-i18n="dateTime">日期-时间 (可选)</span>
           <select id="dateTime"></select>
         </label>
 
         <label class="field">
-          <span>新版区域查询顺序</span>
+          <span data-i18n="newAreaOrderMode">新版区域查询顺序</span>
           <select id="newAreaOrderMode">
-            <option value="default">默认顺序</option>
-            <option value="custom">自定义顺序</option>
+            <option value="default" data-i18n="order.default">默认顺序</option>
+            <option value="custom" data-i18n="order.custom">自定义顺序</option>
           </select>
         </label>
 
         <div id="newAreaCustomWrap" class="field hidden">
-          <span>新版自定义区域 (三位数字，回车添加)</span>
-          <input id="newAreaCodeInput" type="text" inputmode="numeric" placeholder="例如 001" maxlength="3" />
+          <span data-i18n="newAreaCustom">新版自定义区域 (三位数字，回车添加)</span>
+          <input
+            id="newAreaCodeInput"
+            type="text"
+            inputmode="numeric"
+            placeholder="例如 001"
+            maxlength="3"
+            data-i18n-placeholder="newAreaPlaceholder"
+          />
           <div id="newAreaCodeList" class="code-list"></div>
-          <div class="hint">将按输入顺序优先查询这些新版区域</div>
+          <div class="hint" data-i18n="newAreaHint">将按输入顺序优先查询这些新版区域</div>
         </div>
 
         <label class="field">
-          <span>旧版区域查询顺序</span>
+          <span data-i18n="legacyAreaOrderMode">旧版区域查询顺序</span>
           <select id="legacyAreaOrderMode">
-            <option value="default">默认顺序</option>
-            <option value="custom">自定义顺序</option>
+            <option value="default" data-i18n="order.default">默认顺序</option>
+            <option value="custom" data-i18n="order.custom">自定义顺序</option>
           </select>
         </label>
 
         <div id="legacyAreaCustomWrap" class="field hidden">
-          <span>自定义区域 (三位数字，回车添加)</span>
-          <input id="legacyAreaCodeInput" type="text" inputmode="numeric" placeholder="例如 205" maxlength="3" />
+          <span data-i18n="legacyAreaCustom">自定义区域 (三位数字，逗号分隔，回车批量添加)</span>
+          <input
+            id="legacyAreaCodeInput"
+            type="text"
+            inputmode="text"
+            placeholder="例如 205,206，207"
+            data-i18n-placeholder="legacyAreaPlaceholder"
+          />
           <div id="legacyAreaCodeList" class="code-list"></div>
-          <div class="hint">将按输入顺序逐个查找这些区域</div>
+          <div class="hint" data-i18n="legacyAreaHint">支持中英文逗号分隔，按回车后将按输入顺序逐个查找这些区域</div>
         </div>
+
+        <label class="toggle-row" for="legacyCompetitionUiEnabled">
+          <span data-i18n="legacyCompetitionUiEnabled">旧版比赛场界面</span>
+          <input id="legacyCompetitionUiEnabled" type="checkbox" />
+        </label>
 
         <div class="subpanel">
-          <h3>旧版区域切换速度</h3>
+          <h3 data-i18n="legacyAreaSpeed">旧版区域切换速度</h3>
           <label class="field">
-            <span>区域切换间隔(ms)</span>
-            <input id="legacyAreaSwitchIntervalMs" type="number" min="120" max="5000" step="10" value="1200" />
+            <span data-i18n="legacyAreaSwitchIntervalMs">区域切换间隔(ms)</span>
+            <input id="legacyAreaSwitchIntervalMs" type="number" min="120" max="50000" step="10" value="5000" />
           </label>
           <label class="field">
-            <span>区域切换后等待(ms)</span>
-            <input id="legacyAreaSettleMs" type="number" min="120" max="5000" step="10" value="1200" />
+            <span data-i18n="legacyAreaSettleMs">区域切换后等待(ms)</span>
+            <input id="legacyAreaSettleMs" type="number" min="120" step="10" value="200" />
           </label>
           <label class="field">
-            <span>随机抖动(±ms)</span>
-            <input id="legacyAreaRandomJitterMs" type="number" min="0" max="1500" step="10" value="0" />
+            <span data-i18n="legacyAreaRandomJitterMs">随机抖动(±ms)</span>
+            <input id="legacyAreaRandomJitterMs" type="number" min="0" max="1500" step="10" value="100" />
           </label>
-          <div class="hint">最终延迟 = 基础值 ± 随机抖动</div>
+          <div class="hint" data-i18n="legacyAreaRandomHint">最终延迟 = 基础值 ± 随机抖动</div>
         </div>
 
         <label class="field">
-          <span>钉钉 Webhook (可选)</span>
-          <input id="dingTalkWebhookUrl" type="url" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..." />
+          <span data-i18n="notifyProvider">消息提醒渠道</span>
+          <select id="notifyProvider">
+            <option value="dingtalk" data-i18n="notifyProvider.dingtalk">钉钉</option>
+            <option value="telegram" data-i18n="notifyProvider.telegram">Telegram</option>
+          </select>
         </label>
+
+        <div class="subpanel">
+          <h3 data-i18n="notifyCategories">消息推送开关</h3>
+          <label class="toggle-row" for="queueNotifyEnabled">
+            <span data-i18n="queueNotifyEnabled">排队提醒</span>
+            <input id="queueNotifyEnabled" type="checkbox" checked />
+          </label>
+          <label class="toggle-row" for="cloudflareNotifyEnabled">
+            <span data-i18n="cloudflareNotifyEnabled">Cloudflare 人机验证提醒</span>
+            <input id="cloudflareNotifyEnabled" type="checkbox" checked />
+          </label>
+          <label class="toggle-row" for="captchaNotifyEnabled">
+            <span data-i18n="captchaNotifyEnabled">验证码消息提醒</span>
+            <input id="captchaNotifyEnabled" type="checkbox" checked />
+          </label>
+          <label class="toggle-row" for="successNotifyEnabled">
+            <span data-i18n="successNotifyEnabled">进入价格页/锁座成功提醒</span>
+            <input id="successNotifyEnabled" type="checkbox" checked />
+          </label>
+        </div>
+
+        <div id="dingTalkNotifyFields">
+          <label class="field">
+            <span data-i18n="dingTalkWebhookUrl">钉钉 Webhook (可选)</span>
+            <input
+              id="dingTalkWebhookUrl"
+              type="url"
+              placeholder="https://oapi.dingtalk.com/robot/send?access_token=..."
+            />
+          </label>
+
+          <label class="field">
+            <span data-i18n="dingTalkSecret">钉钉加签 Secret (可选)</span>
+            <input
+              id="dingTalkSecret"
+              type="text"
+              placeholder="SEC..."
+            />
+          </label>
+        </div>
+
+        <div id="telegramNotifyFields" class="hidden">
+          <label class="field">
+            <span data-i18n="telegramBotToken">Telegram Bot Token</span>
+            <input
+              id="telegramBotToken"
+              type="text"
+              placeholder="123456789:AA..."
+            />
+          </label>
+
+          <label class="field">
+            <span data-i18n="telegramChatId">Telegram Chat ID</span>
+            <input
+              id="telegramChatId"
+              type="text"
+              placeholder="@channel_name or 123456789"
+            />
+          </label>
+        </div>
 
         <label class="field">
-          <span>钉钉加签 Secret (可选)</span>
-          <input id="dingTalkSecret" type="text" placeholder="SEC..." />
+          <span data-i18n="queueNotifyThresholds">排队提醒阈值</span>
+          <input
+            id="queueNotifyThresholds"
+            type="text"
+            placeholder="1000,100,10"
+            data-i18n-placeholder="queueNotifyThresholdsPlaceholder"
+          />
+          <div id="queueNotifyThresholdList" class="code-list"></div>
+          <div class="hint" data-i18n="queueNotifyThresholdsHint">
+            逗号分隔；当排队剩余小于等于任一阈值时发送提醒。
+          </div>
         </label>
 
-        <div id="vpnConfigWrap">
-          <label id="vpnApiUrlField" class="field">
-            <span>VPN 切换 API 地址</span>
-            <input id="vpnApiUrl" type="url" value="http://127.0.0.1:8000" />
+        <div class="subpanel">
+          <h3 data-i18n="captchaAssist">验证码辅助</h3>
+          <label class="toggle-row" for="captchaAutoFillEnabled">
+            <span data-i18n="captchaAutoFillEnabled">数字验证码自动填写</span>
+            <input id="captchaAutoFillEnabled" type="checkbox" checked />
           </label>
-
-          <label class="toggle-row" for="vpnAutoSwitchEnabled">
-            <span>队列异常时自动切换 VPN</span>
-            <input id="vpnAutoSwitchEnabled" type="checkbox" checked />
+          <div class="hint" data-i18n="captchaAutoFillHint">
+            检测到图片验证码时自动识别并填写；关闭后可手动输入，脚本会等待你完成后继续。
+          </div>
+          <label class="toggle-row" for="sliderAutoDragEnabled">
+            <span data-i18n="sliderAutoDragEnabled">滑块验证码自动拖动</span>
+            <input id="sliderAutoDragEnabled" type="checkbox" />
           </label>
-
-          <label class="toggle-row" for="queueVpnNotifyEnabled">
-            <span>推送 VPN 异常钉钉通知</span>
-            <input id="queueVpnNotifyEnabled" type="checkbox" checked />
-          </label>
+          <div class="hint" data-i18n="sliderAutoDragHint">
+            检测到滑块时自动尝试拖动；若未通过，流程会暂停，手动完成后自动继续。
+          </div>
         </div>
       </section>
 
       <div class="actions">
-        <button id="startBtn" class="start" type="button">开始</button>
-        <button id="stopBtn" class="stop" type="button">停止</button>
+        <button id="startBtn" class="start" type="button" data-i18n="start">开始</button>
+        <button id="stopBtn" class="stop" type="button" data-i18n="stop">停止</button>
       </div>
       <div class="actions">
-        <button id="saveBtn" class="save" type="button">保存配置</button>
+        <button id="saveBtn" class="save" type="button" data-i18n="save">保存配置</button>
       </div>
 
-      <p id="status" class="status">未启动</p>
+      <p id="status" class="status" data-i18n="status.base.stopped">未启动</p>
+      </div>
     </main>
 
     <script src="popup.js"></script>

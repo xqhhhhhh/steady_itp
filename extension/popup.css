@@ -3,7 +3,7 @@
 }
 
 body {
-  width: 320px;
+  width: 360px;
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   background: #f7f8fb;
@@ -17,6 +17,26 @@ body {
 h1 {
   margin: 0 0 10px;
   font-size: 16px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.topbar h1 {
+  margin-bottom: 0;
+}
+
+.lang-switch select {
+  border: 1px solid #d5d8e0;
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 12px;
+  background: #fff;
+  color: #1f2a44;
 }
 
 .license-bar {
@@ -65,6 +85,11 @@ h1 {
 
 .license-status.activated {
   color: #256a36;
+}
+
+.license-gate-note {
+  margin: 0 0 12px;
+  color: #6b7280;
 }
 
 .panel {
@@ -247,4 +272,16 @@ button {
   margin: 10px 0 0;
   font-size: 12px;
   color: #39435f;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }

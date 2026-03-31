@@ -10,6 +10,7 @@ const distRoot = path.join(extensionRoot, "dist");
 
 const TOP_LEVEL_IGNORES = new Set([
   "dist",
+  "dist.zip",
   "node_modules",
   "scripts",
   "package.json",

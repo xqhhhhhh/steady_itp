@@ -6,12 +6,23 @@ const ALARM_NOTIFY_SENT_KEY = "nolBotAlarmNotifySent";
 const DING_DEDUP_TTL_MS = 5 * 60 * 1000;
 const ALARM_DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_OCR_API_URL = "https://api.nexuschat.top/ocr-api/ocr/file";
+const DEFAULT_QUEUE_NOTIFY_THRESHOLDS = [1000, 100, 10];
+const DEFAULT_LEGACY_AREA_SWITCH_INTERVAL_MS = 5000;
+const DEFAULT_LEGACY_AREA_SETTLE_MS = 200;
+const DEFAULT_LEGACY_AREA_RANDOM_JITTER_MS = 100;
 const DEFAULT_ALARM_API_URL = "http://127.0.0.1:8002";
 const DEFAULT_CLOUDFLARE_CLICK_API_URL = "http://127.0.0.1:8003";
 const OCR_DEVICE_ID_SYNC_KEY = "nolBotOcrDeviceId";
 const OCR_DEVICE_ID_RE = /^[A-Za-z0-9._:-]{8,128}$/;
 const DEBUGGER_PROTOCOL_VERSION = "1.3";
 const nativeDialogDebuggerTabs = new Set();
+const DEBUGGER_API = chrome?.debugger;
+const DEBUGGER_API_AVAILABLE = Boolean(
+  DEBUGGER_API &&
+    typeof DEBUGGER_API.attach === "function" &&
+    typeof DEBUGGER_API.detach === "function" &&
+    typeof DEBUGGER_API.sendCommand === "function"
+);
 
 function normalizeOcrApiUrl(raw, fallback = DEFAULT_OCR_API_URL) {
   const candidate = String(raw || "").trim();
@@ -27,6 +38,32 @@ function normalizeOcrApiUrl(raw, fallback = DEFAULT_OCR_API_URL) {
   } catch (_) {
     return fb;
   }
+}
+
+function normalizeNotifyProvider(raw, fallback = "dingtalk") {
+  const value = String(raw || "").trim().toLowerCase();
+  if (value === "telegram") return "telegram";
+  if (value === "dingtalk") return "dingtalk";
+  return fallback === "telegram" ? "telegram" : "dingtalk";
+}
+
+function normalizeQueueNotifyThresholds(raw, fallback = DEFAULT_QUEUE_NOTIFY_THRESHOLDS) {
+  const values = Array.isArray(raw) ? raw : String(raw || "").split(/[,\s]+/);
+  const seen = new Set();
+  const out = [];
+  for (const item of values) {
+    const n = Number(String(item || "").trim());
+    if (!Number.isFinite(n)) continue;
+    const threshold = Math.min(999999, Math.max(1, Math.round(n)));
+    if (seen.has(threshold)) continue;
+    seen.add(threshold);
+    out.push(threshold);
+  }
+  if (!out.length) {
+    return Array.isArray(fallback) ? fallback.slice() : DEFAULT_QUEUE_NOTIFY_THRESHOLDS.slice();
+  }
+  out.sort((a, b) => b - a);
+  return out;
 }
 
 function isSupportedTicketUrl(rawUrl = "") {
@@ -46,13 +83,14 @@ function isSupportedTicketUrl(rawUrl = "") {
 }
 
 async function ensureNativeDialogDebugger(tabId) {
+  if (!DEBUGGER_API_AVAILABLE) return { ok: false, error: "debugger_api_unavailable" };
   const id = Number(tabId);
   if (!Number.isInteger(id) || id <= 0) return { ok: false, error: "invalid_tab_id" };
   const target = { tabId: id };
 
   if (nativeDialogDebuggerTabs.has(id)) {
     try {
-      await chrome.debugger.sendCommand(target, "Page.enable");
+      await DEBUGGER_API.sendCommand(target, "Page.enable");
       return { ok: true, attached: true, reused: true };
     } catch (_) {
       nativeDialogDebuggerTabs.delete(id);
@@ -61,20 +99,20 @@ async function ensureNativeDialogDebugger(tabId) {
 
   let attachErr = "";
   try {
-    await chrome.debugger.attach(target, DEBUGGER_PROTOCOL_VERSION);
+    await DEBUGGER_API.attach(target, DEBUGGER_PROTOCOL_VERSION);
   } catch (err) {
     attachErr = String(err?.message || err);
   }
 
   try {
-    await chrome.debugger.sendCommand(target, "Page.enable");
+    await DEBUGGER_API.sendCommand(target, "Page.enable");
     nativeDialogDebuggerTabs.add(id);
     return { ok: true, attached: !attachErr, reused: Boolean(attachErr), error: attachErr };
   } catch (err) {
     const cmdErr = String(err?.message || err);
     if (!attachErr) {
       try {
-        await chrome.debugger.detach(target);
+        await DEBUGGER_API.detach(target);
       } catch (_) {}
     }
     return { ok: false, error: cmdErr || attachErr || "debugger_attach_failed" };
@@ -82,10 +120,11 @@ async function ensureNativeDialogDebugger(tabId) {
 }
 
 async function tryAcceptNativeDialogByDebugger(tabId) {
+  if (!DEBUGGER_API_AVAILABLE) return { ok: false, error: "debugger_api_unavailable" };
   const id = Number(tabId);
   if (!Number.isInteger(id) || id <= 0) return { ok: false, error: "invalid_tab_id" };
   try {
-    await chrome.debugger.sendCommand(
+    await DEBUGGER_API.sendCommand(
       { tabId: id },
       "Page.handleJavaScriptDialog",
       { accept: true, promptText: "" }
@@ -107,9 +146,13 @@ async function tryAcceptNativeDialogByDebugger(tabId) {
 async function detachNativeDialogDebugger(tabId) {
   const id = Number(tabId);
   if (!Number.isInteger(id) || id <= 0) return;
+  if (!DEBUGGER_API_AVAILABLE) {
+    nativeDialogDebuggerTabs.delete(id);
+    return;
+  }
   const target = { tabId: id };
   try {
-    await chrome.debugger.detach(target);
+    await DEBUGGER_API.detach(target);
   } catch (_) {}
   nativeDialogDebuggerTabs.delete(id);
 }
@@ -160,7 +203,7 @@ async function saveConfig(config) {
       ),
       scavengeRoundMaxSec: normalizeScavengeRoundMaxSec(
         config?.scavengeRoundMaxSec,
-        0
+        480
       ),
       dateMonth: String(config?.dateMonth || "").trim(),
       dateDay: String(config?.dateDay || "").trim(),
@@ -169,14 +212,18 @@ async function saveConfig(config) {
       newAreaCustomCodes: normalizeLegacyAreaCustomCodes(config?.newAreaCustomCodes || []),
       legacyAreaOrderMode: normalizeLegacyAreaOrderMode(config?.legacyAreaOrderMode, "default"),
       legacyAreaCustomCodes: normalizeLegacyAreaCustomCodes(config?.legacyAreaCustomCodes || []),
+      legacyCompetitionUiEnabled: config?.legacyCompetitionUiEnabled === true,
       legacyAreaSwitchIntervalMs: normalizeLegacyAreaTimingMs(
         config?.legacyAreaSwitchIntervalMs,
-        1200
+        DEFAULT_LEGACY_AREA_SWITCH_INTERVAL_MS
       ),
-      legacyAreaSettleMs: normalizeLegacyAreaTimingMs(config?.legacyAreaSettleMs, 1200),
+      legacyAreaSettleMs: normalizeLegacyAreaTimingMs(
+        config?.legacyAreaSettleMs,
+        DEFAULT_LEGACY_AREA_SETTLE_MS
+      ),
       legacyAreaRandomJitterMs: normalizeLegacyAreaRandomJitterMs(
         config?.legacyAreaRandomJitterMs,
-        0
+        DEFAULT_LEGACY_AREA_RANDOM_JITTER_MS
       ),
       fullFlowEnabled: config?.fullFlowEnabled !== false,
       ocrApiUrl: normalizeOcrApiUrl(config?.ocrApiUrl, DEFAULT_OCR_API_URL),
@@ -187,15 +234,30 @@ async function saveConfig(config) {
       ocrAccessTokenExpiresAt: Number(current?.ocrAccessTokenExpiresAt || 0),
       ocrLicenseExpiresAt: Number(current?.ocrLicenseExpiresAt || 0),
       ocrLicenseActivatedAt: Number(current?.ocrLicenseActivatedAt || 0),
+      captchaAutoFillEnabled: config?.captchaAutoFillEnabled !== false,
       vpnApiUrl: String(config?.vpnApiUrl || "http://127.0.0.1:8000").trim(),
-      vpnAutoSwitchEnabled: config?.vpnAutoSwitchEnabled !== false,
-      queueVpnNotifyEnabled: config?.queueVpnNotifyEnabled !== false,
+      vpnAutoSwitchEnabled: config?.vpnAutoSwitchEnabled === true,
+      queueVpnNotifyEnabled: config?.queueVpnNotifyEnabled === true,
+      queueNotifyEnabled: config?.queueNotifyEnabled !== false,
+      cloudflareNotifyEnabled: config?.cloudflareNotifyEnabled !== false,
+      captchaNotifyEnabled: config?.captchaNotifyEnabled !== false,
+      successNotifyEnabled: config?.successNotifyEnabled !== false,
       alarmApiUrl: String(current?.alarmApiUrl || current?.callApiUrl || DEFAULT_ALARM_API_URL).trim(),
       cloudflareClickApiUrl: String(
         current?.cloudflareClickApiUrl || DEFAULT_CLOUDFLARE_CLICK_API_URL
       ).trim(),
+      queueNotifyThresholds: normalizeQueueNotifyThresholds(
+        config?.queueNotifyThresholds || current?.queueNotifyThresholds,
+        DEFAULT_QUEUE_NOTIFY_THRESHOLDS
+      ),
+      notifyProvider: normalizeNotifyProvider(
+        config?.notifyProvider || current?.notifyProvider,
+        "dingtalk"
+      ),
       dingTalkWebhookUrl: String(config?.dingTalkWebhookUrl || "").trim(),
       dingTalkSecret: String(config?.dingTalkSecret || "").trim(),
+      telegramBotToken: String(config?.telegramBotToken || "").trim(),
+      telegramChatId: String(config?.telegramChatId || "").trim(),
       enabled: true,
       startedAt: Date.now()
     }
@@ -255,7 +317,7 @@ async function saveConfigOnly(config) {
       ),
       scavengeRoundMaxSec: normalizeScavengeRoundMaxSec(
         config?.scavengeRoundMaxSec,
-        current.scavengeRoundMaxSec || 0
+        current.scavengeRoundMaxSec || 480
       ),
       quantity: Number(config?.quantity || current.quantity || 1),
       dateMonth: String(config?.dateMonth || "").trim(),
@@ -275,17 +337,21 @@ async function saveConfigOnly(config) {
       legacyAreaCustomCodes: normalizeLegacyAreaCustomCodes(
         config?.legacyAreaCustomCodes || current.legacyAreaCustomCodes || []
       ),
+      legacyCompetitionUiEnabled:
+        typeof config?.legacyCompetitionUiEnabled === "boolean"
+          ? config.legacyCompetitionUiEnabled
+          : current.legacyCompetitionUiEnabled === true,
       legacyAreaSwitchIntervalMs: normalizeLegacyAreaTimingMs(
         config?.legacyAreaSwitchIntervalMs,
-        current.legacyAreaSwitchIntervalMs || 1200
+        current.legacyAreaSwitchIntervalMs || DEFAULT_LEGACY_AREA_SWITCH_INTERVAL_MS
       ),
       legacyAreaSettleMs: normalizeLegacyAreaTimingMs(
         config?.legacyAreaSettleMs,
-        current.legacyAreaSettleMs || 1200
+        current.legacyAreaSettleMs || DEFAULT_LEGACY_AREA_SETTLE_MS
       ),
       legacyAreaRandomJitterMs: normalizeLegacyAreaRandomJitterMs(
         config?.legacyAreaRandomJitterMs,
-        current.legacyAreaRandomJitterMs || 0
+        current.legacyAreaRandomJitterMs || DEFAULT_LEGACY_AREA_RANDOM_JITTER_MS
       ),
       fullFlowEnabled:
         typeof config?.fullFlowEnabled === "boolean"
@@ -306,25 +372,57 @@ async function saveConfigOnly(config) {
       ocrAccessTokenExpiresAt: Number(current?.ocrAccessTokenExpiresAt || 0),
       ocrLicenseExpiresAt: Number(current?.ocrLicenseExpiresAt || 0),
       ocrLicenseActivatedAt: Number(current?.ocrLicenseActivatedAt || 0),
+      captchaAutoFillEnabled:
+        typeof config?.captchaAutoFillEnabled === "boolean"
+          ? config.captchaAutoFillEnabled
+          : current.captchaAutoFillEnabled !== false,
       vpnApiUrl: String(config?.vpnApiUrl || current.vpnApiUrl || "http://127.0.0.1:8000").trim(),
       vpnAutoSwitchEnabled:
         typeof config?.vpnAutoSwitchEnabled === "boolean"
           ? config.vpnAutoSwitchEnabled
-          : current.vpnAutoSwitchEnabled !== false,
+          : current.vpnAutoSwitchEnabled === true,
       queueVpnNotifyEnabled:
         typeof config?.queueVpnNotifyEnabled === "boolean"
           ? config.queueVpnNotifyEnabled
-          : current.queueVpnNotifyEnabled !== false,
+          : current.queueVpnNotifyEnabled === true,
+      queueNotifyEnabled:
+        typeof config?.queueNotifyEnabled === "boolean"
+          ? config.queueNotifyEnabled
+          : current.queueNotifyEnabled !== false,
+      cloudflareNotifyEnabled:
+        typeof config?.cloudflareNotifyEnabled === "boolean"
+          ? config.cloudflareNotifyEnabled
+          : current.cloudflareNotifyEnabled !== false,
+      captchaNotifyEnabled:
+        typeof config?.captchaNotifyEnabled === "boolean"
+          ? config.captchaNotifyEnabled
+          : current.captchaNotifyEnabled !== false,
+      successNotifyEnabled:
+        typeof config?.successNotifyEnabled === "boolean"
+          ? config.successNotifyEnabled
+          : current.successNotifyEnabled !== false,
       alarmApiUrl: String(
         current?.alarmApiUrl || current?.callApiUrl || DEFAULT_ALARM_API_URL
       ).trim(),
       cloudflareClickApiUrl: String(
         current?.cloudflareClickApiUrl || DEFAULT_CLOUDFLARE_CLICK_API_URL
       ).trim(),
+      queueNotifyThresholds: normalizeQueueNotifyThresholds(
+        config?.queueNotifyThresholds || current?.queueNotifyThresholds,
+        DEFAULT_QUEUE_NOTIFY_THRESHOLDS
+      ),
+      notifyProvider: normalizeNotifyProvider(
+        config?.notifyProvider || current?.notifyProvider,
+        "dingtalk"
+      ),
       dingTalkWebhookUrl: String(
         config?.dingTalkWebhookUrl || current.dingTalkWebhookUrl || ""
       ).trim(),
       dingTalkSecret: String(config?.dingTalkSecret || current.dingTalkSecret || "").trim(),
+      telegramBotToken: String(
+        config?.telegramBotToken || current.telegramBotToken || ""
+      ).trim(),
+      telegramChatId: String(config?.telegramChatId || current.telegramChatId || "").trim(),
       savedAt: Date.now()
     }
   });
@@ -433,8 +531,8 @@ function normalizeLegacyAreaCustomCodes(raw) {
 
 function normalizeLegacyAreaTimingMs(raw, fallback = 1200) {
   const n = Number(raw);
-  if (!Number.isFinite(n)) return Math.min(5000, Math.max(120, Number(fallback) || 1200));
-  return Math.min(5000, Math.max(120, Math.round(n)));
+  if (!Number.isFinite(n)) return Math.max(120, Math.round(Number(fallback) || 1200));
+  return Math.max(120, Math.round(n));
 }
 
 function normalizeLegacyAreaRandomJitterMs(raw, fallback = 0) {
@@ -863,6 +961,30 @@ async function sendDingTalkText(webhookUrl, secret, title, text) {
   return true;
 }
 
+async function sendTelegramText(botToken, chatId, title, text) {
+  const token = String(botToken || "").trim();
+  const targetChatId = String(chatId || "").trim();
+  if (!token) throw new Error("Telegram Bot Token 未配置");
+  if (!targetChatId) throw new Error("Telegram Chat ID 未配置");
+
+  const bodyText = `[NOL BOT] ${String(title || "通知")}\n${String(text || "").trim()}\n${new Date().toLocaleString()}`;
+  const resp = await fetch(`https://api.telegram.org/bot${encodeURIComponent(token)}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: targetChatId,
+      text: bodyText,
+      disable_web_page_preview: true
+    })
+  });
+  if (!resp.ok) throw new Error(`Telegram HTTP ${resp.status}`);
+  const data = await resp.json().catch(() => ({}));
+  if (data?.ok !== true) {
+    throw new Error(`Telegram error: ${String(data?.description || "unknown_error")}`);
+  }
+  return true;
+}
+
 async function forceInjectAndKick(tabId) {
   if (!tabId) return;
   let contentReady = false;
@@ -1278,6 +1400,16 @@ async function runLegacySelectSeatInMainWorld(tabId, frameId, payload = {}) {
           const isAvailableSeat = (el) => {
             if (!el) return false;
             const tag = String(el.tagName || "").toLowerCase();
+            if (tag === "img") {
+              const cls = normalize(getClass(el));
+              const value = normalize(el.getAttribute("value") || "");
+              const onclick = normalize(el.getAttribute("onclick") || "");
+              const styleText = normalize(el.getAttribute("style") || "");
+              if (!cls.includes("styselectseat")) return false;
+              if (!onclick.includes("selectseatkbo") && !onclick.includes("selectseat")) return false;
+              if (value && value !== "n") return false;
+              return styleText.includes("display:none") || styleText.includes("display: none");
+            }
             if (tag !== "span") return false;
             const cls = normalize(getClass(el));
             const value = normalize(el.getAttribute("value") || "");
@@ -1290,9 +1422,20 @@ async function runLegacySelectSeatInMainWorld(tabId, frameId, payload = {}) {
           };
           const selectedCount = () => {
             const nodes = Array.from(
-              document.querySelectorAll("span#Seats, span[name='Seats'], span[class*='Seat']")
+              document.querySelectorAll(
+                "span#Seats, span[name='Seats'], span[class*='Seat'], img.stySelectSeat, img[id^='SID'], img[onclick*='SelectSeatKBO']"
+              )
             );
             return nodes.filter((el) => {
+              const tag = String(el.tagName || "").toLowerCase();
+              if (tag === "img") {
+                const cls = normalize(getClass(el));
+                const onclick = normalize(el.getAttribute("onclick") || "");
+                const styleText = normalize(el.getAttribute("style") || "");
+                if (!cls.includes("styselectseat")) return false;
+                if (!onclick.includes("selectseatkbo") && !onclick.includes("selectseat")) return false;
+                return !styleText.includes("display:none") && !styleText.includes("display: none");
+              }
               const cls = normalize(getClass(el));
               if (!cls.includes("seat")) return false;
               if (isDashedSelected(el)) return true;
@@ -1302,7 +1445,7 @@ async function runLegacySelectSeatInMainWorld(tabId, frameId, payload = {}) {
           };
           const seatNodes = Array.from(
             document.querySelectorAll(
-              "span#Seats, span[name='Seats'], span[class*='Seat'], span[onclick*='SelectSeat'], span[onclick*='selectseat'], span[value='N'], span[value='n']"
+              "span#Seats, span[name='Seats'], span[class*='Seat'], span[onclick*='SelectSeat'], span[onclick*='selectseat'], span[value='N'], span[value='n'], img.stySelectSeat, img[id^='SID'], img[onclick*='SelectSeatKBO']"
             )
           );
           out.frameSeatNodeCount = seatNodes.length;
@@ -1469,10 +1612,6 @@ async function runLegacySelectSeatInMainWorld(tabId, frameId, payload = {}) {
 async function setNativeDialogAutoConfirmInMainWorld(tabId, frameId, enabled = false) {
   if (!tabId) return { ok: false, error: "no_tab_id" };
   try {
-    if (enabled) {
-      await ensureNativeDialogDebugger(tabId).catch(() => ({}));
-      await tryAcceptNativeDialogByDebugger(tabId).catch(() => ({}));
-    }
     const target = { tabId, allFrames: true };
     const results = await chrome.scripting.executeScript({
       target,
@@ -1963,8 +2102,6 @@ async function sweepConfirmDialogsAroundOriginTab(originTabId) {
     let clickedTabs = 0;
     let lastClickedHref = "";
     for (const tabId of tabIds) {
-      await ensureNativeDialogDebugger(tabId).catch(() => ({}));
-      await tryAcceptNativeDialogByDebugger(tabId).catch(() => ({}));
       try {
         const patchRes = await setNativeDialogAutoConfirmInMainWorld(tabId, undefined, true);
         if (patchRes?.ok) patchedTabs += 1;
@@ -1991,17 +2128,18 @@ async function sweepConfirmDialogsAroundOriginTab(originTabId) {
   }
 }
 
-async function setSliderCaptchaDebugHookInMainWorld(tabId, enabled = false) {
+async function setSliderCaptchaDebugHookInMainWorld(tabId, enabled = false, options = {}) {
   if (!tabId) return { ok: false, error: "no_tab_id" };
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
       world: "MAIN",
-      func: (flag) => {
+      func: (input) => {
         const out = {
           ok: true,
-          enabled: Boolean(flag),
+          enabled: Boolean(input?.enabled),
           patched: false,
+          liveSampled: false,
           frameHref: String(location.href || ""),
           error: ""
         };
@@ -2021,6 +2159,107 @@ async function setSliderCaptchaDebugHookInMainWorld(tabId, enabled = false) {
             try {
               (w.top || w).postMessage({ __NOL_SLIDER_CAPTCHA_DEBUG: payload }, "*");
             } catch (_) {}
+          };
+
+          const buildSliderSnapshot = (instance) => {
+            if (!instance || typeof instance !== "object") return null;
+            const x = Number(instance.x || 0);
+            const width = Number(instance.options?.width || instance.width || 0);
+            if (!Number.isFinite(x) || !(width > 80)) return null;
+            const blockTargetLeft = x - 3;
+            const sliderTargetDistance =
+              Number.isFinite(width) && width > 80
+                ? (blockTargetLeft * (width - 40)) / (width - 60)
+                : null;
+            return {
+              x,
+              y: Number(instance.y || 0),
+              offset: Number(instance.options?.offset || 0),
+              width,
+              blockTargetLeft,
+              sliderTargetDistance,
+              src: String(instance.img?.currentSrc || instance.img?.src || "")
+            };
+          };
+
+          const isLikelySliderInstance = (candidate, Ctor) => {
+            if (!candidate || typeof candidate !== "object") return false;
+            try {
+              if (Ctor && (candidate instanceof Ctor || candidate.constructor === Ctor)) return true;
+            } catch (_) {}
+            return Boolean(
+              Number.isFinite(Number(candidate.x || NaN)) &&
+                Number(candidate.options?.width || candidate.width || 0) > 80 &&
+                candidate.slider &&
+                candidate.block
+            );
+          };
+
+          const sampleLiveInstance = (Ctor) => {
+            const seen = new Set();
+            const tryCandidate = (candidate, source) => {
+              if (!candidate || typeof candidate !== "object" || seen.has(candidate)) return false;
+              seen.add(candidate);
+              if (!isLikelySliderInstance(candidate, Ctor)) return false;
+              const snapshot = buildSliderSnapshot(candidate);
+              if (!snapshot) return false;
+              emit({
+                phase: "x_generated",
+                ...snapshot,
+                liveSampleSource: source
+              });
+              return true;
+            };
+            const tryNestedValues = (container, sourcePrefix) => {
+              if (!container || typeof container !== "object") return false;
+              let keys = [];
+              try {
+                keys = Object.keys(container);
+              } catch (_) {
+                return false;
+              }
+              for (const key of keys) {
+                let value;
+                try {
+                  value = container[key];
+                } catch (_) {
+                  continue;
+                }
+                if (tryCandidate(value, `${sourcePrefix}.${String(key)}`)) return true;
+              }
+              return false;
+            };
+
+            if (tryCandidate(w.sliderCaptcha, "window.sliderCaptcha")) return true;
+            if (tryNestedValues(w.sliderCaptcha, "window.sliderCaptcha")) return true;
+
+            let winKeys = [];
+            try {
+              winKeys = Object.getOwnPropertyNames(w);
+            } catch (_) {}
+            for (const key of winKeys) {
+              if (
+                key === "window" ||
+                key === "self" ||
+                key === "top" ||
+                key === "parent" ||
+                key === "frames"
+              ) {
+                continue;
+              }
+              let value;
+              try {
+                value = w[key];
+              } catch (_) {
+                continue;
+              }
+              if (tryCandidate(value, `window.${String(key)}`)) return true;
+              if (/slider|captcha/i.test(String(key)) && tryNestedValues(value, `window.${String(key)}`)) {
+                return true;
+              }
+            }
+            emit({ phase: "live_sample_missing" });
+            return false;
           };
 
           const patchConstructor = (Ctor) => {
@@ -2059,23 +2298,13 @@ async function setSliderCaptchaDebugHookInMainWorld(tabId, enabled = false) {
                     const self = this;
                     img.onload = function (...onloadArgs) {
                       const onloadRet = oldOnload.apply(this, onloadArgs);
-                      const x = Number(self.x || 0);
-                      const width = Number(self.options?.width || 0);
-                      const blockTargetLeft = x - 3;
-                      const sliderTargetDistance =
-                        Number.isFinite(width) && width > 80
-                          ? (blockTargetLeft * (width - 40)) / (width - 60)
-                          : null;
-                      emit({
-                        phase: "x_generated",
-                        x,
-                        y: Number(self.y || 0),
-                        offset: Number(self.options?.offset || 0),
-                        width,
-                        blockTargetLeft,
-                        sliderTargetDistance,
-                        src: String(img.currentSrc || img.src || "")
-                      });
+                      const snapshot = buildSliderSnapshot(self);
+                      if (snapshot) {
+                        emit({
+                          phase: "x_generated",
+                          ...snapshot
+                        });
+                      }
                       return onloadRet;
                     };
                     img.__nolDbgOnloadWrapped = true;
@@ -2123,6 +2352,7 @@ async function setSliderCaptchaDebugHookInMainWorld(tabId, enabled = false) {
 
             Ctor.__nolSliderCaptchaDebugPatched = true;
             emit({ phase: "hook_ready" });
+            sampleLiveInstance(Ctor);
             return true;
           };
 
@@ -2136,22 +2366,41 @@ async function setSliderCaptchaDebugHookInMainWorld(tabId, enabled = false) {
             }, 500);
           }
 
-          w.__nolSliderCaptchaDebugEnabled = Boolean(flag);
+          w.__nolSliderCaptchaDebugEnabled = Boolean(input?.enabled);
           out.enabled = Boolean(w.__nolSliderCaptchaDebugEnabled);
           const ctor = w.sliderCaptcha?.Constructor;
           if (ctor) {
             out.patched = Boolean(
               patchConstructor(ctor) || ctor.__nolSliderCaptchaDebugPatched
             );
+            if (out.enabled) {
+              out.liveSampled = sampleLiveInstance(ctor);
+            }
           }
-          emit({ phase: "hook_toggle", enabled: out.enabled, patched: out.patched });
+          if (input?.resampleNow === true && ctor) {
+            out.liveSampled = sampleLiveInstance(ctor) || out.liveSampled;
+          }
+          if (input?.silent !== true) {
+            emit({
+              phase: "hook_toggle",
+              enabled: out.enabled,
+              patched: out.patched,
+              liveSampled: out.liveSampled
+            });
+          }
         } catch (err) {
           out.ok = false;
           out.error = String(err?.message || err);
         }
         return out;
       },
-      args: [Boolean(enabled)]
+      args: [
+        {
+          enabled: Boolean(enabled),
+          resampleNow: options?.resampleNow === true,
+          silent: options?.silent === true
+        }
+      ]
     });
     const rows = Array.isArray(results) ? results : [];
     const mapped = rows
@@ -2187,9 +2436,10 @@ chrome.runtime.onInstalled.addListener(async () => {
         newAreaCustomCodes: [],
         legacyAreaOrderMode: "default",
         legacyAreaCustomCodes: [],
-        legacyAreaSwitchIntervalMs: 1200,
-        legacyAreaSettleMs: 1200,
-        legacyAreaRandomJitterMs: 0,
+        legacyCompetitionUiEnabled: false,
+        legacyAreaSwitchIntervalMs: DEFAULT_LEGACY_AREA_SWITCH_INTERVAL_MS,
+        legacyAreaSettleMs: DEFAULT_LEGACY_AREA_SETTLE_MS,
+        legacyAreaRandomJitterMs: DEFAULT_LEGACY_AREA_RANDOM_JITTER_MS,
         fullFlowEnabled: true,
         saleStartTime: "",
         preEnterSeconds: 30,
@@ -2202,7 +2452,7 @@ chrome.runtime.onInstalled.addListener(async () => {
         sliderAutoDragSecretEnabled: false,
         scavengeLoopEnabled: false,
         scavengeLoopIntervalSec: 600,
-        scavengeRoundMaxSec: 0,
+        scavengeRoundMaxSec: 480,
         countryCode: "86",
         phoneNumber: "",
         ocrApiUrl: DEFAULT_OCR_API_URL,
@@ -2213,13 +2463,22 @@ chrome.runtime.onInstalled.addListener(async () => {
         ocrAccessTokenExpiresAt: 0,
         ocrLicenseExpiresAt: 0,
         ocrLicenseActivatedAt: 0,
+        captchaAutoFillEnabled: true,
         vpnApiUrl: "http://127.0.0.1:8000",
-        vpnAutoSwitchEnabled: true,
-        queueVpnNotifyEnabled: true,
+        vpnAutoSwitchEnabled: false,
+        queueVpnNotifyEnabled: false,
+        queueNotifyEnabled: true,
+        cloudflareNotifyEnabled: true,
+        captchaNotifyEnabled: true,
+        successNotifyEnabled: true,
         alarmApiUrl: DEFAULT_ALARM_API_URL,
         cloudflareClickApiUrl: DEFAULT_CLOUDFLARE_CLICK_API_URL,
+        queueNotifyThresholds: DEFAULT_QUEUE_NOTIFY_THRESHOLDS.slice(),
+        notifyProvider: "dingtalk",
         dingTalkWebhookUrl: "",
-        dingTalkSecret: ""
+        dingTalkSecret: "",
+        telegramBotToken: "",
+        telegramChatId: ""
       }
     });
     return;
@@ -2238,7 +2497,15 @@ chrome.runtime.onInstalled.addListener(async () => {
     String(current?.ocrApiUrl || "").trim() !== normalizedOcrApiUrl ||
     String(current?.ocrDeviceId || "").trim() !== normalizedOcrDeviceId ||
     String(current?.alarmApiUrl || current?.callApiUrl || "").trim() !== normalizedAlarmApiUrl ||
-    String(current?.cloudflareClickApiUrl || "").trim() !== normalizedCloudflareClickApiUrl
+    String(current?.cloudflareClickApiUrl || "").trim() !== normalizedCloudflareClickApiUrl ||
+    current?.vpnAutoSwitchEnabled !== false ||
+    current?.queueVpnNotifyEnabled !== false ||
+    typeof current?.queueNotifyEnabled !== "boolean" ||
+    typeof current?.cloudflareNotifyEnabled !== "boolean" ||
+    typeof current?.captchaNotifyEnabled !== "boolean" ||
+    typeof current?.successNotifyEnabled !== "boolean" ||
+    typeof current?.captchaAutoFillEnabled !== "boolean" ||
+    typeof current?.legacyCompetitionUiEnabled !== "boolean"
   ) {
     await chrome.storage.local.set({
       [STORAGE_KEY]: {
@@ -2246,20 +2513,35 @@ chrome.runtime.onInstalled.addListener(async () => {
         ocrApiUrl: normalizedOcrApiUrl,
         ocrDeviceId: normalizedOcrDeviceId,
         alarmApiUrl: normalizedAlarmApiUrl,
-        cloudflareClickApiUrl: normalizedCloudflareClickApiUrl
+        cloudflareClickApiUrl: normalizedCloudflareClickApiUrl,
+        queueNotifyThresholds: normalizeQueueNotifyThresholds(
+          current?.queueNotifyThresholds,
+          DEFAULT_QUEUE_NOTIFY_THRESHOLDS
+        ),
+        queueNotifyEnabled: current?.queueNotifyEnabled !== false,
+        cloudflareNotifyEnabled: current?.cloudflareNotifyEnabled !== false,
+        captchaNotifyEnabled: current?.captchaNotifyEnabled !== false,
+        successNotifyEnabled: current?.successNotifyEnabled !== false,
+        captchaAutoFillEnabled: current?.captchaAutoFillEnabled !== false,
+        legacyCompetitionUiEnabled: current?.legacyCompetitionUiEnabled === true,
+        notifyProvider: normalizeNotifyProvider(current?.notifyProvider, "dingtalk"),
+        vpnAutoSwitchEnabled: false,
+        queueVpnNotifyEnabled: false,
+        telegramBotToken: String(current?.telegramBotToken || "").trim(),
+        telegramChatId: String(current?.telegramChatId || "").trim()
       }
     });
   }
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  if (!pendingKickTabs.has(tabId)) return;
   if (changeInfo.status !== "complete") return;
   const cfg = await getConfig();
   if (!cfg.enabled) {
     pendingKickTabs.delete(tabId);
     return;
   }
+  if (!pendingKickTabs.has(tabId)) return;
   if (!isSupportedTicketUrl(tab?.url || "")) {
     pendingKickTabs.delete(tabId);
     return;
@@ -2297,41 +2579,49 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   nativeDialogDebuggerTabs.delete(Number(tabId));
 });
 
-chrome.debugger.onDetach.addListener((source) => {
-  const tabId = Number(source?.tabId);
-  if (!Number.isInteger(tabId) || tabId <= 0) return;
-  nativeDialogDebuggerTabs.delete(tabId);
-});
+if (
+  DEBUGGER_API_AVAILABLE &&
+  DEBUGGER_API?.onDetach &&
+  typeof DEBUGGER_API.onDetach.addListener === "function" &&
+  DEBUGGER_API?.onEvent &&
+  typeof DEBUGGER_API.onEvent.addListener === "function"
+) {
+  DEBUGGER_API.onDetach.addListener((source) => {
+    const tabId = Number(source?.tabId);
+    if (!Number.isInteger(tabId) || tabId <= 0) return;
+    nativeDialogDebuggerTabs.delete(tabId);
+  });
 
-chrome.debugger.onEvent.addListener(async (source, method, params) => {
-  if (method !== "Page.javascriptDialogOpening") return;
-  const tabId = Number(source?.tabId);
-  if (!Number.isInteger(tabId) || tabId <= 0) return;
-  if (!nativeDialogDebuggerTabs.has(tabId)) return;
-  try {
-    await chrome.debugger.sendCommand(
-      { tabId },
-      "Page.handleJavaScriptDialog",
-      {
-        accept: true,
-        promptText: String(params?.defaultPrompt ?? "")
-      }
-    );
-    await chrome.storage.local.set({
-      nolBotLastLog: {
-        text: `已通过Debugger自动确认原生弹窗: ${String(params?.type || "unknown")}`,
-        ts: Date.now()
-      }
-    });
-  } catch (err) {
-    await chrome.storage.local.set({
-      nolBotLastLog: {
-        text: `Debugger处理原生弹窗失败: ${String(err?.message || err)}`,
-        ts: Date.now()
-      }
-    });
-  }
-});
+  DEBUGGER_API.onEvent.addListener(async (source, method, params) => {
+    if (method !== "Page.javascriptDialogOpening") return;
+    const tabId = Number(source?.tabId);
+    if (!Number.isInteger(tabId) || tabId <= 0) return;
+    if (!nativeDialogDebuggerTabs.has(tabId)) return;
+    try {
+      await DEBUGGER_API.sendCommand(
+        { tabId },
+        "Page.handleJavaScriptDialog",
+        {
+          accept: true,
+          promptText: String(params?.defaultPrompt ?? "")
+        }
+      );
+      await chrome.storage.local.set({
+        nolBotLastLog: {
+          text: `已通过Debugger自动确认原生弹窗: ${String(params?.type || "unknown")}`,
+          ts: Date.now()
+        }
+      });
+    } catch (err) {
+      await chrome.storage.local.set({
+        nolBotLastLog: {
+          text: `Debugger处理原生弹窗失败: ${String(err?.message || err)}`,
+          ts: Date.now()
+        }
+      });
+    }
+  });
+}
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   (async () => {
@@ -2481,6 +2771,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           frame: message.frame || "unknown"
         }
       });
+      const tabId = _sender?.tab?.id;
+      const frame = String(message.frame || "").toLowerCase();
+      const host = String(message.host || "").toLowerCase();
+      if (Number.isInteger(tabId) && frame === "top" && isLikelyBookingHost(host)) {
+        try {
+          const cfg = await getConfig();
+          if (cfg?.enabled) {
+            await setNativeDialogAutoConfirmInMainWorld(
+              tabId,
+              Number.isInteger(_sender?.frameId) ? _sender.frameId : undefined,
+              true
+            );
+            await setSliderCaptchaDebugHookInMainWorld(tabId, true);
+          }
+        } catch (_) {}
+      }
       sendResponse({ ok: true });
       return;
     }
@@ -2574,6 +2880,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return;
     }
 
+    if (message?.type === "RESAMPLE_SLIDER_CAPTCHA_DEBUG_MAIN") {
+      const tabId = _sender?.tab?.id;
+      const result = await setSliderCaptchaDebugHookInMainWorld(tabId, true, {
+        resampleNow: true,
+        silent: true
+      });
+      sendResponse({ ok: Boolean(result?.ok), result });
+      return;
+    }
+
     if (message?.type === "OCR_REQUEST") {
       try {
         let cfg = await getConfig();
@@ -2645,38 +2961,55 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return;
     }
 
-    if (message?.type === "DINGTALK_NOTIFY") {
+    if (message?.type === "REMOTE_NOTIFY") {
+      let provider = "dingtalk";
       try {
         const cfg = await getConfig();
-        const webhook = String(cfg?.dingTalkWebhookUrl || "").trim();
-        const secret = String(cfg?.dingTalkSecret || "").trim();
-        if (!webhook) {
-          sendResponse({ ok: false, error: "DingTalk webhook 未配置" });
-          return;
-        }
+        provider = normalizeNotifyProvider(cfg?.notifyProvider, "dingtalk");
         const eventKey = String(message?.eventKey || "").trim();
         if (eventKey && (await hasSentDingEvent(eventKey))) {
           sendResponse({ ok: true, sent: false, dedup: true });
           return;
         }
-        await sendDingTalkText(
-          webhook,
-          secret,
-          String(message?.title || "NOL BOT 通知"),
-          String(message?.text || "")
-        );
+
+        const title = String(message?.title || "NOL BOT 通知");
+        const text = String(message?.text || "");
+        let successLabel = "钉钉通知";
+        let failureLabel = "钉钉通知";
+
+        if (provider === "telegram") {
+          const botToken = String(cfg?.telegramBotToken || "").trim();
+          const chatId = String(cfg?.telegramChatId || "").trim();
+          if (!botToken || !chatId) {
+            sendResponse({ ok: false, error: "Telegram Bot Token 或 Chat ID 未配置" });
+            return;
+          }
+          successLabel = "Telegram 通知";
+          failureLabel = "Telegram 通知";
+          await sendTelegramText(botToken, chatId, title, text);
+        } else {
+          const webhook = String(cfg?.dingTalkWebhookUrl || "").trim();
+          const secret = String(cfg?.dingTalkSecret || "").trim();
+          if (!webhook) {
+            sendResponse({ ok: false, error: "DingTalk webhook 未配置" });
+            return;
+          }
+          await sendDingTalkText(webhook, secret, title, text);
+        }
+
         if (eventKey) await markDingEventSent(eventKey);
         await chrome.storage.local.set({
           nolBotLastLog: {
-            text: `钉钉通知已发送: ${String(message?.title || "通知")}`,
+            text: `${successLabel}已发送: ${title}`,
             ts: Date.now()
           }
         });
         sendResponse({ ok: true, sent: true });
       } catch (err) {
+        const label = provider === "telegram" ? "Telegram 通知" : "钉钉通知";
         await chrome.storage.local.set({
           nolBotLastLog: {
-            text: `钉钉通知发送失败: ${String(err?.message || err)}`,
+            text: `${label}发送失败: ${String(err?.message || err)}`,
             ts: Date.now()
           }
         });

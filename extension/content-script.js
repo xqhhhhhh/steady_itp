@@ -1,6 +1,15 @@
 const STORAGE_KEY = "nolBotConfig";
 const EXIMBAY_ACTIVE_KEY = "nolBotEximbayActive";
+const LOG_PANEL_UI_STATE_KEY = "nolBotLogOverlayState";
 const DEFAULT_OCR_API_URL = "https://api.nexuschat.top/ocr-api/ocr/file";
+const DEFAULT_QUEUE_NOTIFY_THRESHOLDS = [1000, 100, 10];
+const DEFAULT_LEGACY_AREA_SWITCH_INTERVAL_MS = 5000;
+const DEFAULT_LEGACY_AREA_SETTLE_MS = 200;
+const DEFAULT_LEGACY_AREA_RANDOM_JITTER_MS = 100;
+const LOG_PANEL_DEFAULT_WIDTH = 360;
+const LOG_PANEL_DEFAULT_HEIGHT = 240;
+const LOG_PANEL_MIN_WIDTH = 280;
+const LOG_PANEL_MIN_HEIGHT = 120;
 const SLIDER_CAPTCHA_DRAG_COOLDOWN_MS = 2600;
 const SLIDER_CAPTCHA_DEBUG_DISTANCE_TTL_MS = 30000;
 const SLIDER_CAPTCHA_FALLBACK_DISTANCE = 220;
@@ -22,7 +31,7 @@ const state = {
     reserveClickStartMode: "edge_once",
     scavengeLoopEnabled: false,
     scavengeLoopIntervalSec: 600,
-    scavengeRoundMaxSec: 0,
+    scavengeRoundMaxSec: 480,
     quantity: 1,
     dateMonth: "",
     dateDay: "",
@@ -31,9 +40,10 @@ const state = {
     newAreaCustomCodes: [],
     legacyAreaOrderMode: "default",
     legacyAreaCustomCodes: [],
-    legacyAreaSwitchIntervalMs: 1200,
-    legacyAreaSettleMs: 1200,
-    legacyAreaRandomJitterMs: 0,
+    legacyCompetitionUiEnabled: false,
+    legacyAreaSwitchIntervalMs: DEFAULT_LEGACY_AREA_SWITCH_INTERVAL_MS,
+    legacyAreaSettleMs: DEFAULT_LEGACY_AREA_SETTLE_MS,
+    legacyAreaRandomJitterMs: DEFAULT_LEGACY_AREA_RANDOM_JITTER_MS,
     countryCode: "86",
     phoneNumber: "",
     ocrApiUrl: DEFAULT_OCR_API_URL,
@@ -44,11 +54,20 @@ const state = {
     ocrAccessTokenExpiresAt: 0,
     ocrLicenseExpiresAt: 0,
     ocrLicenseActivatedAt: 0,
+    captchaAutoFillEnabled: true,
     vpnApiUrl: "http://127.0.0.1:8000",
-    vpnAutoSwitchEnabled: true,
-    queueVpnNotifyEnabled: true,
+    vpnAutoSwitchEnabled: false,
+    queueVpnNotifyEnabled: false,
+    queueNotifyEnabled: true,
+    cloudflareNotifyEnabled: true,
+    captchaNotifyEnabled: true,
+    successNotifyEnabled: true,
+    queueNotifyThresholds: DEFAULT_QUEUE_NOTIFY_THRESHOLDS.slice(),
+    notifyProvider: "dingtalk",
     dingTalkWebhookUrl: "",
-    dingTalkSecret: ""
+    dingTalkSecret: "",
+    telegramBotToken: "",
+    telegramChatId: ""
   },
   intervalId: null,
   busy: false,
@@ -60,7 +79,19 @@ const state = {
   totalButtonClicked: false,
   logPanelEl: null,
   logListEl: null,
+  logPanelToggleEl: null,
+  logPanelDragHandleEl: null,
+  logPanelResizeHandleEl: null,
   logBuffer: [],
+  logPanelUi: {
+    width: LOG_PANEL_DEFAULT_WIDTH,
+    height: LOG_PANEL_DEFAULT_HEIGHT,
+    collapsed: false,
+    left: null,
+    top: null
+  },
+  logPanelUiLoaded: false,
+  logPanelUiLoading: false,
   eximbaySignalAt: 0,
   eximbayFlowKey: "",
   eximbayWechatClicked: false,
@@ -89,6 +120,8 @@ const state = {
   reserveEntryClickedOnce: false,
   reserveEntryTargetLogSig: "",
   reserveEntryTargetLastLogAt: 0,
+  legacyCompetitionNoticeCloseLastClickAt: 0,
+  legacyCompetitionNoticeCloseLastLogAt: 0,
   productLastCountdownLogAt: 0,
   queueLastLogAt: 0,
   queueActive: false,
@@ -135,6 +168,7 @@ const state = {
   sliderCaptchaDebugBridgeReady: false,
   sliderCaptchaDebugLastEventAt: 0,
   sliderCaptchaDebugLastSig: "",
+  sliderCaptchaResampleLastAt: 0,
   lastStage: "unknown",
   lastBookingPageVariant: "unknown",
   notifySale3mSent: false,
@@ -143,6 +177,9 @@ const state = {
   inpageTicketAlarmActive: false,
   inpageTicketAlarmTimerId: 0,
   inpageTicketAlarmAudioCtx: null,
+  inpageTicketAlarmHtmlAudio: null,
+  inpageTicketAlarmHtmlAudioStarted: false,
+  inpageTicketAlarmFallbackLogged: false,
   inpageTicketAlarmLastWarnAt: 0,
   scavengeLoopSuccess: false,
   scavengeLoopNextRestartAt: 0,
@@ -151,14 +188,12 @@ const state = {
   scavengeLoopTimeoutPausedAt: 0,
   scavengeLoopLastWaitLogAt: 0,
   scavengeLoopLastWaitTargetAt: 0,
-  notifyQueueThresholdSent: {
-    1000: false,
-    100: false,
-    10: false
-  },
+  notifyQueueThresholdSent: {},
   newSeatFlowKey: "",
   newSeatBlockedMap: {},
   newSeatLastAttemptKey: "",
+  newSeatLastClickedKey: "",
+  newSeatZoomClickCount: 0,
   legacySeatFlowKey: "",
   legacySeatAreaIndex: 0,
   legacySeatCurrentAreaCode: "",
@@ -187,6 +222,7 @@ const state = {
     ts: 0,
     count: 0
   },
+  newSeatZoomLastClickAt: 0,
   crossFrameDialogSweepLastAt: 0,
   captcha: {
     lastImageSig: "",
@@ -194,6 +230,9 @@ const state = {
     submitCount: 0,
     solvedAt: 0,
     lastPassLogAt: 0,
+    lastDisabledLogAt: 0,
+    lastMissingInputSig: "",
+    lastMissingInputAt: 0,
     candidates: [],
     candidateIndex: 0,
     legacyFirstInputDelayDone: false
@@ -246,9 +285,9 @@ const TICK_MS_CRITICAL_DEFAULT = 65;
 const INPAGE_TICKET_ALARM_INTERVAL_MS = 1200;
 const QUEUE_KEEP_ALIVE_MIN_MS = 2.2 * 60 * 1000;
 const QUEUE_KEEP_ALIVE_MAX_MS = 4.8 * 60 * 1000;
-const LEGACY_AREA_SETTLE_MS = 1200;
-const LEGACY_AREA_SWITCH_INTERVAL_MS = 1200;
-const LEGACY_AREA_RANDOM_JITTER_MS = 0;
+const LEGACY_AREA_SETTLE_MS = DEFAULT_LEGACY_AREA_SETTLE_MS;
+const LEGACY_AREA_SWITCH_INTERVAL_MS = DEFAULT_LEGACY_AREA_SWITCH_INTERVAL_MS;
+const LEGACY_AREA_RANDOM_JITTER_MS = DEFAULT_LEGACY_AREA_RANDOM_JITTER_MS;
 const SEAT_BLOCK_TTL_MS = 30 * 1000;
 const IS_TOP_FRAME = window.top === window;
 const BOT_OWNER_KEY = "__nolBotTopOwner";
@@ -287,6 +326,43 @@ function normalizeNewAreaOrderMode(raw) {
 
 function normalizeNewAreaCustomCodes(raw) {
   return normalizeLegacyAreaCustomCodes(raw);
+}
+
+function normalizeNotifyProvider(raw, fallback = "dingtalk") {
+  const value = String(raw || "").trim().toLowerCase();
+  if (value === "telegram") return "telegram";
+  if (value === "dingtalk") return "dingtalk";
+  return fallback === "telegram" ? "telegram" : "dingtalk";
+}
+
+function normalizeQueueNotifyThresholds(raw, fallback = DEFAULT_QUEUE_NOTIFY_THRESHOLDS) {
+  const values = Array.isArray(raw) ? raw : String(raw || "").split(/[,\s]+/);
+  const seen = new Set();
+  const out = [];
+  for (const item of values) {
+    const n = Number(String(item || "").trim());
+    if (!Number.isFinite(n)) continue;
+    const threshold = Math.min(999999, Math.max(1, Math.round(n)));
+    if (seen.has(threshold)) continue;
+    seen.add(threshold);
+    out.push(threshold);
+  }
+  if (!out.length) {
+    return Array.isArray(fallback) ? fallback.slice() : DEFAULT_QUEUE_NOTIFY_THRESHOLDS.slice();
+  }
+  out.sort((a, b) => b - a);
+  return out;
+}
+
+function buildQueueNotifyThresholdState(thresholds) {
+  const map = {};
+  for (const threshold of normalizeQueueNotifyThresholds(
+    thresholds,
+    DEFAULT_QUEUE_NOTIFY_THRESHOLDS
+  )) {
+    map[threshold] = false;
+  }
+  return map;
 }
 
 function buildNewAreaOrderMap() {
@@ -593,8 +669,8 @@ function normalizeScavengeRoundMaxSec(raw, fallback = 0) {
 
 function normalizeLegacyAreaTimingMs(raw, fallback = 1200) {
   const n = Number(raw);
-  if (!Number.isFinite(n)) return Math.min(5000, Math.max(120, Math.round(Number(fallback) || 1200)));
-  return Math.min(5000, Math.max(120, Math.round(n)));
+  if (!Number.isFinite(n)) return Math.max(120, Math.round(Number(fallback) || 1200));
+  return Math.max(120, Math.round(n));
 }
 
 function normalizeLegacyAreaRandomJitterMs(raw, fallback = 0) {
@@ -620,7 +696,7 @@ function getLegacyAreaSwitchIntervalMs() {
     state.config.legacyAreaRandomJitterMs,
     LEGACY_AREA_RANDOM_JITTER_MS
   );
-  return withJitterMs(base, jitter, 120, 5000);
+  return withJitterMs(base, jitter, 120, 50000);
 }
 
 function getLegacyAreaSettleMs() {
@@ -694,7 +770,12 @@ async function syncNativeDialogAutoConfirm(force = false) {
 function shouldEnableSliderCaptchaDebugHook() {
   if (!state.config.enabled) return false;
   const host = String(location.host || "").toLowerCase();
-  return host === "gpoticket.globalinterpark.com" || isLegacyBookingUrl();
+  return (
+    host === "tickets.interpark.com" ||
+    host === "ticket.globalinterpark.com" ||
+    host === "gpoticket.globalinterpark.com" ||
+    isLegacyBookingUrl()
+  );
 }
 
 function formatSliderCaptchaDebugSource(raw) {
@@ -763,6 +844,23 @@ function handleSliderCaptchaDebugPayload(raw, source = "event") {
     return;
   }
 
+  if (phase === "hook_ready") {
+    log(`滑块调试Hook已挂载(${source})`);
+    return;
+  }
+
+  if (phase === "hook_toggle") {
+    log(
+      `滑块调试Hook状态(${source}): enabled=${raw.enabled === true}, patched=${raw.patched === true}, sampled=${raw.liveSampled === true}`
+    );
+    return;
+  }
+
+  if (phase === "live_sample_missing") {
+    log(`滑块调试Hook已挂载，但未采到当前实例(${source})`);
+    return;
+  }
+
   if (phase === "hook_error") {
     log(`滑块调试Hook异常(${source}): ${String(raw.error || raw.msg || "unknown")}`);
   }
@@ -816,28 +914,28 @@ async function syncSliderCaptchaDebugHook(force = false) {
   } catch (_) {}
 }
 
-async function sendDingTalkNotify(eventKey, title, text) {
+async function sendRemoteNotify(eventKey, title, text) {
   if (window.top !== window) return false;
   try {
     const resp = await chrome.runtime.sendMessage({
-      type: "DINGTALK_NOTIFY",
+      type: "REMOTE_NOTIFY",
       eventKey: String(eventKey || "").trim(),
       title: String(title || "NOL BOT 通知"),
       text: String(text || "")
     });
     if (resp?.ok && resp.sent) {
-      log(`钉钉通知已发送: ${title}`);
+      log(`远程通知已发送: ${title}`);
       return true;
     }
     if (resp?.ok && resp?.dedup) {
-      log(`钉钉通知去重跳过: ${title}`);
+      log(`远程通知去重跳过: ${title}`);
       return false;
     }
     if (resp?.error) {
-      log(`钉钉通知发送失败: ${String(resp.error)}`);
+      log(`远程通知发送失败: ${String(resp.error)}`);
     }
   } catch (err) {
-    log(`钉钉通知发送异常: ${String(err?.message || err)}`);
+    log(`远程通知发送异常: ${String(err?.message || err)}`);
   }
   return false;
 }
@@ -886,6 +984,19 @@ function stopInpageTicketAlarm(reason = "") {
     ctx.close().catch(() => {});
   }
 
+  const audio = state.inpageTicketAlarmHtmlAudio;
+  state.inpageTicketAlarmHtmlAudio = null;
+  state.inpageTicketAlarmHtmlAudioStarted = false;
+  state.inpageTicketAlarmFallbackLogged = false;
+  try {
+    if (audio) {
+      audio.pause();
+      audio.currentTime = 0;
+      audio.removeAttribute("src");
+      audio.load?.();
+    }
+  } catch (_) {}
+
   if (reason) {
     log(`插件内到票响铃已停止 (${reason})`);
   }
@@ -905,16 +1016,120 @@ function getInpageTicketAlarmAudioContext() {
   }
 }
 
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+function buildInpageTicketAlarmWavDataUrl() {
+  const sampleRate = 8000;
+  const totalSeconds = 0.72;
+  const sampleCount = Math.max(1, Math.floor(sampleRate * totalSeconds));
+  const pcm = new Int16Array(sampleCount);
+  const notes = [
+    { start: 0.00, end: 0.16, freq: 1460 },
+    { start: 0.20, end: 0.36, freq: 1080 },
+    { start: 0.40, end: 0.56, freq: 1460 }
+  ];
+
+  for (let i = 0; i < sampleCount; i += 1) {
+    const t = i / sampleRate;
+    let value = 0;
+    for (const note of notes) {
+      if (t < note.start || t > note.end) continue;
+      const local = t - note.start;
+      const duration = Math.max(0.001, note.end - note.start);
+      const edge = Math.min(0.012, duration / 3);
+      let gain = 0.24;
+      if (local < edge) gain *= local / edge;
+      else if (local > duration - edge) gain *= (duration - local) / edge;
+      value += Math.sin(2 * Math.PI * note.freq * local) * gain;
+    }
+    const clipped = Math.max(-1, Math.min(1, value));
+    pcm[i] = Math.round(clipped * 32767);
+  }
+
+  const dataSize = pcm.length * 2;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+  const writeStr = (offset, text) => {
+    for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i));
+  };
+
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, "data");
+  view.setUint32(40, dataSize, true);
+  for (let i = 0; i < pcm.length; i += 1) {
+    view.setInt16(44 + i * 2, pcm[i], true);
+  }
+  return `data:audio/wav;base64,${arrayBufferToBase64(buffer)}`;
+}
+
+function getInpageTicketAlarmHtmlAudio() {
+  const cached = state.inpageTicketAlarmHtmlAudio;
+  if (cached) return cached;
+  try {
+    const audio = new Audio();
+    audio.preload = "auto";
+    audio.loop = true;
+    audio.src = buildInpageTicketAlarmWavDataUrl();
+    state.inpageTicketAlarmHtmlAudio = audio;
+    return audio;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function tryStartInpageTicketAlarmHtmlAudio() {
+  const audio = getInpageTicketAlarmHtmlAudio();
+  if (!audio) return false;
+  if (state.inpageTicketAlarmHtmlAudioStarted) return true;
+  try {
+    audio.currentTime = 0;
+  } catch (_) {}
+  try {
+    await audio.play();
+    state.inpageTicketAlarmHtmlAudioStarted = true;
+    if (!state.inpageTicketAlarmFallbackLogged) {
+      log("到票提醒已切换到备用音频通道");
+      state.inpageTicketAlarmFallbackLogged = true;
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 async function playInpageTicketAlarmOnce() {
   const ctx = getInpageTicketAlarmAudioContext();
-  if (!ctx) return false;
+  if (!ctx) {
+    return await tryStartInpageTicketAlarmHtmlAudio();
+  }
 
   if (ctx.state === "suspended") {
     try {
       await ctx.resume();
     } catch (_) {}
   }
-  if (ctx.state !== "running") return false;
+  if (ctx.state !== "running") {
+    return await tryStartInpageTicketAlarmHtmlAudio();
+  }
 
   const base = ctx.currentTime + 0.01;
   const notes = [1460, 1080, 1460];
@@ -932,6 +1147,7 @@ async function playInpageTicketAlarmOnce() {
     osc.start(t);
     osc.stop(t + 0.17);
   }
+  state.inpageTicketAlarmFallbackLogged = false;
   return true;
 }
 
@@ -1069,6 +1285,22 @@ function shouldPushQueueVpnNotify() {
   return state.config.queueVpnNotifyEnabled !== false;
 }
 
+function shouldPushQueueNotify() {
+  return state.config.queueNotifyEnabled !== false;
+}
+
+function shouldPushCloudflareNotify() {
+  return state.config.cloudflareNotifyEnabled !== false;
+}
+
+function shouldPushCaptchaNotify() {
+  return state.config.captchaNotifyEnabled !== false;
+}
+
+function shouldPushSuccessNotify() {
+  return state.config.successNotifyEnabled !== false;
+}
+
 async function runQueueHealthGuard() {
   const now = Date.now();
   if (now - state.queueHealth.lastProbeAt < state.queueHealth.probeIntervalMs) return;
@@ -1086,7 +1318,7 @@ async function runQueueHealthGuard() {
   if (health.ok) {
     if (state.queueHealth.alertActive) {
       if (shouldPushQueueVpnNotify()) {
-        await sendDingTalkNotify(
+        await sendRemoteNotify(
           `queue_recovered_${state.config.saleStartTime || location.pathname}`,
           "排队网络已恢复",
           `网络探测恢复正常，当前队列约 ${Number.isFinite(remaining) ? remaining : "未知"}。`
@@ -1106,7 +1338,7 @@ async function runQueueHealthGuard() {
   const canResend = now - state.queueHealth.lastAlertAt > 60000;
   if (!state.queueHealth.alertActive || canResend) {
     if (shouldPushQueueVpnNotify()) {
-      await sendDingTalkNotify(
+      await sendRemoteNotify(
         `queue_unhealthy_${state.config.saleStartTime || location.pathname}`,
         "排队网络异常（重度）",
         `连续探测失败 ${state.queueHealth.consecutiveFail} 次，原因: ${health.reason || "unknown"}，当前队列约 ${Number.isFinite(remaining) ? remaining : "未知"}。`
@@ -1126,7 +1358,7 @@ async function runQueueHealthGuard() {
   if (switched.ok) {
     log("已触发 VPN 自动切换");
     if (shouldPushQueueVpnNotify()) {
-      await sendDingTalkNotify(
+      await sendRemoteNotify(
         `vpn_switched_${state.config.saleStartTime || location.pathname}_${Math.floor(now / 600000)}`,
         "已触发 VPN 自动切换",
         `队列网络连续异常，已请求自动切换 VPN。当前队列约 ${Number.isFinite(remaining) ? remaining : "未知"}。`
@@ -1144,7 +1376,7 @@ async function maybeNotifySale3Minutes() {
   state.notifySale3mSent = true;
   const startAt = getSaleStartTimestamp();
   const at = startAt ? new Date(startAt).toLocaleString() : "未知";
-  await sendDingTalkNotify(
+  await sendRemoteNotify(
     `sale_3m_${state.config.saleStartTime || "unknown"}`,
     "开抢前3分钟提醒",
     `距开抢约 3 分钟，请确认已登录、页面在线、网络稳定。开抢时间: ${at}`
@@ -1152,12 +1384,17 @@ async function maybeNotifySale3Minutes() {
 }
 
 async function maybeNotifyQueueThresholds() {
+  if (!shouldPushQueueNotify()) return;
   const remaining = parseQueueRemaining();
   if (!Number.isFinite(remaining)) return;
-  for (const threshold of [1000, 100, 10]) {
+  const thresholds = normalizeQueueNotifyThresholds(
+    state.config.queueNotifyThresholds,
+    DEFAULT_QUEUE_NOTIFY_THRESHOLDS
+  );
+  for (const threshold of thresholds) {
     if (remaining <= threshold && !state.notifyQueueThresholdSent[threshold]) {
       state.notifyQueueThresholdSent[threshold] = true;
-      await sendDingTalkNotify(
+      await sendRemoteNotify(
         `queue_${threshold}_${state.config.saleStartTime || location.pathname}`,
         `排队剩余 <= ${threshold}`,
         `当前排队顺位约 ${remaining}，请准备关注页面放行。`
@@ -1220,12 +1457,13 @@ async function maybeNotifyBuyNowNoResponse() {
     state.buyNowNoResponseLastNotifyAt = 0;
     return;
   }
+  if (!shouldPushCloudflareNotify()) return;
 
   const now = Date.now();
   if (now - firstAt < 60 * 1000) return;
   if (now - Number(state.buyNowNoResponseLastNotifyAt || 0) < 90 * 1000) return;
 
-  const sent = await sendDingTalkNotify(
+  const sent = await sendRemoteNotify(
     `buy_now_no_response_${state.config.startedAt || state.config.saleStartTime || location.pathname}`,
     "疑似 Cloudflare 验证阻塞",
     `点击“购买入口（立即购买/先行订购）”已超过 1 分钟仍无页面放行，疑似出现 Cloudflare Verify you are human，请手动验证后继续。\n页面: ${location.href}`
@@ -1236,16 +1474,21 @@ async function maybeNotifyBuyNowNoResponse() {
 async function maybeNotifyEnteredPrice() {
   if (state.notifyPriceEnteredSent) return;
   state.notifyPriceEnteredSent = true;
+  state.newSeatLastAttemptKey = "";
+  state.newSeatLastClickedKey = "";
   const selected = detectSelectedSeatCount();
   const detailText = `已进入价格页(step=price)，当前检测已选座位数: ${selected}。`;
+  const eventNonce = Date.now();
   startInpageTicketAlarm("已进入价格页");
-  await sendDingTalkNotify(
-    `entered_price_${state.config.saleStartTime || location.pathname}${location.search}`,
-    "已进入价格页",
-    detailText
-  );
+  if (shouldPushSuccessNotify()) {
+    await sendRemoteNotify(
+      `entered_price_${state.config.saleStartTime || location.pathname}${location.search}_${eventNonce}`,
+      "已进入价格页",
+      detailText
+    );
+  }
   await sendLocalAlarmNotify(
-    `entered_price_alarm_${state.config.saleStartTime || location.pathname}${location.search}`,
+    `entered_price_alarm_${state.config.saleStartTime || location.pathname}${location.search}_${eventNonce}`,
     "已进入价格页",
     detailText
   );
@@ -1270,10 +1513,13 @@ async function maybeNotifyLegacySeatCompletedOnTransition() {
   const elapsed = now - triggeredAt;
   const stepNo = getLegacyActiveStepNumber();
   const seatVisible = isLegacySeatLayerVisible();
+  const competitionPriceVisible =
+    state.config.legacyCompetitionUiEnabled === true && isLegacyCompetitionPricePage();
   const progressedByStep = Number.isFinite(stepNo) && stepNo > 0 && stepNo !== 2;
   const progressedByLayer = elapsed > 1200 && !seatVisible && stepNo !== 2;
+  const progressedByCompetitionPrice = competitionPriceVisible;
 
-  if (!progressedByStep && !progressedByLayer) {
+  if (!progressedByStep && !progressedByLayer && !progressedByCompetitionPrice) {
     if (elapsed > 20000) {
       state.legacySeatSubmitTriggeredAt = 0;
     }
@@ -1283,14 +1529,19 @@ async function maybeNotifyLegacySeatCompletedOnTransition() {
   state.legacySeatSubmitTriggeredAt = 0;
   const selected = Math.max(1, Number(state.legacySeatSubmitSelectedAtTrigger) || 1);
   const target = Math.max(1, Number(state.legacySeatSubmitTargetAtTrigger) || 1);
-  const eventKey = `legacy_seat_done_${state.config.saleStartTime || "unknown"}_${location.pathname}_${location.search}`;
-  const detailText = `已选座并点击 completed，已进入下一界面。数量: ${selected}/${target}，step=${stepNo || "unknown"}，时间: ${new Date().toLocaleString()}`;
+  const eventKey = `legacy_seat_done_${state.config.saleStartTime || "unknown"}_${location.pathname}_${location.search}_${triggeredAt}`;
+  const transitionReason = progressedByCompetitionPrice
+    ? "已进入比赛场 Price/Discount 页面"
+    : "已进入下一界面";
+  const detailText = `已选座并点击 completed，${transitionReason}。数量: ${selected}/${target}，step=${stepNo || "unknown"}，时间: ${new Date().toLocaleString()}`;
   startInpageTicketAlarm("已提交座位");
-  const sent = await sendDingTalkNotify(
-    eventKey,
-    "抢票成功：已提交座位",
-    detailText
-  );
+  const sent = shouldPushSuccessNotify()
+    ? await sendRemoteNotify(
+        eventKey,
+        "抢票成功：已提交座位",
+        detailText
+      )
+    : true;
   await sendLocalAlarmNotify(
     `${eventKey}_alarm`,
     "抢票成功：已提交座位",
@@ -1734,6 +1985,32 @@ function getSliderCaptchaAutoDragDistance(preferredDoc = null) {
   };
 }
 
+function hasFreshSliderCaptchaDebugDistance(now = Date.now()) {
+  const debugDistance = Number(state.sliderCaptchaTargetDistance || 0);
+  return (
+    debugDistance > 0 &&
+    now - Number(state.sliderCaptchaTargetDistanceAt || 0) <= SLIDER_CAPTCHA_DEBUG_DISTANCE_TTL_MS
+  );
+}
+
+async function requestSliderCaptchaDebugResample(force = false) {
+  if (!IS_TOP_FRAME) return false;
+  if (!shouldEnableSliderCaptchaDebugHook()) return false;
+  const now = Date.now();
+  if (!force && now - Number(state.sliderCaptchaResampleLastAt || 0) < 900) {
+    return false;
+  }
+  state.sliderCaptchaResampleLastAt = now;
+  try {
+    const resp = await chrome.runtime.sendMessage({
+      type: "RESAMPLE_SLIDER_CAPTCHA_DEBUG_MAIN"
+    });
+    return resp?.ok === true;
+  } catch (_) {
+    return false;
+  }
+}
+
 async function runSliderCaptchaPauseGuard() {
   const active = isSliderCaptchaWidgetPresent();
   if (!active) {
@@ -1745,6 +2022,7 @@ async function runSliderCaptchaPauseGuard() {
       state.sliderCaptchaTargetDistance = 0;
       state.sliderCaptchaTargetDistanceAt = 0;
       state.sliderCaptchaTargetDistanceSource = "";
+      state.sliderCaptchaResampleLastAt = 0;
       log("滑块验证码已完成，恢复自动流程");
     }
     return false;
@@ -1752,6 +2030,9 @@ async function runSliderCaptchaPauseGuard() {
 
   const now = Date.now();
   const autoDragEnabled = state.config.sliderAutoDragSecretEnabled === true;
+  if (!hasFreshSliderCaptchaDebugDistance(now)) {
+    await requestSliderCaptchaDebugResample();
+  }
   if (
     autoDragEnabled &&
     now - Number(state.sliderCaptchaAutoDragLastAt || 0) >= SLIDER_CAPTCHA_DRAG_COOLDOWN_MS
@@ -1779,11 +2060,13 @@ async function runSliderCaptchaPauseGuard() {
 
   if (now - state.sliderCaptchaLastNotifyAt > 5 * 60 * 1000) {
     state.sliderCaptchaLastNotifyAt = now;
-    await sendDingTalkNotify(
-      "",
-      "检测到滑块验证码，已暂停",
-      `页面出现滑块验证码，自动流程已暂停。请手动完成滑块后，脚本会自动继续。\n页面: ${location.href}`
-    );
+    if (shouldPushCaptchaNotify()) {
+      await sendRemoteNotify(
+        "",
+        "检测到滑块验证码，已暂停",
+        `页面出现滑块验证码，自动流程已暂停。请手动完成滑块后，脚本会自动继续。\n页面: ${location.href}`
+      );
+    }
   }
   return true;
 }
@@ -1846,11 +2129,13 @@ async function runHumanVerifyStep() {
     !state.humanVerifyAlertActive || now - state.humanVerifyLastNotifyAt > 2 * 60 * 1000;
   if (shouldNotifyNow) {
     state.humanVerifyAlertActive = true;
-    const sent = await sendDingTalkNotify(
-      `human_verify_${location.pathname}_${now}`,
-      "检测到 Cloudflare 人机验证",
-      `页面出现 Verify you are human 验证，请及时处理。\n页面: ${location.href}`
-    );
+    const sent = shouldPushCloudflareNotify()
+      ? await sendRemoteNotify(
+          `human_verify_${location.pathname}_${now}`,
+          "检测到 Cloudflare 人机验证",
+          `页面出现 Verify you are human 验证，请及时处理。\n页面: ${location.href}`
+        )
+      : true;
     state.humanVerifyLastNotifyAt = sent ? now : now - 110 * 1000;
   }
 
@@ -1973,14 +2258,195 @@ async function runHumanVerifyStep() {
   return true;
 }
 
+function clampLogPanelWidth(raw) {
+  const maxWidth = Math.max(LOG_PANEL_MIN_WIDTH, window.innerWidth - 24);
+  const width = Number(raw || LOG_PANEL_DEFAULT_WIDTH);
+  if (!Number.isFinite(width)) return Math.min(LOG_PANEL_DEFAULT_WIDTH, maxWidth);
+  return Math.min(maxWidth, Math.max(LOG_PANEL_MIN_WIDTH, Math.round(width)));
+}
+
+function clampLogPanelHeight(raw) {
+  const maxHeight = Math.max(LOG_PANEL_MIN_HEIGHT, window.innerHeight - 72);
+  const height = Number(raw || LOG_PANEL_DEFAULT_HEIGHT);
+  if (!Number.isFinite(height)) return Math.min(LOG_PANEL_DEFAULT_HEIGHT, maxHeight);
+  return Math.min(maxHeight, Math.max(LOG_PANEL_MIN_HEIGHT, Math.round(height)));
+}
+
+async function persistLogPanelUiState() {
+  try {
+    await chrome.storage.local.set({
+      [LOG_PANEL_UI_STATE_KEY]: {
+        width: clampLogPanelWidth(state.logPanelUi.width),
+        height: clampLogPanelHeight(state.logPanelUi.height),
+        collapsed: Boolean(state.logPanelUi.collapsed),
+        left: Number.isFinite(state.logPanelUi.left) ? Math.round(state.logPanelUi.left) : null,
+        top: Number.isFinite(state.logPanelUi.top) ? Math.round(state.logPanelUi.top) : null
+      }
+    });
+  } catch (_) {}
+}
+
+function applyLogPanelUiState() {
+  if (
+    !state.logPanelEl ||
+    !state.logListEl ||
+    !state.logPanelToggleEl ||
+    !state.logPanelDragHandleEl
+  ) {
+    return;
+  }
+  state.logPanelUi.width = clampLogPanelWidth(state.logPanelUi.width);
+  state.logPanelUi.height = clampLogPanelHeight(state.logPanelUi.height);
+  state.logPanelEl.style.width = `${state.logPanelUi.width}px`;
+  state.logPanelEl.style.height = state.logPanelUi.collapsed
+    ? "auto"
+    : `${state.logPanelUi.height}px`;
+  state.logPanelEl.dataset.collapsed = state.logPanelUi.collapsed ? "true" : "false";
+  state.logListEl.style.display = state.logPanelUi.collapsed ? "none" : "block";
+  if (state.logPanelResizeHandleEl) {
+    state.logPanelResizeHandleEl.style.display = state.logPanelUi.collapsed ? "none" : "block";
+  }
+  state.logPanelToggleEl.textContent = state.logPanelUi.collapsed ? "展开" : "收起";
+  state.logPanelToggleEl.setAttribute(
+    "aria-expanded",
+    state.logPanelUi.collapsed ? "false" : "true"
+  );
+  state.logPanelDragHandleEl.style.cursor = state.logPanelUi.collapsed ? "grab" : "move";
+  const hasCustomPosition =
+    Number.isFinite(state.logPanelUi.left) && Number.isFinite(state.logPanelUi.top);
+  if (!hasCustomPosition) {
+    state.logPanelEl.style.left = "auto";
+    state.logPanelEl.style.top = "auto";
+    state.logPanelEl.style.right = "14px";
+    state.logPanelEl.style.bottom = "58px";
+    return;
+  }
+  state.logPanelEl.style.right = "auto";
+  state.logPanelEl.style.bottom = "auto";
+  state.logPanelEl.style.left = `${Math.round(state.logPanelUi.left)}px`;
+  state.logPanelEl.style.top = `${Math.round(state.logPanelUi.top)}px`;
+  const rect = state.logPanelEl.getBoundingClientRect();
+  const maxLeft = Math.max(8, window.innerWidth - rect.width - 8);
+  const maxTop = Math.max(8, window.innerHeight - rect.height - 8);
+  const clampedLeft = Math.min(maxLeft, Math.max(8, Math.round(state.logPanelUi.left)));
+  const clampedTop = Math.min(maxTop, Math.max(8, Math.round(state.logPanelUi.top)));
+  if (clampedLeft !== state.logPanelUi.left || clampedTop !== state.logPanelUi.top) {
+    state.logPanelUi.left = clampedLeft;
+    state.logPanelUi.top = clampedTop;
+    state.logPanelEl.style.left = `${clampedLeft}px`;
+    state.logPanelEl.style.top = `${clampedTop}px`;
+  }
+}
+
+function attachLogPanelResizeBehavior(handleEl) {
+  if (!handleEl || !state.logPanelEl) return;
+  let resizeSession = null;
+
+  const onPointerMove = (event) => {
+    if (!resizeSession) return;
+    state.logPanelUi.width = clampLogPanelWidth(
+      resizeSession.startWidth - (event.clientX - resizeSession.startX)
+    );
+    state.logPanelUi.height = clampLogPanelHeight(
+      resizeSession.startHeight - (event.clientY - resizeSession.startY)
+    );
+    applyLogPanelUiState();
+  };
+
+  const onPointerUp = async () => {
+    if (!resizeSession) return;
+    resizeSession = null;
+    window.removeEventListener("pointermove", onPointerMove);
+    window.removeEventListener("pointerup", onPointerUp);
+    window.removeEventListener("pointercancel", onPointerUp);
+    await persistLogPanelUiState();
+  };
+
+  handleEl.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || !state.logPanelEl) return;
+    event.preventDefault();
+    const rect = state.logPanelEl.getBoundingClientRect();
+    resizeSession = {
+      startX: event.clientX,
+      startY: event.clientY,
+      startWidth: rect.width,
+      startHeight: rect.height
+    };
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerUp);
+  });
+
+  window.addEventListener("resize", applyLogPanelUiState);
+}
+
+function attachLogPanelDragBehavior(handleEl) {
+  if (!handleEl || !state.logPanelEl) return;
+  let dragSession = null;
+
+  const onPointerMove = (event) => {
+    if (!dragSession) return;
+    const nextLeft = dragSession.startLeft + (event.clientX - dragSession.startX);
+    const nextTop = dragSession.startTop + (event.clientY - dragSession.startY);
+    state.logPanelUi.left = nextLeft;
+    state.logPanelUi.top = nextTop;
+    applyLogPanelUiState();
+  };
+
+  const onPointerUp = async () => {
+    if (!dragSession) return;
+    dragSession = null;
+    handleEl.style.cursor = state.logPanelUi.collapsed ? "grab" : "move";
+    window.removeEventListener("pointermove", onPointerMove);
+    window.removeEventListener("pointerup", onPointerUp);
+    window.removeEventListener("pointercancel", onPointerUp);
+    await persistLogPanelUiState();
+  };
+
+  handleEl.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || !state.logPanelEl) return;
+    if (event.target?.closest?.("button, a, input, select, textarea, [data-role='log-resize']")) {
+      return;
+    }
+    event.preventDefault();
+    const rect = state.logPanelEl.getBoundingClientRect();
+    state.logPanelUi.left = rect.left;
+    state.logPanelUi.top = rect.top;
+    applyLogPanelUiState();
+    dragSession = {
+      startX: event.clientX,
+      startY: event.clientY,
+      startLeft: rect.left,
+      startTop: rect.top
+    };
+    handleEl.style.cursor = "grabbing";
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerUp);
+  });
+}
+
 function ensureLogPanel() {
   if (!IS_TOP_FRAME) return;
   if (state.logPanelEl || !document.body) return;
   const existing = document.getElementById("nol-ticket-bot-log-panel");
   if (existing) {
-    state.logPanelEl = existing;
-    state.logListEl = existing.querySelector("div:last-child");
-    return;
+    const existingList = existing.querySelector("[data-role='log-list']");
+    const existingToggle = existing.querySelector("[data-role='log-toggle']");
+    const existingDrag = existing.querySelector("[data-role='log-drag']");
+    const existingResize = existing.querySelector("[data-role='log-resize']");
+    if (existingList && existingToggle && existingDrag && existingResize) {
+      state.logPanelEl = existing;
+      state.logListEl = existingList;
+      state.logPanelToggleEl = existingToggle;
+      state.logPanelDragHandleEl = existingDrag;
+      state.logPanelResizeHandleEl = existingResize;
+      attachLogPanelDragBehavior(existingDrag);
+      attachLogPanelResizeBehavior(existingResize);
+      applyLogPanelUiState();
+      return;
+    }
+    existing.remove();
   }
   const panel = document.createElement("div");
   panel.id = "nol-ticket-bot-log-panel";
@@ -1988,8 +2454,12 @@ function ensureLogPanel() {
     position: "fixed",
     right: "14px",
     bottom: "58px",
-    width: "360px",
-    maxHeight: "240px",
+    width: `${LOG_PANEL_DEFAULT_WIDTH}px`,
+    height: `${LOG_PANEL_DEFAULT_HEIGHT}px`,
+    minWidth: `${LOG_PANEL_MIN_WIDTH}px`,
+    minHeight: `${LOG_PANEL_MIN_HEIGHT}px`,
+    maxWidth: "calc(100vw - 24px)",
+    maxHeight: "calc(100vh - 72px)",
     overflow: "hidden",
     zIndex: "2147483647",
     background: "rgba(17,24,39,0.92)",
@@ -1998,33 +2468,138 @@ function ensureLogPanel() {
     borderRadius: "10px",
     boxShadow: "0 6px 20px rgba(0,0,0,.35)",
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-    fontSize: "11px"
+    fontSize: "11px",
+    display: "flex",
+    flexDirection: "column",
+    backdropFilter: "blur(10px)"
   });
 
   const title = document.createElement("div");
-  title.textContent = "NOL BOT Logs";
+  title.setAttribute("data-role", "log-drag");
   Object.assign(title.style, {
     padding: "8px 10px",
     borderBottom: "1px solid rgba(255,255,255,0.12)",
-    fontWeight: "600",
-    color: "#93c5fd"
+    color: "#93c5fd",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: "8px",
+    flex: "0 0 auto",
+    cursor: "move",
+    userSelect: "none"
   });
 
+  const titleTextWrap = document.createElement("div");
+  Object.assign(titleTextWrap.style, {
+    fontWeight: "600"
+  });
+  const titleText = document.createElement("div");
+  titleText.textContent = "NOL BOT Logs";
+  Object.assign(titleText.style, {
+    fontWeight: "600"
+  });
+  const titleHint = document.createElement("div");
+  titleHint.textContent = "页面运行日志";
+  Object.assign(titleHint.style, {
+    color: "rgba(191,219,254,0.72)",
+    fontSize: "10px",
+    marginTop: "2px"
+  });
+  titleTextWrap.appendChild(titleText);
+  titleTextWrap.appendChild(titleHint);
+
+  const actions = document.createElement("div");
+  Object.assign(actions.style, {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px"
+  });
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.setAttribute("data-role", "log-toggle");
+  Object.assign(toggle.style, {
+    border: "1px solid rgba(255,255,255,0.18)",
+    borderRadius: "999px",
+    background: "rgba(255,255,255,0.06)",
+    color: "#e5e7eb",
+    font: "inherit",
+    fontSize: "10px",
+    padding: "4px 10px",
+    cursor: "pointer"
+  });
+  toggle.textContent = "收起";
+  actions.appendChild(toggle);
+  title.appendChild(titleTextWrap);
+  title.appendChild(actions);
+
   const list = document.createElement("div");
+  list.setAttribute("data-role", "log-list");
   Object.assign(list.style, {
     padding: "8px 10px",
-    maxHeight: "190px",
+    flex: "1 1 auto",
+    minHeight: "0",
     overflowY: "auto",
     lineHeight: "1.4",
     whiteSpace: "pre-wrap",
     wordBreak: "break-word"
   });
 
+  const resizeHandle = document.createElement("div");
+  resizeHandle.setAttribute("data-role", "log-resize");
+  resizeHandle.title = "拖动调节大小";
+  Object.assign(resizeHandle.style, {
+    position: "absolute",
+    left: "0",
+    top: "0",
+    width: "18px",
+    height: "18px",
+    cursor: "nwse-resize",
+    background:
+      "linear-gradient(315deg, transparent 0 40%, rgba(255,255,255,0.14) 40% 50%, transparent 50% 62%, rgba(255,255,255,0.22) 62% 72%, transparent 72% 100%)"
+  });
+
   panel.appendChild(title);
   panel.appendChild(list);
+  panel.appendChild(resizeHandle);
   document.body.appendChild(panel);
   state.logPanelEl = panel;
   state.logListEl = list;
+  state.logPanelToggleEl = toggle;
+  state.logPanelDragHandleEl = title;
+  state.logPanelResizeHandleEl = resizeHandle;
+  toggle.addEventListener("click", async () => {
+    state.logPanelUi.collapsed = !state.logPanelUi.collapsed;
+    applyLogPanelUiState();
+    await persistLogPanelUiState();
+  });
+  attachLogPanelDragBehavior(title);
+  attachLogPanelResizeBehavior(resizeHandle);
+  if (!state.logPanelUiLoading && !state.logPanelUiLoaded) {
+    state.logPanelUiLoading = true;
+    chrome.storage.local
+      .get(LOG_PANEL_UI_STATE_KEY)
+      .then((all) => {
+        const raw = all?.[LOG_PANEL_UI_STATE_KEY];
+        if (raw && typeof raw === "object") {
+          state.logPanelUi = {
+            width: clampLogPanelWidth(raw.width),
+            height: clampLogPanelHeight(raw.height),
+            collapsed: Boolean(raw.collapsed),
+            left: Number.isFinite(raw.left) ? Math.round(raw.left) : null,
+            top: Number.isFinite(raw.top) ? Math.round(raw.top) : null
+          };
+        }
+        state.logPanelUiLoaded = true;
+        state.logPanelUiLoading = false;
+        applyLogPanelUiState();
+      })
+      .catch(() => {
+        state.logPanelUiLoaded = true;
+        state.logPanelUiLoading = false;
+        applyLogPanelUiState();
+      });
+  }
+  applyLogPanelUiState();
 }
 
 function pushVisibleLog(text) {
@@ -2151,6 +2726,166 @@ function clickByKeywords(words) {
   const generic = findClickableByText(words);
   if (generic) return forceClick(generic) || clickAtCenter(generic) || clickElement(generic);
   return false;
+}
+
+function findSeatZoomInButton() {
+  const exact = document.querySelector(
+    "button.SeatPlan_zoomButtonIn__jgtaT[aria-label='放大座位圖'], button[class*='SeatPlan_zoomButtonIn'][aria-label='放大座位圖'], button[class*='SeatPlan_zoomButtonIn'][aria-label='放大座位图']"
+  );
+  if (exact && visible(exact)) return exact;
+
+  const buttons = Array.from(document.querySelectorAll("button")).filter(visible);
+  const candidates = buttons
+    .map((btn) => {
+      const bag = normalizeText(
+        [
+          btn.textContent,
+          btn.getAttribute("aria-label"),
+          btn.getAttribute("title"),
+          btn.className?.toString()
+        ]
+          .filter(Boolean)
+          .join(" ")
+      );
+      let score = 0;
+      if (bag.includes("seatplan_zoombuttonin")) score += 12;
+      if (bag.includes("zoombuttonin")) score += 10;
+      if (bag.includes("放大座位圖") || bag.includes("放大座位图")) score += 10;
+      if (bag.includes("zoom in") || bag.includes("zoom")) score += 6;
+      if (bag.includes("확대")) score += 5;
+      const r = btn.getBoundingClientRect();
+      if (r.left > window.innerWidth * 0.8) score += 2;
+      if (r.top > window.innerHeight * 0.6) score += 2;
+      if (btn.disabled || btn.getAttribute("aria-disabled") === "true") score -= 20;
+      return score > 0 ? { btn, score } : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+  return candidates[0]?.btn || null;
+}
+
+function getNewSeatZoomScale() {
+  const content = document.querySelector(
+    "[class*='EntZoomableWrapper_content__'], [class*='SeatPlan_content__']"
+  );
+  if (!content) return 1;
+  const styleText = String(content.getAttribute("style") || "");
+  const match = styleText.match(/scale\(([\d.]+)\)/i);
+  const scale = Number(match?.[1] || 1);
+  return Number.isFinite(scale) && scale > 0 ? scale : 1;
+}
+
+function countLoadedNewSeatDomNodes() {
+  return document.querySelectorAll(
+    [
+      "[class*='SeatMap_seatSvg__']",
+      "[class*='seatSvg']",
+      "g[id^='seat_block_'] circle",
+      "g[id^='seat_block_'] path",
+      "g[id^='seat_block_'] image",
+      "g[id^='seat_block_'] [role='button']"
+    ].join(",")
+  ).length;
+}
+
+function shouldExpandNewSeatMapDetail(forceAfterCaptcha = false) {
+  const seatNodeCount = countLoadedNewSeatDomNodes();
+  if (seatNodeCount > 0 && !forceAfterCaptcha) return false;
+  const zoomBtn = findSeatZoomInButton();
+  if (!zoomBtn) return false;
+  if (forceAfterCaptcha) return true;
+  // 这类页面会先渲染空的 seat_block 占位节点，所以必须看“真实座位 DOM”是否出现，
+  // 不能只看 seat_block 是否存在。
+  return seatNodeCount === 0;
+}
+
+function triggerSeatZoomInButton(zoomBtn) {
+  if (!zoomBtn) return false;
+  try {
+    zoomBtn.focus?.({ preventScroll: true });
+  } catch (_) {}
+  let hit = false;
+  try {
+    if (typeof zoomBtn.click === "function") {
+      zoomBtn.click();
+      hit = true;
+    }
+  } catch (_) {}
+  hit = dispatchRichPointerClick(zoomBtn) || hit;
+  hit = forceClick(zoomBtn) || hit;
+  hit = clickAtCenter(zoomBtn) || hit;
+  hit = clickElement(zoomBtn) || hit;
+  try {
+    zoomBtn.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Enter",
+        code: "Enter",
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    zoomBtn.dispatchEvent(
+      new KeyboardEvent("keyup", {
+        key: "Enter",
+        code: "Enter",
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    zoomBtn.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: " ",
+        code: "Space",
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    zoomBtn.dispatchEvent(
+      new KeyboardEvent("keyup", {
+        key: " ",
+        code: "Space",
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    hit = true;
+  } catch (_) {}
+  return hit;
+}
+
+async function maybeExpandNewSeatMapDetail(options = {}) {
+  const forceAfterCaptcha = options?.forceAfterCaptcha === true;
+  if (!shouldExpandNewSeatMapDetail(forceAfterCaptcha)) return false;
+  const now = Date.now();
+  if (Number(state.newSeatZoomClickCount || 0) >= 3) return false;
+  if (now - Number(state.newSeatZoomLastClickAt || 0) < 1500) return false;
+  const zoomBtn = findSeatZoomInButton();
+  if (!zoomBtn) return false;
+  const beforeScale = getNewSeatZoomScale();
+  const beforeSeatNodes = countLoadedNewSeatDomNodes();
+  const firstHit = triggerSeatZoomInButton(zoomBtn);
+  if (!firstHit) {
+    return false;
+  }
+  await sleep(120);
+  triggerSeatZoomInButton(zoomBtn);
+  await sleep(180);
+  const afterScale = getNewSeatZoomScale();
+  const afterSeatNodes = countLoadedNewSeatDomNodes();
+  state.newSeatZoomLastClickAt = now;
+  state.newSeatZoomClickCount = Number(state.newSeatZoomClickCount || 0) + 1;
+  const changed = afterScale > beforeScale + 0.001 || afterSeatNodes > beforeSeatNodes;
+  if (forceAfterCaptcha) {
+    log(
+      `新版验证码通过后已优先连点放大按钮2次，等待座位信息加载 (${state.newSeatZoomClickCount}/3, scale=${beforeScale}->${afterScale}, seatDom=${beforeSeatNodes}->${afterSeatNodes}${changed ? "" : ", unchanged"})`
+    );
+  } else {
+    log(
+      `新版选座检测到总览分区图，已连点放大按钮2次以加载座位信息 (${state.newSeatZoomClickCount}/3, scale=${beforeScale}->${afterScale}, seatDom=${beforeSeatNodes}->${afterSeatNodes}${changed ? "" : ", unchanged"})`
+    );
+  }
+  await sleep(260);
+  return true;
 }
 
 function clickBottomRightPrimaryButton(words) {
@@ -2288,6 +3023,15 @@ async function closeAnySeatConfirmPopupCrossFrameIfPresent() {
     if (resp?.ok && resp?.result?.clicked) {
       const clickedTabs = Number(resp?.result?.clickedTabs || 0);
       const scannedTabs = Number(resp?.result?.scannedTabs || 0);
+      const stage = detectCurrentStage();
+      if (stage === "seat") {
+        const blockedKey = String(state.newSeatLastAttemptKey || state.newSeatLastClickedKey || "").trim();
+        if (blockedKey) {
+          rememberNewSeatBlockedKey(blockedKey);
+          state.selectedSeatCountCache = { ts: Date.now(), count: 0 };
+          log("新版跨窗口确认弹窗已命中，刚尝试的座位已加入冷却跳过");
+        }
+      }
       log(
         `选座界面检测到跨窗口确认弹窗，已自动点击确定 (clickedTabs=${clickedTabs}, scannedTabs=${scannedTabs})`
       );
@@ -2504,6 +3248,25 @@ function findSeatBlockId(el) {
     node = node.parentElement;
   }
   return "";
+}
+
+function isSelectedSeatMarker(el) {
+  if (!isDomElement(el)) return false;
+  const tag = String(el.tagName || "").toLowerCase();
+  if (tag !== "image" && tag !== "img") return false;
+  const href = normalizeText(
+    el.getAttribute("href") ||
+      el.getAttribute("xlink:href") ||
+      el.href?.baseVal ||
+      el.href ||
+      ""
+  );
+  return href.includes("check-white.svg");
+}
+
+function getSelectedSeatMarkerCandidates() {
+  return Array.from(document.querySelectorAll("svg image, image, img"))
+    .filter((el) => visible(el) && isSelectedSeatMarker(el));
 }
 
 function parseSeatBlockParts(blockId) {
@@ -2793,6 +3556,55 @@ function clickSeatCandidate(el) {
   return clickElement(el);
 }
 
+function hasSelectedVisualForSeat(seatEl) {
+  if (!isDomElement(seatEl)) return false;
+  const cls = normalizeText(getClassBag(seatEl));
+  const attrs = normalizeText(
+    [
+      seatEl.getAttribute("aria-selected"),
+      seatEl.getAttribute("data-selected"),
+      seatEl.getAttribute("data-status")
+    ]
+      .filter(Boolean)
+      .join(" ")
+  );
+  if (
+    cls.includes("selected") ||
+    attrs.includes("true") ||
+    attrs.includes("selected") ||
+    hasSeatMapClassPrefix(seatEl, "seatmap_selected__")
+  ) {
+    return true;
+  }
+  const seatRect = seatEl.getBoundingClientRect();
+  const seatCenterX = seatRect.left + seatRect.width / 2;
+  const seatCenterY = seatRect.top + seatRect.height / 2;
+  const { blockId } = findSeatBlockAndCluster(seatEl);
+  const tolerance = Math.max(16, Math.max(seatRect.width, seatRect.height) * 10);
+  return getSelectedSeatMarkerCandidates().some((marker) => {
+    const markerBlockId = findSeatBlockAndCluster(marker).blockId || "";
+    if (blockId && markerBlockId && blockId !== markerBlockId) return false;
+    const rect = marker.getBoundingClientRect();
+    const markerCenterX = rect.left + rect.width / 2;
+    const markerCenterY = rect.top + rect.height / 2;
+    return (
+      Math.abs(markerCenterX - seatCenterX) <= tolerance &&
+      Math.abs(markerCenterY - seatCenterY) <= tolerance
+    );
+  });
+}
+
+async function waitForSelectedVisualAfterSeatClick(seatEl, beforeCount, timeoutMs = 900) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const currentCount = detectSelectedSeatCount();
+    if (currentCount > beforeCount) return true;
+    if (hasSelectedVisualForSeat(seatEl)) return true;
+    await sleep(80);
+  }
+  return detectSelectedSeatCount() > beforeCount || hasSelectedVisualForSeat(seatEl);
+}
+
 function getNewSeatKey(el) {
   if (!isDomElement(el)) return "";
   const rect = el.getBoundingClientRect();
@@ -2864,10 +3676,17 @@ async function chooseSeatsByClick(quantity) {
     if (!candidates.length) {
       const totalSeatSvg = document.querySelectorAll("[class*='SeatMap_seatSvg__'], [class*='seatSvg']").length;
       const disabledSeatSvg = document.querySelectorAll("[class*='SeatMap_seatSvg__'][class*='disabled'], [class*='seatSvg'][class*='disabled']").length;
+      const seatNodeCount = countLoadedNewSeatDomNodes();
       const customCodes = normalizeNewAreaCustomCodes(state.config.newAreaCustomCodes || []);
       const customText = customCodes.length ? `, custom=${customCodes.join("/")}` : "";
       state.newSeatBlockedMap = pruneSeatBlockedMap(state.newSeatBlockedMap, Date.now());
       const blockedCount = Object.keys(state.newSeatBlockedMap).length;
+      if (seatNodeCount === 0 && totalSeatSvg === 0) {
+        if (await maybeExpandNewSeatMapDetail({ forceAfterCaptcha: false })) {
+          log("未发现具体座位DOM，已触发放大按钮兜底");
+          break;
+        }
+      }
       log(
         `未发现可选座位候选 (seatSvg=${totalSeatSvg}, disabled=${disabledSeatSvg}, blocked=${blockedCount}${customText})`
       );
@@ -2904,6 +3723,7 @@ async function chooseSeatsByClick(quantity) {
       tried.add(seat);
       attempts += 1;
       state.newSeatLastAttemptKey = seatKey;
+      state.newSeatLastClickedKey = seatKey;
       if (!clickSeatCandidate(seat)) continue;
       // 被他人锁座弹窗通常在点击后很快出现，先给一次处理窗口。
       await sleep(120);
@@ -2911,11 +3731,9 @@ async function chooseSeatsByClick(quantity) {
         await sleep(120);
         continue;
       }
-      // 选座计数在部分场馆页面会有渲染延迟，等待更久避免超点
-      await sleep(100);
-
+      const selectedApplied = await waitForSelectedVisualAfterSeatClick(seat, before, 950);
       const after = detectSelectedSeatCount();
-      if (after > before) {
+      if (selectedApplied || after > before) {
         log(`选座进度: ${after}/${target}`);
         state.newSeatLastAttemptKey = "";
         await sleep(50);
@@ -3063,7 +3881,7 @@ function closeSeatUnlockNoticeIfPresent(context = "new") {
           log("旧版已标记被占座位，后续将跳过该座位");
         }
       } else {
-        const k = String(state.newSeatLastAttemptKey || "").trim();
+        const k = String(state.newSeatLastAttemptKey || state.newSeatLastClickedKey || "").trim();
         if (k) {
           rememberNewSeatBlockedKey(k);
           log("新版已标记被占座位，后续将跳过该座位");
@@ -3075,6 +3893,12 @@ function closeSeatUnlockNoticeIfPresent(context = "new") {
         state.legacySeatSelectedAssumed = 0;
         state.legacySeatSinglePickPendingUntil = 0;
         state.legacySeatSubmitTriggeredAt = 0;
+      } else {
+        const k = String(state.newSeatLastAttemptKey || state.newSeatLastClickedKey || "").trim();
+        if (k) {
+          rememberNewSeatBlockedKey(k);
+          log("新版已标记本次未生效座位，后续将临时跳过该座位");
+        }
       }
       state.selectedSeatCountCache = { ts: Date.now(), count: 0 };
       log("已处理“请选择座位”提示弹窗，继续回到选座流程");
@@ -3094,6 +3918,9 @@ async function runSeatStep() {
   if (state.newSeatFlowKey !== flowKey) {
     state.newSeatFlowKey = flowKey;
     state.newSeatLastAttemptKey = "";
+    state.newSeatLastClickedKey = "";
+    state.newSeatZoomLastClickAt = 0;
+    state.newSeatZoomClickCount = 0;
   }
   if (closeAnySeatConfirmPopupIfPresent() || (await closeAnySeatConfirmPopupCrossFrameIfPresent())) {
     await sleep(120);
@@ -3103,6 +3930,11 @@ async function runSeatStep() {
   const target = normalizeQuantity(state.config.quantity, 1);
   if (closeSeatUnlockNoticeIfPresent("new")) {
     await sleep(140);
+    return;
+  }
+  const captchaJustSolved =
+    Number(state.captcha.solvedAt || 0) > 0 && Date.now() - Number(state.captcha.solvedAt || 0) < 5000;
+  if (await maybeExpandNewSeatMapDetail({ forceAfterCaptcha: captchaJustSolved })) {
     return;
   }
   const selected = detectSelectedSeatCount();
@@ -3782,6 +4614,51 @@ function parseTimeMinutes(text) {
 }
 
 function getDateTimeOptionCandidates(sortMode = "score") {
+  const timeBlockButtons = Array.from(
+    document.querySelectorAll(
+      "button[class*='TimeBlock_timeButton'], [class*='TimeBlock_timeBlock'] > button"
+    )
+  ).filter((el) => isDomElement(el) && visible(el));
+
+  if (timeBlockButtons.length) {
+    const directCandidates = timeBlockButtons
+      .map((btn) => {
+        const text = String(
+          btn.querySelector("[class*='TimeBlock_clock']")?.textContent || btn.textContent || ""
+        ).trim();
+        if (!text) return null;
+        const timeMinutes = parseTimeMinutes(text);
+        if (!Number.isFinite(timeMinutes)) return null;
+
+        const disabled =
+          btn.disabled ||
+          btn.hasAttribute("disabled") ||
+          btn.getAttribute("aria-disabled") === "true";
+        if (disabled) return null;
+
+        const r = btn.getBoundingClientRect();
+        if (r.width < 60 || r.height < 24) return null;
+
+        const selected = btn.getAttribute("aria-selected") === "true";
+        let score = 20;
+        if (selected) score += 8;
+        if (r.width >= 100) score += 3;
+        if (r.left > window.innerWidth * 0.4) score += 3;
+        return { el: btn, text, r, selected, score, timeMinutes };
+      })
+      .filter(Boolean);
+
+    if (sortMode === "time") {
+      directCandidates.sort(
+        (a, b) =>
+          a.timeMinutes - b.timeMinutes || a.r.top - b.r.top || a.r.left - b.r.left || b.score - a.score
+      );
+    } else {
+      directCandidates.sort((a, b) => b.score - a.score || a.r.top - b.r.top || a.r.left - b.r.left);
+    }
+    return directCandidates;
+  }
+
   const timePattern = /\b\d{1,2}\s*[:：.]\s*\d{2}\s*(?:am|pm)?\b/i;
   const nodes = Array.from(
     document.querySelectorAll("button, [role='button'], div, span, li, p")
@@ -5489,6 +6366,30 @@ function findCaptchaImageElement() {
     if (modalCaptchaImg && visible(modalCaptchaImg)) return modalCaptchaImg;
   }
 
+  const modernBookingContext =
+    String(location.host || "").toLowerCase() === "tickets.interpark.com" ||
+    String(location.host || "").toLowerCase() === "ticket.globalinterpark.com";
+  if (modernBookingContext) {
+    const hasVisibleModernCaptchaRoot = docs.some((doc) =>
+      Array.from(
+        doc.querySelectorAll("[class*='ModalLayout_innerWrap'], [class*='ModalCaptchaText_layerWrap']")
+      ).some((el) => {
+        if (!visible(el)) return false;
+        const text = normalizeText((el.textContent || "").slice(0, 320));
+        return (
+          text.includes("請輸入畫面的文字") ||
+          text.includes("请输入画面的文字") ||
+          text.includes("please enter the text") ||
+          text.includes("captcha") ||
+          Boolean(el.querySelector("[class*='ModalCaptchaText_captchaInput'], [class*='ModalCaptchaText_captchaImage'] img"))
+        );
+      })
+    );
+    if (!hasVisibleModernCaptchaRoot) {
+      return null;
+    }
+  }
+
   const legacyContextLikely =
     location.host === "gpoticket.globalinterpark.com" ||
     isLegacyBookingUrl() ||
@@ -5658,6 +6559,51 @@ function findCaptchaInput(imageEl) {
   return scored[0]?.score >= 2 ? scored[0].input : null;
 }
 
+function findModernCaptchaModalRoot(seedEl) {
+  const ownerDoc = seedEl?.ownerDocument || null;
+  const docs = getCaptchaSearchDocuments(ownerDoc);
+  const pickRoot = (el) => {
+    if (!isDomElement(el) || !visible(el)) return null;
+    const wrap =
+      el.matches?.("[class*='ModalLayout_innerWrap']")
+        ? el
+        : el.closest?.("[class*='ModalLayout_innerWrap']") || el;
+    return visible(wrap) ? wrap : visible(el) ? el : null;
+  };
+
+  const direct =
+    pickRoot(
+      seedEl?.closest?.("[class*='ModalCaptchaText_layerWrap'], [class*='ModalLayout_innerWrap']") ||
+        null
+    ) || null;
+  if (direct) return direct;
+
+  const scored = docs
+    .flatMap((doc) =>
+      Array.from(
+        doc.querySelectorAll("[class*='ModalLayout_innerWrap'], [class*='ModalCaptchaText_layerWrap']")
+      )
+    )
+    .map((root) => {
+      const wrap = pickRoot(root);
+      if (!wrap) return null;
+      const text = normalizeText((wrap.textContent || "").slice(0, 320));
+      let score = 0;
+      if (wrap.querySelector("[class*='ModalCaptchaText_captchaInput']")) score += 8;
+      if (wrap.querySelector("[class*='ModalCaptchaText_captchaImage'] img, [class*='ModalCaptchaText_captchaImage'] canvas")) {
+        score += 8;
+      }
+      if (wrap.querySelector("button[class*='EntButton'], button[disabled]")) score += 3;
+      if (text.includes("請輸入畫面的文字") || text.includes("请输入画面的文字")) score += 10;
+      if (text.includes("輸入文字後才能選擇座位") || text.includes("输入文字后才能选择座位")) score += 8;
+      if (text.includes("captcha")) score += 3;
+      return { root: wrap, score };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+  return scored[0]?.score >= 10 ? scored[0].root : null;
+}
+
 function findCaptchaSubmitButton(imageEl, inputEl) {
   const doc = inputEl?.ownerDocument || imageEl?.ownerDocument || document;
   const legacySubmit =
@@ -5825,13 +6771,24 @@ async function clickCaptchaRefresh(imageEl) {
     if (legacyRefresh && visible(legacyRefresh) && clickElement(legacyRefresh)) return true;
   }
 
+  const exactRefresh = doc.querySelector(
+    "button.ModalCaptchaText_buttonRefresh__7j9P3[aria-label='Get a new image'], button[class*='ModalCaptchaText_buttonRefresh'][aria-label='Get a new image'], button[class*='ModalCaptchaText_buttonRefresh'][aria-label='重新取得圖片'], button[class*='ModalCaptchaText_buttonRefresh'][aria-label='获取新图片']"
+  );
+  if (exactRefresh && visible(exactRefresh) && (exactRefresh.click?.(), clickElement(exactRefresh))) {
+    return true;
+  }
+
   const scope = imageEl?.closest("form, section, div, li, td") || doc;
   const words = ["刷新", "换一张", "重新", "refresh", "reload"];
   const nodes = Array.from(
     scope.querySelectorAll("button, [role='button'], a, span, div")
   ).filter(visible);
   for (const el of nodes) {
-    const text = normalizeText(el.textContent || "");
+    const text = normalizeText(
+      [el.textContent, el.getAttribute("aria-label"), el.getAttribute("title")]
+        .filter(Boolean)
+        .join(" ")
+    );
     if (!text) continue;
     if (!words.some((w) => text.includes(normalizeText(w)))) continue;
     if (clickElement(el)) return true;
@@ -5851,7 +6808,9 @@ function getCaptchaEngine() {
     state,
     log,
     sleep,
+    isCaptchaAutoFillEnabled: () => state.config.captchaAutoFillEnabled !== false,
     findCaptchaImageElement,
+    findModernCaptchaModalRoot,
     isLegacyCaptchaLayerVisible,
     isLegacyCaptchaImage,
     findCaptchaInput,
@@ -5877,31 +6836,72 @@ async function runCaptchaStep() {
   return await engine.runStep();
 }
 
+function hasEmbeddedPricePanelInSeatPage() {
+  const host = String(location.host || "").toLowerCase();
+  const path = String(location.pathname || "").toLowerCase();
+  if (
+    !(host === "tickets.interpark.com" || host === "ticket.globalinterpark.com") ||
+    !path.includes("/onestop/seat")
+  ) {
+    return false;
+  }
+
+  const text = getWholeText();
+  const hasPriceTitle =
+    text.includes("选择价格") ||
+    text.includes("選擇價格") ||
+    text.includes("price selection") ||
+    text.includes("selected seat");
+  if (!hasPriceTitle) return false;
+
+  const hasQuantityControls = Boolean(findPlusButton() || findMinusButton());
+  const hasOrderAction = Boolean(getPreorderButtonStrict());
+  const hasPriceAmount = /(?:won|元|円|\$)\s*\d|(?:\d[\d,]*)\s*(?:won|元|円)/i.test(
+    document.body?.innerText || ""
+  );
+  return hasQuantityControls || hasOrderAction || hasPriceAmount;
+}
+
 function isSeatPage() {
+  const host = String(location.host || "").toLowerCase();
+  const path = String(location.pathname || "").toLowerCase();
   const text = getWholeText();
   const hasCompleteBtn = Boolean(findButtonByClassAndText(STEP_TEXT.completeSeat));
   const seatBlockCount = document.querySelectorAll("g[id^='seat_block_']").length;
   const seatSvgCount = document.querySelectorAll("[class*='SeatMap_seatSvg__'], [class*='seatSvg']").length;
   const hasSeatMapDom = seatBlockCount > 0 || seatSvgCount >= 20;
+  const isKnownSeatPath =
+    (host === "tickets.interpark.com" || host === "ticket.globalinterpark.com") &&
+    path.includes("/onestop/seat");
   const hasSeatKeyword =
     text.includes("选择座位") ||
     text.includes("選擇座位") ||
     text.includes("尚未選擇座位") ||
     text.includes("尚未选择座位") ||
-    text.includes("좌석");
+    text.includes("좌석") ||
+    text.includes("selected seat") ||
+    text.includes("please select your seat") ||
+    text.includes("seat tier pricing");
   const hasPriceKeyword = text.includes("选择价格") || text.includes("選擇價格");
   const hasInfoKeyword =
     text.includes("订票者资讯") ||
     text.includes("訂購者資訊") ||
     text.includes("手機號碼") ||
-    text.includes("手机号");
+    text.includes("手机号") ||
+    text.includes("phone number") ||
+    text.includes("mobile number");
+  const hasEmbeddedPricePanel = hasEmbeddedPricePanelInSeatPage();
 
+  if (isKnownSeatPath && !hasEmbeddedPricePanel) return true;
   if (hasCompleteBtn) return true;
-  if (hasSeatMapDom && hasSeatKeyword && !hasPriceKeyword && !hasInfoKeyword) return true;
+  if (hasSeatMapDom && hasSeatKeyword && !hasPriceKeyword && !hasInfoKeyword && !hasEmbeddedPricePanel) {
+    return true;
+  }
   return false;
 }
 
 function isQueuePage() {
+  if (isInterparkWaitingPage()) return true;
   const text = getWholeText();
   return (
     text.includes("等候人数过多待机中") ||
@@ -5933,7 +6933,46 @@ function isDatePage() {
 
 function isPricePage() {
   const href = String(location.href || "").toLowerCase();
-  return href.includes("price");
+  return href.includes("price") || hasEmbeddedPricePanelInSeatPage();
+}
+
+function isLegacyCompetitionPricePage() {
+  const text = normalizeText(getWholeText());
+  if (
+    text.includes("price/discount") &&
+    text.includes("delivery/confirmation") &&
+    text.includes("selected seat(s)")
+  ) {
+    return true;
+  }
+  if (
+    text.includes("price") &&
+    text.includes("discount") &&
+    text.includes("selected seat(s)") &&
+    text.includes("my ticket")
+  ) {
+    return true;
+  }
+  const selectedSeatText = Array.from(document.querySelectorAll("td, div, span, strong"))
+    .filter(visible)
+    .some((el) => normalizeText(el.textContent || "").includes("selected seat(s)"));
+  const nextButton = Array.from(document.querySelectorAll("a, button, input[type='button'], input[type='image']"))
+    .filter(visible)
+    .some((el) => {
+      const bag = normalizeText(
+        [
+          el.textContent,
+          el.getAttribute("value"),
+          el.getAttribute("alt"),
+          el.getAttribute("title"),
+          el.getAttribute("src")
+        ]
+          .filter(Boolean)
+          .join(" ")
+      );
+      return bag.includes("next") || bag.includes("btn_next");
+    });
+  return selectedSeatText && nextButton && text.includes("price");
 }
 
 function isInfoPage() {
@@ -5974,9 +7013,9 @@ function isInfoPage() {
 }
 
 function detectCurrentStage() {
+  if (isPricePage()) return "price";
   if (isSeatPage()) return "seat";
   if (isInfoPage()) return "info";
-  if (isPricePage()) return "price";
   if (isDatePage()) return "date";
   return "unknown";
 }
@@ -5988,6 +7027,12 @@ function isLegacyBookingUrl() {
     href.includes("/global/play/book/bookmain.asp") ||
     path.includes("/global/play/book/bookmain.asp")
   );
+}
+
+function isInterparkWaitingPage() {
+  const host = String(location.host || "").toLowerCase();
+  const path = String(location.pathname || "").toLowerCase();
+  return host === "tickets.interpark.com" && (path === "/waiting" || path.startsWith("/waiting/"));
 }
 
 function isInterparkGatePage() {
@@ -6112,6 +7157,7 @@ async function runBookingStageByType(stage, options = {}) {
   } = options;
 
   if (stage === "seat") {
+    state.notifyPriceEnteredSent = false;
     if (updateLastStage) state.lastStage = "seat";
     if (!state.priceLockedSlow) setTickMode("fast");
     await runSeatStep();
@@ -6143,12 +7189,14 @@ async function runBookingStageByType(stage, options = {}) {
   }
 
   if (stage === "date") {
+    state.notifyPriceEnteredSent = false;
     if (updateLastStage) state.lastStage = "date";
     if (!state.priceLockedSlow) setTickMode("fast");
     await runDateStep();
     return false;
   }
 
+  state.notifyPriceEnteredSent = false;
   if (updateLastStage) state.lastStage = "unknown";
   if (enableUnknownReserveClick && clickReserveEntryAggressive()) {
     log("未知阶段命中预约入口，已点击 预约");
@@ -6279,6 +7327,336 @@ function getLegacyCandidateDocs(frameDoc) {
     } catch (_) {}
   }
   return docs;
+}
+
+function collectAccessibleChildDocs(rootDoc, out = [], seen = new Set()) {
+  if (!rootDoc || seen.has(rootDoc)) return out;
+  seen.add(rootDoc);
+  out.push(rootDoc);
+  const childFrames = Array.from(rootDoc.querySelectorAll("iframe, frame"));
+  for (const fr of childFrames) {
+    try {
+      const doc = fr.contentDocument || fr.contentWindow?.document || null;
+      if (doc) collectAccessibleChildDocs(doc, out, seen);
+    } catch (_) {}
+  }
+  return out;
+}
+
+function getLegacyCompetitionNoticeDocs() {
+  const docs = [];
+  const seen = new Set();
+  collectAccessibleChildDocs(document, docs, seen);
+  const frameDoc = getLegacyBookFrameDocument();
+  if (frameDoc) collectAccessibleChildDocs(frameDoc, docs, seen);
+  return docs;
+}
+
+function isVisibleLegacyCompetitionNoticeWrap(wrap) {
+  if (!wrap) return false;
+  if (visible(wrap)) return true;
+  const closeBtn = wrap.querySelector(".closeBtn");
+  const closeImg = closeBtn?.querySelector("img");
+  return visible(closeBtn) || visible(closeImg);
+}
+
+function invokeLegacyCompetitionNoticeCloseHandlers(target) {
+  const windows = [];
+  const seen = new Set();
+  const pushWindow = (view) => {
+    if (!view || seen.has(view)) return;
+    seen.add(view);
+    windows.push(view);
+  };
+
+  pushWindow(target?.ownerDocument?.defaultView || null);
+  pushWindow(window);
+  try {
+    pushWindow(window.parent);
+  } catch (_) {}
+  try {
+    pushWindow(window.top);
+  } catch (_) {}
+
+  for (const view of windows) {
+    try {
+      if (typeof view.fnBookNoticeShowHide === "function") {
+        view.fnBookNoticeShowHide("");
+        return true;
+      }
+    } catch (_) {}
+  }
+  return false;
+}
+
+function invokeLegacyCompetitionNoticeHrefScript(target) {
+  const href = String(target?.getAttribute?.("href") || "").trim();
+  if (!href.toLowerCase().startsWith("javascript:")) return false;
+  const script = href.replace(/^javascript:\s*/i, "").trim();
+  if (!script) return false;
+
+  const windows = [];
+  const seen = new Set();
+  const pushWindow = (view) => {
+    if (!view || seen.has(view)) return;
+    seen.add(view);
+    windows.push(view);
+  };
+
+  pushWindow(target?.ownerDocument?.defaultView || null);
+  pushWindow(window);
+  try {
+    pushWindow(window.parent);
+  } catch (_) {}
+  try {
+    pushWindow(window.top);
+  } catch (_) {}
+
+  for (const view of windows) {
+    try {
+      if (typeof view.eval === "function") {
+        view.eval(script);
+        return true;
+      }
+    } catch (_) {}
+  }
+  return false;
+}
+
+function cleanupLegacyCompetitionNoticePresentation(target) {
+  const wrap = target?.closest?.(".layerWrap");
+  const doc = target?.ownerDocument || document;
+  const root =
+    wrap?.closest?.(".bookNoticeLayer") ||
+    target?.closest?.(".bookNoticeLayer") ||
+    doc.querySelector("#divBookNoticeLayer, .bookNoticeLayer");
+
+  if (root) {
+    try {
+      root.style.display = "none";
+      root.style.visibility = "hidden";
+      root.style.opacity = "0";
+      root.style.pointerEvents = "none";
+      root.style.zIndex = "-1";
+    } catch (_) {}
+  }
+  if (wrap) {
+    try {
+      wrap.style.display = "none";
+      wrap.style.visibility = "hidden";
+      wrap.style.opacity = "0";
+      wrap.style.pointerEvents = "none";
+    } catch (_) {}
+  }
+
+  const overlaySelectors = [
+    ".layerBg",
+    ".layerbg",
+    ".bgLayer",
+    ".bg-layer",
+    ".dimmed",
+    ".dim",
+    ".mask",
+    ".overlay",
+    ".modal-backdrop",
+    ".popupBg"
+  ];
+  for (const selector of overlaySelectors) {
+    const nodes = Array.from(doc.querySelectorAll(selector));
+    for (const node of nodes) {
+      if (!visible(node)) continue;
+      const rect = node.getBoundingClientRect();
+      const coversLargeArea =
+        rect.width >= Math.max(220, window.innerWidth * 0.4) &&
+        rect.height >= Math.max(220, window.innerHeight * 0.4);
+      if (!coversLargeArea) continue;
+      try {
+        node.style.display = "none";
+        node.style.visibility = "hidden";
+        node.style.opacity = "0";
+        node.style.pointerEvents = "none";
+      } catch (_) {}
+    }
+  }
+
+  try {
+    const body = doc.body;
+    if (body) {
+      body.style.overflow = "";
+      body.style.pointerEvents = "";
+      body.style.filter = "";
+    }
+  } catch (_) {}
+}
+
+function invokeLegacyCompetitionRefreshHandlers(target = null) {
+  const windows = [];
+  const seen = new Set();
+  const pushWindow = (view) => {
+    if (!view || seen.has(view)) return;
+    seen.add(view);
+    windows.push(view);
+  };
+
+  pushWindow(target?.ownerDocument?.defaultView || null);
+  pushWindow(window);
+  try {
+    pushWindow(window.parent);
+  } catch (_) {}
+  try {
+    pushWindow(window.top);
+  } catch (_) {}
+
+  for (const view of windows) {
+    try {
+      if (typeof view.fnRefresh === "function") {
+        view.fnRefresh();
+        return true;
+      }
+    } catch (_) {}
+  }
+  return false;
+}
+
+function findLegacyCompetitionRefreshButton(preferredDoc = null) {
+  const docs = getLegacySeatSearchDocuments(preferredDoc);
+  const selectors = [
+    "a[href*='fnRefresh']",
+    "a[onclick*='fnRefresh']",
+    "img[src*='btn_seat_again']",
+    "img[alt*='refresh' i]"
+  ];
+  const candidates = [];
+
+  for (const doc of docs) {
+    for (const selector of selectors) {
+      const found = Array.from(doc.querySelectorAll(selector));
+      for (const node of found) {
+        const el =
+          String(node.tagName || "").toLowerCase() === "img" ? node.closest("a") || node : node;
+        if (!el || !visible(el)) continue;
+        const bag = normalizeText(
+          [
+            el.textContent,
+            el.getAttribute("href"),
+            el.getAttribute("onclick"),
+            el.getAttribute("title"),
+            el.getAttribute("aria-label"),
+            el.querySelector("img")?.getAttribute("src"),
+            el.querySelector("img")?.getAttribute("alt")
+          ]
+            .filter(Boolean)
+            .join(" ")
+        );
+        let score = 0;
+        if (bag.includes("fnrefresh")) score += 10;
+        if (bag.includes("btn_seat_again")) score += 8;
+        if (bag.includes("refresh")) score += 4;
+        candidates.push({ el, score });
+      }
+    }
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0]?.el || null;
+}
+
+async function clickLegacyCompetitionRefreshButton(preferredDoc = null) {
+  const mainScripts = ["fnRefresh();", "javascript:fnRefresh();"];
+  for (const script of mainScripts) {
+    const main = await triggerLegacyScriptMainWorld(script, "competition_refresh");
+    if (main?.ok) {
+      const now = Date.now();
+      state.legacySeatLastAreaSwitchAt = now;
+      state.legacySeatAreaNextSwitchAt = now + getLegacyAreaSwitchIntervalMs();
+      state.legacySeatAreaSettleUntil = now + getLegacyAreaSettleMs();
+      const frameInfo = main.frameId ?? "-";
+      log(`比赛场旧版刷新主世界触发: mode=${main.mode || "-"}, frame=${frameInfo}`);
+      await sleep(140);
+      return true;
+    }
+  }
+  if (Date.now() - state.legacySeatLastClickFailLogAt > 1200) {
+    const target = findLegacyCompetitionRefreshButton(preferredDoc);
+    const hasTarget = target ? "Y" : "N";
+    log(`比赛场旧版刷新主世界触发失败: fnRefresh 未执行成功, button=${hasTarget}`);
+    state.legacySeatLastClickFailLogAt = Date.now();
+  }
+  return false;
+}
+
+function findLegacyCompetitionNoticeCloseButton() {
+  const docs = getLegacyCompetitionNoticeDocs();
+  if (!docs.length) return null;
+
+  const selectors = [
+    ".layerWrap .titleArea .closeBtn",
+    ".layerWrap a.closeBtn[href*='fnBookNoticeShowHide']",
+    "a.closeBtn[href*='fnBookNoticeShowHide']",
+    ".layerWrap .titleArea a[href*='fnBookNoticeShowHide']",
+    ".layerWrap .closeBtn"
+  ];
+  const candidates = [];
+
+  for (const doc of docs) {
+    for (const selector of selectors) {
+      const found = Array.from(doc.querySelectorAll(selector));
+      for (const el of found) {
+        const wrap = el.closest(".layerWrap");
+        if (!isVisibleLegacyCompetitionNoticeWrap(wrap)) continue;
+        if (!visible(el) && !visible(el.querySelector?.("img"))) continue;
+        const titleText = normalizeText(
+          wrap?.querySelector(".titleArea .tit")?.textContent ||
+            wrap?.querySelector(".titleArea")?.textContent ||
+            ""
+        );
+        const actionText = normalizeText(
+          [el.textContent, el.getAttribute("title"), el.getAttribute("aria-label"), el.getAttribute("href")]
+            .filter(Boolean)
+            .join(" ")
+        );
+        let score = 0;
+        if (wrap) score += 4;
+        if (titleText.includes("notice")) score += 5;
+        if (actionText.includes("fnbooknoticeshowhide")) score += 6;
+        if (String(el.className || "").toLowerCase().includes("close")) score += 3;
+        candidates.push({ el, score });
+      }
+    }
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0]?.el || null;
+}
+
+function closeLegacyCompetitionNoticeIfPresent() {
+  const now = Date.now();
+  const minGap = state.tickMode === "critical" ? 55 : 140;
+  if (now - Number(state.legacyCompetitionNoticeCloseLastClickAt || 0) < minGap) return false;
+
+  const target = findLegacyCompetitionNoticeCloseButton();
+  if (!target) return false;
+
+  const bursts = state.tickMode === "critical" ? 3 : 2;
+  for (let i = 0; i < bursts; i += 1) {
+    clickAtCenter(target);
+  }
+  forceClick(target);
+  dispatchRichPointerClick(target);
+  const handlerInvoked = invokeLegacyCompetitionNoticeCloseHandlers(target);
+  const hrefInvoked = invokeLegacyCompetitionNoticeHrefScript(target);
+  cleanupLegacyCompetitionNoticePresentation(target);
+  const wrap = target.closest(".layerWrap");
+  if (wrap && isVisibleLegacyCompetitionNoticeWrap(wrap) && (!handlerInvoked || !hrefInvoked)) {
+    cleanupLegacyCompetitionNoticePresentation(target);
+  }
+
+  state.legacyCompetitionNoticeCloseLastClickAt = now;
+  if (now - Number(state.legacyCompetitionNoticeCloseLastLogAt || 0) > 1200) {
+    log("比赛场旧版检测到 Notice 弹窗，已点击关闭");
+    state.legacyCompetitionNoticeCloseLastLogAt = now;
+  }
+  return true;
 }
 
 function getLegacyHandlerCode(el) {
@@ -7078,43 +8456,73 @@ function dragCaptchaSlider(distance) {
   );
 
   const targetX = startX + finalDistance;
-  const holdMs = 55 + Math.floor(Math.random() * 70);
-  const settleMs = 35 + Math.floor(Math.random() * 55);
-  const durationMs = Math.max(460, Math.min(1100, Math.round(430 + finalDistance * 1.9)));
-  const stepCount = Math.max(30, Math.min(95, Math.round(durationMs / 12)));
-  const overshoot = Math.min(2.6, Math.max(0.8, finalDistance * 0.012));
+  const holdMs = 75 + Math.floor(Math.random() * 110);
+  const settleMs = 55 + Math.floor(Math.random() * 65);
+  const durationMs = Math.max(620, Math.min(1550, Math.round(520 + finalDistance * 2.35)));
+  const stepCount = Math.max(38, Math.min(118, Math.round(durationMs / 14)));
+  const overshoot = Math.min(3.8, Math.max(1.1, finalDistance * 0.014));
   const nearEndX = targetX + overshoot;
+  const easeInQuad = (t) => t * t;
+  const easeOutQuad = (t) => 1 - (1 - t) * (1 - t);
   const easeInOutCubic = (t) =>
     t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+  const progressAt = (t) => {
+    if (t <= 0.12) {
+      return 0.035 * easeOutQuad(t / 0.12);
+    }
+    if (t <= 0.58) {
+      return 0.035 + 0.74 * easeInOutCubic((t - 0.12) / 0.46);
+    }
+    if (t <= 0.84) {
+      return 0.775 + 0.16 * easeOutQuad((t - 0.58) / 0.26);
+    }
+    return 0.935 + 0.065 * easeInQuad((t - 0.84) / 0.16);
+  };
 
   let idx = 0;
   let currentX = startX;
   const runStep = () => {
     if (idx >= stepCount) {
-      dispatchMove(nearEndX, startY + (Math.random() * 0.6 - 0.3), 1);
+      dispatchMove(nearEndX, startY + (Math.random() * 0.7 - 0.35), 1);
       view.setTimeout(() => {
-        dispatchMove(targetX, startY + (Math.random() * 0.4 - 0.2), 1);
+        dispatchMove(targetX, startY + (Math.random() * 0.5 - 0.25), 1);
         view.setTimeout(() => {
           dispatchUp(targetX, startY);
         }, settleMs);
-      }, 26 + Math.floor(Math.random() * 24));
+      }, 38 + Math.floor(Math.random() * 48));
       return;
     }
 
     const t = (idx + 1) / stepCount;
-    const eased = easeInOutCubic(t);
-    const jitter = (Math.random() * 0.8 - 0.4) * (t > 0.85 ? 0.35 : 1);
-    let nextX = startX + (nearEndX - startX) * eased + jitter;
-    if (nextX < currentX + 0.25) nextX = currentX + 0.25;
+    const progress = progressAt(t);
+    const jitterScale = t > 0.88 ? 0.2 : t > 0.72 ? 0.32 : t > 0.2 ? 0.55 : 0.4;
+    const jitter = (Math.random() * 2 - 1) * jitterScale;
+    let nextX = startX + (nearEndX - startX) * progress + jitter;
+    if (t > 0.56 && t < 0.86 && Math.random() < 0.12) {
+      nextX -= 0.18 + Math.random() * 0.35;
+    }
+    if (nextX < currentX - 0.45) nextX = currentX - 0.45;
+    if (nextX < startX + 0.2) nextX = startX + 0.2;
     if (nextX > nearEndX) nextX = nearEndX;
     currentX = nextX;
-    const y = startY + (Math.random() * 0.8 - 0.4) + Math.sin(t * Math.PI) * 0.2;
+    const y =
+      startY +
+      (Math.random() * 1.1 - 0.55) +
+      Math.sin(t * Math.PI) * 0.28 +
+      Math.sin(t * Math.PI * 2.2) * 0.08;
     dispatchMove(currentX, y, 1);
     idx += 1;
-    const delayMs = 8 + Math.floor(Math.random() * 8);
+    let delayMs = 7 + Math.floor(Math.random() * 9);
+    if (t < 0.16 || t > 0.84) {
+      delayMs += 3 + Math.floor(Math.random() * 7);
+    }
+    if (t > 0.62 && t < 0.82 && Math.random() < 0.1) {
+      delayMs += 16 + Math.floor(Math.random() * 24);
+    }
     view.setTimeout(runStep, delayMs);
   };
 
+  dispatchMove(startX + (Math.random() * 0.8 - 0.4), startY + (Math.random() * 0.6 - 0.3), 1);
   view.setTimeout(runStep, holdMs);
   return true;
 }
@@ -7472,6 +8880,7 @@ function resetLegacySeatRuntime() {
   state.legacySeatLastAreaDiscoveryAt = 0;
   state.legacySeatAreaSettleUntil = 0;
   state.legacySeatSinglePickPendingUntil = 0;
+  state.notifyLegacySeatCompletedSent = false;
 }
 
 function getLegacySeatFrameDocument() {
@@ -7870,10 +9279,38 @@ function isLegacySeatDashedSelected(el) {
   return false;
 }
 
+function getLegacySeatRect(el) {
+  if (!isDomElement(el)) {
+    return { left: 0, top: 0, width: 0, height: 0, right: 0, bottom: 0 };
+  }
+  const rect = el.getBoundingClientRect();
+  if (rect.width > 0.4 || rect.height > 0.4) {
+    return rect;
+  }
+  const styleRaw = String(el.getAttribute("style") || "");
+  const leftMatch = styleRaw.match(/left\s*:\s*(-?\d+(?:\.\d+)?)/i);
+  const topMatch = styleRaw.match(/top\s*:\s*(-?\d+(?:\.\d+)?)/i);
+  const left = Number(leftMatch?.[1] || 0);
+  const top = Number(topMatch?.[1] || 0);
+  const width = Number(el.getAttribute("width") || 10) || 10;
+  const height = Number(el.getAttribute("height") || 10) || 10;
+  return { left, top, width, height, right: left + width, bottom: top + height };
+}
+
 function isLegacySeatSpanAvailable(el) {
-  if (!isDomElement(el) || !visibleForSeat(el)) return false;
+  if (!isDomElement(el)) return false;
   const tag = String(el.tagName || "").toLowerCase();
-  if (tag !== "span") return false;
+  if (tag === "img") {
+    const cls = normalizeText(el.className || "");
+    const value = normalizeText(el.getAttribute("value") || "");
+    const onclick = normalizeText(el.getAttribute("onclick") || "");
+    const styleText = normalizeText(el.getAttribute("style") || "");
+    if (!cls.includes("styselectseat")) return false;
+    if (!onclick.includes("selectseatkbo") && !onclick.includes("selectseat")) return false;
+    if (value && value !== "n") return false;
+    return styleText.includes("display:none") || styleText.includes("display: none");
+  }
+  if (!visibleForSeat(el) || tag !== "span") return false;
   const clsRaw =
     typeof el.className === "string"
       ? el.className
@@ -7902,7 +9339,17 @@ function isLegacySeatSpanAvailable(el) {
 }
 
 function isLegacySeatSpanSelected(el) {
-  if (!isDomElement(el) || !visibleForSeat(el)) return false;
+  if (!isDomElement(el)) return false;
+  const tag = String(el.tagName || "").toLowerCase();
+  if (tag === "img") {
+    const cls = normalizeText(el.className || "");
+    const onclick = normalizeText(el.getAttribute("onclick") || "");
+    const styleText = normalizeText(el.getAttribute("style") || "");
+    if (!cls.includes("styselectseat")) return false;
+    if (!onclick.includes("selectseatkbo") && !onclick.includes("selectseat")) return false;
+    return !styleText.includes("display:none") && !styleText.includes("display: none");
+  }
+  if (!visibleForSeat(el)) return false;
   if (isLegacySeatDashedSelected(el)) return true;
   const cls = normalizeText(el.className || "");
   if (!cls.includes("seat")) return false;
@@ -7912,11 +9359,14 @@ function isLegacySeatSpanSelected(el) {
 
 function getLegacySeatKey(el) {
   if (!isDomElement(el)) return "";
-  const rect = el.getBoundingClientRect();
+  const rect = getLegacySeatRect(el);
   const title = String(el.getAttribute("title") || "").trim();
+  const seatInfo = String(el.getAttribute("seatinfo") || "").trim();
+  const rg = String(el.getAttribute("rg") || "").trim();
+  const sn = String(el.getAttribute("sn") || "").trim();
   const fromHandler = extractLegacySeatAreaCode(getLegacyHandlerCode(el));
   const code = String(fromHandler || state.legacySeatCurrentAreaCode || "").trim();
-  const token = title || String(el.getAttribute("onclick") || "").trim();
+  const token = seatInfo || title || rg || sn || String(el.getAttribute("onclick") || "").trim();
   return `${code || "-"}|${token || "-"}|${Math.round(rect.left)}:${Math.round(rect.top)}`;
 }
 
@@ -7940,7 +9390,13 @@ function getLegacySelectedSeatCount() {
     }
   }
 
-  const seatNodes = docs.flatMap((doc) => Array.from(doc.querySelectorAll("span#Seats, span[name='Seats']")));
+  const seatNodes = docs.flatMap((doc) =>
+    Array.from(
+      doc.querySelectorAll(
+        "span#Seats, span[name='Seats'], img.stySelectSeat, img[id^='SID'], img[onclick*='SelectSeatKBO']"
+      )
+    )
+  );
   const domSelected = seatNodes.filter((el) => isLegacySeatSpanSelected(el)).length;
   return Math.max(textCount, domSelected);
 }
@@ -7979,6 +9435,44 @@ function getLegacyAvailableSeatCandidates(preferredDoc = null) {
   return out;
 }
 
+function getLegacyCompetitionAvailableSeatCandidates(preferredDoc = null) {
+  const docs = getLegacySeatSearchDocuments(preferredDoc);
+  const out = [];
+  for (const doc of docs) {
+    const mapEl = doc.querySelector("#MainMap");
+    const mapRect = mapEl ? getLegacySeatRect(mapEl) : null;
+    const fallbackWidth = doc.documentElement?.scrollWidth || doc.body?.scrollWidth || window.innerWidth || 1024;
+    const centerX =
+      mapRect && Number.isFinite(mapRect.width) && mapRect.width > 0
+        ? mapRect.left + mapRect.width / 2
+        : fallbackWidth / 2;
+    const nodes = Array.from(
+      doc.querySelectorAll(
+        "img.stySelectSeat[value='N'], img.stySelectSeat[value='n'], img[id^='SID'][value='N'], img[id^='SID'][value='n'], span#Seats, span[name='Seats'], span[class*='Seat'], span[onclick*='SelectSeat'], span[onclick*='selectseat'], span[value='N'], span[value='n']"
+      )
+    );
+    for (const el of nodes) {
+      if (!isLegacySeatSpanAvailable(el)) continue;
+      const key = getLegacySeatKey(el);
+      if (!key) continue;
+      if (hasLegacySeatBlockedKey(key)) continue;
+      const rect = getLegacySeatRect(el);
+      out.push({
+        el,
+        key,
+        rect,
+        centerDist: Math.abs(rect.left + rect.width / 2 - centerX)
+      });
+    }
+  }
+  out.sort((a, b) => {
+    if (Math.abs(a.centerDist - b.centerDist) > 1) return a.centerDist - b.centerDist;
+    if (Math.abs(a.rect.top - b.rect.top) > 1) return a.rect.top - b.rect.top;
+    return a.rect.left - b.rect.left;
+  });
+  return out;
+}
+
 function getLegacySeatScanStats(preferredDoc = null) {
   const docs = getLegacySeatSearchDocuments(preferredDoc);
   let total = 0;
@@ -7987,7 +9481,7 @@ function getLegacySeatScanStats(preferredDoc = null) {
   for (const doc of docs) {
     const nodes = Array.from(
       doc.querySelectorAll(
-        "span#Seats, span[name='Seats'], span[class*='Seat'], span[onclick*='SelectSeat'], span[onclick*='selectseat'], span[value='N'], span[value='n']"
+        "span#Seats, span[name='Seats'], span[class*='Seat'], span[onclick*='SelectSeat'], span[onclick*='selectseat'], span[value='N'], span[value='n'], img.stySelectSeat, img[id^='SID'], img[onclick*='SelectSeatKBO']"
       )
     );
     total += nodes.length;
@@ -8011,6 +9505,8 @@ async function switchLegacySeatArea(area) {
   if (!area?.el) return false;
   const now = Date.now();
   const areaIdentity = String(area.code || area.key || area.label || "").trim();
+  const seatDoc = getLegacySeatFrameDocument();
+  const localView = seatDoc?.defaultView || null;
   if (
     now - state.legacySeatLastAreaSwitchAt < 220 &&
     state.legacySeatCurrentAreaCode === areaIdentity
@@ -8021,6 +9517,7 @@ async function switchLegacySeatArea(area) {
   let hit = false;
   let mainResult = null;
   let mainLastResult = null;
+  let localScriptHit = false;
   const areaLabel = String(area.code || area.label || area.key || "").trim();
   const mainScripts = (Array.isArray(area.scripts) ? area.scripts : []).slice().sort((a, b) => {
     const aa = /fnblockseatupdate\s*\(/i.test(String(a || "")) ? 1 : 0;
@@ -8036,26 +9533,15 @@ async function switchLegacySeatArea(area) {
       break;
     }
   }
-  if (!hit) {
-    hit = runLegacyHandlerScript(area.el, [
-    "fnblockseatupdate",
-    "blockseatupdate",
-    "selectblock"
-    ]);
-  }
-  const anchor = String(area.el.tagName || "").toLowerCase() === "a" ? area.el : area.el.closest?.("a");
-  if (!hit && anchor) {
-    hit = runLegacyHandlerScript(anchor, [
-      "fnblockseatupdate",
-      "blockseatupdate",
-      "selectblock"
-    ]);
-  }
-  if (!hit && !hasJavascriptHref(area.el)) {
-    hit = forceClick(area.el) || clickAtCenter(area.el) || clickElement(area.el);
-  }
-  if (!hit && anchor && !hasJavascriptHref(anchor)) {
-    hit = forceClick(anchor) || clickAtCenter(anchor) || clickElement(anchor);
+  if (!hit && localView) {
+    for (const script of mainScripts) {
+      if (!normalizeLegacyScriptCode(script)) continue;
+      if (runLegacyScriptCode(localView, script, area.el)) {
+        hit = true;
+        localScriptHit = true;
+        break;
+      }
+    }
   }
   if (!hit) return false;
 
@@ -8077,6 +9563,9 @@ async function switchLegacySeatArea(area) {
       return `, main=N, fn=${mainLastResult.fnBlockSeatUpdateDefined ? "Y" : "N"}, host=${
         mainLastResult.fnHost || "-"
       }, frame=${mainLastResult.frameId ?? "-"}, err=${String(mainLastResult.error || "-")}`;
+    }
+    if (localScriptHit) {
+      return ", main=N, local=frame_script";
     }
     return "";
   })();
@@ -8126,6 +9615,9 @@ async function runLegacySeatStep() {
   if (state.legacySeatFlowKey !== flowKey) {
     resetLegacySeatRuntime();
     state.legacySeatFlowKey = flowKey;
+  }
+  if (state.notifyLegacySeatCompletedSent && !state.legacySeatSubmitTriggeredAt) {
+    state.notifyLegacySeatCompletedSent = false;
   }
   if (closeAnySeatConfirmPopupIfPresent() || (await closeAnySeatConfirmPopupCrossFrameIfPresent())) {
     await sleep(120);
@@ -8242,6 +9734,15 @@ async function runLegacySeatStep() {
   const untried = cooled.filter((x) => !hasLegacySeatClickedKey(x.key));
   const clickPool = untried.length ? untried : cooled;
 
+  if (state.legacySeatAreaSettleUntil && Date.now() < state.legacySeatAreaSettleUntil) {
+    if (Date.now() - state.legacySeatLastLogAt > 1200) {
+      const waitMs = Math.max(0, state.legacySeatAreaSettleUntil - Date.now());
+      log(`比赛场旧版选座: 点击后等待 ${waitMs}ms，再尝试下一个座位`);
+      state.legacySeatLastLogAt = Date.now();
+    }
+    return;
+  }
+
   if (target === 1 && state.legacySeatSinglePickPendingUntil > now) {
     if (now - state.legacySeatLastNextAt > 900) {
       if (await clickLegacySeatCompleteButton()) {
@@ -8335,6 +9836,164 @@ async function runLegacySeatStep() {
   }
 }
 
+async function runLegacyCompetitionSeatStep() {
+  const flowKey = `${location.host}${location.pathname}${location.search}|step=${getLegacyActiveStepNumber() || 2}`;
+  if (state.legacySeatFlowKey !== flowKey) {
+    resetLegacySeatRuntime();
+    state.legacySeatFlowKey = flowKey;
+    const startedAt = Date.now();
+    state.legacySeatLastAreaSwitchAt = startedAt;
+    state.legacySeatAreaNextSwitchAt = startedAt + getLegacyAreaSwitchIntervalMs();
+  }
+  if (state.notifyLegacySeatCompletedSent && !state.legacySeatSubmitTriggeredAt) {
+    state.notifyLegacySeatCompletedSent = false;
+  }
+  if (closeAnySeatConfirmPopupIfPresent() || (await closeAnySeatConfirmPopupCrossFrameIfPresent())) {
+    await sleep(120);
+    return;
+  }
+  if (closeSeatUnlockNoticeIfPresent("legacy")) {
+    await sleep(140);
+    return;
+  }
+
+  const seatDoc = getLegacySeatFrameDocument();
+  if (!seatDoc) {
+    if (Date.now() - state.legacySeatLastLogAt > 2500) {
+      log("比赛场旧版选座: ifrmSeat 文档未就绪，等待加载");
+      state.legacySeatLastLogAt = Date.now();
+    }
+    return;
+  }
+
+  const target = normalizeQuantity(state.config.quantity, 1);
+  const now = Date.now();
+  let selectedDom = getLegacySelectedSeatCount();
+  const selectedAssumed = Math.max(0, Number(state.legacySeatSelectedAssumed) || 0);
+  const staleAnchor = Math.max(
+    0,
+    Number(state.legacySeatLastSeatClickAt) || 0,
+    Number(state.legacySeatSubmitTriggeredAt) || 0
+  );
+  const staleElapsed = staleAnchor ? now - staleAnchor : Number.POSITIVE_INFINITY;
+  if (selectedAssumed > selectedDom && staleElapsed > 2200) {
+    state.legacySeatSelectedAssumed = selectedDom;
+    if (selectedDom < target) {
+      state.legacySeatSinglePickPendingUntil = 0;
+      state.legacySeatSubmitTriggeredAt = 0;
+    }
+    if (selectedDom === 0 && now - state.legacySeatLastLogAt > 1200) {
+      log("比赛场旧版选座: 检测到已选座位已失效，恢复继续找座");
+      state.legacySeatLastLogAt = now;
+    }
+  }
+
+  let selected = Math.max(selectedDom, Number(state.legacySeatSelectedAssumed) || 0);
+  if (selected >= target) {
+    state.legacySeatSinglePickPendingUntil = 0;
+    if (Date.now() - state.legacySeatLastNextAt < 900) return;
+    const submitOk = await clickLegacySeatCompleteButton();
+    if (submitOk) {
+      state.legacySeatLastNextAt = Date.now();
+      markLegacySeatSubmitTriggered(selected, target);
+      log(`比赛场旧版座位已满足目标(${selected}/${target})，尝试提交座位确认`);
+      return;
+    }
+    selectedDom = getLegacySelectedSeatCount();
+    if (selectedDom >= target) return;
+    state.legacySeatSelectedAssumed = selectedDom;
+    selected = selectedDom;
+    if (Date.now() - state.legacySeatLastLogAt > 1200) {
+      log("比赛场旧版选座: completed 未生效且已选座位不足，回退到找座流程");
+      state.legacySeatLastLogAt = Date.now();
+    }
+  }
+
+  const candidates = getLegacyCompetitionAvailableSeatCandidates(seatDoc);
+  const cooled = candidates.filter((x) => !hasLegacySeatRecentAttempt(x.key, 6000));
+  const untried = cooled.filter((x) => !hasLegacySeatClickedKey(x.key));
+  const clickPool = untried.length ? untried : cooled;
+
+  if (target === 1 && state.legacySeatSinglePickPendingUntil > now) {
+    if (now - state.legacySeatLastNextAt > 900) {
+      if (await clickLegacySeatCompleteButton()) {
+        state.legacySeatLastNextAt = Date.now();
+        markLegacySeatSubmitTriggered(1, target);
+        log("比赛场旧版单票模式: 已触发 Seat selection completed，等待页面切换");
+      }
+    }
+    if (now - state.legacySeatLastLogAt > 1200) {
+      const waitMs = Math.max(0, state.legacySeatSinglePickPendingUntil - now);
+      log(`比赛场旧版单票模式: 当前锁定中，仅提交 completed (${waitMs}ms)`);
+      state.legacySeatLastLogAt = now;
+    }
+    return;
+  }
+
+  if (!clickPool.length) {
+    if (candidates.length) {
+      if (Date.now() - state.legacySeatLastLogAt > 1200) {
+        log(`比赛场旧版选座: 检测到可选座位(${candidates.length})，等待单击冷却`);
+        state.legacySeatLastLogAt = Date.now();
+      }
+    } else if (Date.now() - state.legacySeatLastLogAt > 2400) {
+      const seatStats = getLegacySeatScanStats(seatDoc);
+      log(
+        `比赛场旧版选座: 当前暂无可选座位, seat扫描=${seatStats.available}/${seatStats.seatN}/${seatStats.total}, docs=${seatStats.docs}`
+      );
+      state.legacySeatLastLogAt = Date.now();
+    }
+    if (
+      Date.now() >=
+      (Number(state.legacySeatAreaNextSwitchAt || 0) ||
+        state.legacySeatLastAreaSwitchAt + getLegacyAreaSwitchIntervalMs())
+    ) {
+      await clickLegacyCompetitionRefreshButton(seatDoc);
+    }
+    return;
+  }
+
+  if (!untried.length && candidates.length && Date.now() - state.legacySeatLastLogAt > 2400) {
+    log(`比赛场旧版选座: 检测到可选座位(${candidates.length})，重试已尝试座位`);
+    state.legacySeatLastLogAt = Date.now();
+  }
+
+  if (Date.now() - state.legacySeatLastSeatClickAt < 120) return;
+  const candidate = clickPool[0];
+  const ok = await clickLegacySeatCandidate(candidate, target);
+  state.legacySeatLastSeatClickAt = Date.now();
+  if (target === 1) {
+    state.legacySeatSinglePickPendingUntil = Date.now() + 8000;
+  }
+  const selectedNow = Math.max(
+    getLegacySelectedSeatCount(),
+    Number(state.legacySeatSelectedAssumed) || 0
+  );
+  if (ok && selectedNow >= target && Date.now() - state.legacySeatLastNextAt > 500) {
+    if (await clickLegacySeatCompleteButton()) {
+      state.legacySeatSinglePickPendingUntil = 0;
+      state.legacySeatLastNextAt = Date.now();
+      markLegacySeatSubmitTriggered(selectedNow, target);
+      log(`比赛场旧版已点击右下角 Seat selection completed (${selectedNow}/${target})`);
+    }
+    return;
+  }
+
+  if (!ok) {
+    state.legacySeatAreaSettleUntil = Date.now() + getLegacyAreaSettleMs();
+    if (Date.now() - state.legacySeatLastLogAt > 900) {
+      const seatInfo = String(
+        candidate?.el?.getAttribute?.("seatinfo") ||
+          candidate?.el?.getAttribute?.("title") ||
+          candidate?.key ||
+          "-"
+      ).trim();
+      log(`比赛场旧版选座: 当前座位点击未生效，等待后尝试下一个 (${seatInfo})`);
+      state.legacySeatLastLogAt = Date.now();
+    }
+  }
+}
+
 async function runLegacyInterparkTick() {
   state.lastStage = "legacy";
   await maybeNotifyLegacySeatCompletedOnTransition();
@@ -8410,6 +10069,90 @@ async function runLegacyInterparkTick() {
   }
 }
 
+async function runLegacyCompetitionInterparkTick() {
+  state.lastStage = "legacy_competition";
+  if (state.lastBookingPageVariant !== "legacy_competition") {
+    state.lastBookingPageVariant = "legacy_competition";
+    log("识别到旧版比赛场界面开关已开启，进入比赛场旧版流程分支");
+  }
+  if (closeLegacyCompetitionNoticeIfPresent()) {
+    await sleep(state.tickMode === "critical" ? 45 : 140);
+    return;
+  }
+
+  await maybeNotifyLegacySeatCompletedOnTransition();
+  if (!state.priceLockedSlow) setTickMode("fast");
+
+  if (isQueuePage()) {
+    state.lastStage = "queue";
+    if (!state.priceLockedSlow) setTickMode("fast");
+    if (!state.queueActive) {
+      state.queueActive = true;
+      state.queueKeepAliveCount = 0;
+      state.queueLastRemaining = null;
+      scheduleNextQueueKeepAlive(true);
+      if (state.firstBuyNowClickAt) {
+        const cost = Date.now() - state.firstBuyNowClickAt;
+        log(`检测到排队页，进入等待(点击到入队 ${cost}ms)`);
+      } else {
+        log("检测到排队页，进入等待");
+      }
+      state.queueHealth.lastProbeAt = 0;
+      state.queueHealth.consecutiveFail = 0;
+      state.queueHealth.lastSuccessAt = Date.now();
+      state.queueHealth.alertActive = false;
+      state.queueHealth.lastAlertAt = 0;
+    }
+    if (state.queueNextKeepAliveAt && Date.now() >= state.queueNextKeepAliveAt) {
+      runQueueKeepAliveAction();
+      scheduleNextQueueKeepAlive(false);
+    }
+    await runQueueHealthGuard();
+    await maybeNotifyQueueThresholds();
+    if (Date.now() - state.queueLastLogAt > 5000) {
+      log("排队中，等待放行...");
+      state.queueLastLogAt = Date.now();
+    }
+    return;
+  }
+
+  if (state.queueActive) {
+    clearQueueRuntimeState();
+    if (!state.priceLockedSlow) setTickMode("fast");
+    log("排队已放行，继续比赛场旧版流程");
+  }
+
+  if (isLegacySeatLayerVisible() || isLegacySeatIframeReady()) {
+    state.legacyNextPendingUntil = 0;
+    state.legacyNextWaitLogAt = 0;
+    const captchaHandled = await runCaptchaStep();
+    if (captchaHandled) {
+      await sleep(180);
+      return;
+    }
+    await runLegacyCompetitionSeatStep();
+    return;
+  }
+
+  if (state.legacySeatFlowKey) {
+    resetLegacySeatRuntime();
+    state.legacySeatSelectedAssumed = 0;
+    state.legacySeatSinglePickPendingUntil = 0;
+  }
+
+  const stepNo = getLegacyActiveStepNumber();
+  const frameDoc = getLegacyBookFrameDocument();
+  if (stepNo === 1 || (!stepNo && isLegacyDateStepLikely(frameDoc))) {
+    await runLegacyDateStep();
+    return;
+  }
+
+  if (Date.now() - state.queueLastLogAt > 5000) {
+    log(`比赛场旧版页面当前处于 step ${stepNo || "unknown"}，日期流程仅在 step 1 执行`);
+    state.queueLastLogAt = Date.now();
+  }
+}
+
 async function tick() {
   if (!IS_TOP_FRAME) return;
   if (!isBotOwner() && !tryClaimBotOwner()) return;
@@ -8472,7 +10215,11 @@ async function tick() {
       const variant = detectInterparkBookingVariant();
       rememberBookingVariant(variant);
       if (variant === "legacy") {
-        await runLegacyInterparkTick();
+        if (state.config.legacyCompetitionUiEnabled === true) {
+          await runLegacyCompetitionInterparkTick();
+        } else {
+          await runLegacyInterparkTick();
+        }
       } else {
         await runNewInterparkTick();
       }
@@ -8546,7 +10293,7 @@ async function loadConfig() {
     ),
     scavengeLoopEnabled: config.scavengeLoopEnabled === true,
     scavengeLoopIntervalSec: normalizeScavengeLoopIntervalSec(config.scavengeLoopIntervalSec, 600),
-    scavengeRoundMaxSec: normalizeScavengeRoundMaxSec(config.scavengeRoundMaxSec, 0),
+    scavengeRoundMaxSec: normalizeScavengeRoundMaxSec(config.scavengeRoundMaxSec, 480),
     quantity: normalizeQuantity(config.quantity, 1),
     dateMonth: String(config.dateMonth || "").trim(),
     dateDay: String(config.dateDay || "").trim(),
@@ -8555,6 +10302,7 @@ async function loadConfig() {
     newAreaCustomCodes: normalizeNewAreaCustomCodes(config.newAreaCustomCodes || []),
     legacyAreaOrderMode: String(config.legacyAreaOrderMode || "default").trim().toLowerCase() === "custom" ? "custom" : "default",
     legacyAreaCustomCodes: normalizeLegacyAreaCustomCodes(config.legacyAreaCustomCodes || []),
+    legacyCompetitionUiEnabled: config.legacyCompetitionUiEnabled === true,
     legacyAreaSwitchIntervalMs: normalizeLegacyAreaTimingMs(
       config.legacyAreaSwitchIntervalMs,
       LEGACY_AREA_SWITCH_INTERVAL_MS
@@ -8577,11 +10325,23 @@ async function loadConfig() {
     ocrAccessTokenExpiresAt: Number(config.ocrAccessTokenExpiresAt || 0),
     ocrLicenseExpiresAt: Number(config.ocrLicenseExpiresAt || 0),
     ocrLicenseActivatedAt: Number(config.ocrLicenseActivatedAt || 0),
+    captchaAutoFillEnabled: config.captchaAutoFillEnabled !== false,
     vpnApiUrl: String(config.vpnApiUrl || "http://127.0.0.1:8000").trim(),
-    vpnAutoSwitchEnabled: config.vpnAutoSwitchEnabled !== false,
-    queueVpnNotifyEnabled: config.queueVpnNotifyEnabled !== false,
+    vpnAutoSwitchEnabled: config.vpnAutoSwitchEnabled === true,
+    queueVpnNotifyEnabled: config.queueVpnNotifyEnabled === true,
+    queueNotifyEnabled: config.queueNotifyEnabled !== false,
+    cloudflareNotifyEnabled: config.cloudflareNotifyEnabled !== false,
+    captchaNotifyEnabled: config.captchaNotifyEnabled !== false,
+    successNotifyEnabled: config.successNotifyEnabled !== false,
+    queueNotifyThresholds: normalizeQueueNotifyThresholds(
+      config.queueNotifyThresholds,
+      DEFAULT_QUEUE_NOTIFY_THRESHOLDS
+    ),
+    notifyProvider: normalizeNotifyProvider(config.notifyProvider, "dingtalk"),
     dingTalkWebhookUrl: String(config.dingTalkWebhookUrl || "").trim(),
-    dingTalkSecret: String(config.dingTalkSecret || "").trim()
+    dingTalkSecret: String(config.dingTalkSecret || "").trim(),
+    telegramBotToken: String(config.telegramBotToken || "").trim(),
+    telegramChatId: String(config.telegramChatId || "").trim()
   };
   const storedScavengeNextRestartAt = Number(config.scavengeLoopNextRestartAt || 0);
   const storedScavengeLastRestartAt = Number(config.scavengeLoopLastRestartAt || 0);
@@ -8608,6 +10368,8 @@ async function loadConfig() {
   state.reserveEntryClickedOnce = false;
   state.reserveEntryTargetLogSig = "";
   state.reserveEntryTargetLastLogAt = 0;
+  state.legacyCompetitionNoticeCloseLastClickAt = 0;
+  state.legacyCompetitionNoticeCloseLastLogAt = 0;
   state.buyNowNoResponseLastNotifyAt = 0;
   state.lastStage = "unknown";
   state.lastBookingPageVariant = "unknown";
@@ -8624,6 +10386,7 @@ async function loadConfig() {
   state.sliderCaptchaTargetDistance = 0;
   state.sliderCaptchaTargetDistanceAt = 0;
   state.sliderCaptchaTargetDistanceSource = "";
+  state.sliderCaptchaResampleLastAt = 0;
   state.legacyNextPendingUntil = 0;
   state.legacyNextWaitLogAt = 0;
   state.notifySale3mSent = false;
@@ -8654,12 +10417,14 @@ async function loadConfig() {
       clearScavengeRuntime();
     }
   }
-  state.notifyQueueThresholdSent = { 1000: false, 100: false, 10: false };
+  state.notifyQueueThresholdSent = buildQueueNotifyThresholdState(state.config.queueNotifyThresholds);
   state.queueTop50FastestSwitchDone = false;
   state.queueLastRemaining = null;
   state.newSeatFlowKey = "";
   state.newSeatBlockedMap = {};
   state.newSeatLastAttemptKey = "";
+  state.newSeatLastClickedKey = "";
+  state.newSeatZoomClickCount = 0;
   state.legacySeatFlowKey = "";
   state.legacySeatAreaIndex = 0;
   state.legacySeatCurrentAreaCode = "";
@@ -8688,6 +10453,9 @@ async function loadConfig() {
   state.captcha.submitCount = 0;
   state.captcha.solvedAt = 0;
   state.captcha.lastPassLogAt = 0;
+  state.captcha.lastDisabledLogAt = 0;
+  state.captcha.lastMissingInputSig = "";
+  state.captcha.lastMissingInputAt = 0;
   state.captcha.candidates = [];
   state.captcha.candidateIndex = 0;
   state.captcha.legacyFirstInputDelayDone = false;

@@ -83,6 +83,7 @@ bash deploy/alarm_local_bundle/build_release.sh
 
 - `OCR 服务地址（可填云服务器）`：例如 `https://your-ocr-domain.example.com/ocr/file`
 - `OCR 激活码（首激活必填）`：首次输入后绑定当前设备
+- `滑块验证码自动拖动`：检测到滑块时自动尝试拖动，失败后仍会暂停等待手动完成
 - `VPN 切换 API 地址`：保持本地，例如 `http://127.0.0.1:8000`
 
 默认值：

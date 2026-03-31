@@ -107,7 +107,9 @@
       state,
       log,
       sleep,
+      isCaptchaAutoFillEnabled,
       findCaptchaImageElement,
+      findModernCaptchaModalRoot,
       isLegacyCaptchaLayerVisible,
       isLegacyCaptchaImage,
       findCaptchaInput,
@@ -147,14 +149,44 @@
         return false;
       }
 
+      const sig = makeCaptchaSignature(imageEl);
+      const modernCaptchaRoot =
+        !isLegacyCaptcha && typeof findModernCaptchaModalRoot === "function"
+          ? findModernCaptchaModalRoot(imageEl)
+          : null;
       const inputEl = findCaptchaInput(imageEl);
       if (!inputEl) {
+        if (!isLegacyCaptcha) {
+          if (!modernCaptchaRoot) {
+            state.captcha.solvedAt = now;
+            state.captcha.submitCount = 0;
+            state.captcha.lastImageSig = "";
+            state.captcha.candidates = [];
+            state.captcha.candidateIndex = 0;
+            state.captcha.lastMissingInputSig = "";
+            state.captcha.lastMissingInputAt = 0;
+            if (now - Number(state.captcha.lastPassLogAt || 0) > 1200) {
+              log("新版验证码弹窗已消失，视为已通过，继续后续流程");
+              state.captcha.lastPassLogAt = now;
+            }
+            return false;
+          }
+        }
         log("检测到验证码图，但未找到输入框");
         return true;
       }
       log("已定位验证码输入框");
+      state.captcha.lastMissingInputSig = "";
+      state.captcha.lastMissingInputAt = 0;
 
-      const sig = makeCaptchaSignature(imageEl);
+      if (typeof isCaptchaAutoFillEnabled === "function" && !isCaptchaAutoFillEnabled()) {
+        if (now - Number(state.captcha.lastDisabledLogAt || 0) > 3500) {
+          log("检测到图片验证码，自动填写已关闭，请手动输入完成后脚本会自动继续");
+          state.captcha.lastDisabledLogAt = now;
+        }
+        return true;
+      }
+
       const sameImage = sig === state.captcha.lastImageSig;
       const retryByErrorNow = hasCaptchaRetryErrorText(captchaDoc);
       const shouldForceReOcrByError = isLegacyCaptcha && retryByErrorNow;
@@ -278,7 +310,13 @@
         }
 
         await sleep(180);
-        const stillHasCaptcha = Boolean(findCaptchaImageElement());
+        const stillHasCaptcha = isLegacyCaptcha
+          ? Boolean(findCaptchaImageElement())
+          : Boolean(
+              typeof findModernCaptchaModalRoot === "function"
+                ? findModernCaptchaModalRoot(imageEl)
+                : findCaptchaImageElement()
+            );
         if (stillHasCaptcha) {
           state.captcha.submitCount += 1;
           const submitEl = findCaptchaSubmitButton(imageEl, inputEl);
@@ -288,12 +326,15 @@
           } else {
             log("回车后验证码仍存在，未命中确认按钮");
           }
-          if (state.captcha.submitCount >= 3) {
+          const refreshThreshold = isLegacyCaptcha ? 3 : 5;
+          if (state.captcha.submitCount >= refreshThreshold) {
             await clickCaptchaRefresh(imageEl);
             state.captcha.lastImageSig = "";
             state.captcha.lastAttemptAt = 0;
             state.captcha.submitCount = 0;
-            log("连续验证码提交后触发刷新");
+            state.captcha.candidates = [];
+            state.captcha.candidateIndex = 0;
+            log(`${isLegacyCaptcha ? "旧版" : "新版"}验证码连续提交 ${refreshThreshold} 次后触发刷新`);
           }
           return true;
         }
