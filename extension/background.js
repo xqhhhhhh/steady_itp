@@ -24,6 +24,10 @@ const DEBUGGER_API_AVAILABLE = Boolean(
     typeof DEBUGGER_API.sendCommand === "function"
 );
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+}
+
 function normalizeOcrApiUrl(raw, fallback = DEFAULT_OCR_API_URL) {
   const candidate = String(raw || "").trim();
   const fb = String(fallback || DEFAULT_OCR_API_URL).trim();
@@ -143,6 +147,35 @@ async function tryAcceptNativeDialogByDebugger(tabId) {
   }
 }
 
+async function pumpAcceptNativeDialogByDebugger(tabId, durationMs = 1800, intervalMs = 120) {
+  const id = Number(tabId);
+  if (!Number.isInteger(id) || id <= 0) return { ok: false, error: "invalid_tab_id" };
+  const deadline = Date.now() + Math.max(0, Number(durationMs) || 0);
+  const gap = Math.max(40, Number(intervalMs) || 120);
+  let acceptedCount = 0;
+  let lastError = "";
+  do {
+    const result = await tryAcceptNativeDialogByDebugger(id).catch((err) => ({
+      ok: false,
+      error: String(err?.message || err)
+    }));
+    if (result?.accepted) acceptedCount += 1;
+    if (result?.ok === false && result?.error) lastError = String(result.error);
+    await sleep(gap);
+  } while (Date.now() < deadline);
+  return { ok: !lastError, acceptedCount, error: lastError };
+}
+
+function scheduleNativeDialogAcceptTail(tabId, delayMs = 300, durationMs = 3200, intervalMs = 120) {
+  const id = Number(tabId);
+  if (!Number.isInteger(id) || id <= 0) return;
+  setTimeout(() => {
+    ensureNativeDialogDebugger(id)
+      .catch(() => ({}))
+      .then(() => pumpAcceptNativeDialogByDebugger(id, durationMs, intervalMs).catch(() => ({})));
+  }, Math.max(0, Number(delayMs) || 0));
+}
+
 async function detachNativeDialogDebugger(tabId) {
   const id = Number(tabId);
   if (!Number.isInteger(id) || id <= 0) return;
@@ -199,7 +232,7 @@ async function saveConfig(config) {
       scavengeLoopEnabled: config?.scavengeLoopEnabled === true,
       scavengeLoopIntervalSec: normalizeScavengeLoopIntervalSec(
         config?.scavengeLoopIntervalSec,
-        600
+        300
       ),
       scavengeRoundMaxSec: normalizeScavengeRoundMaxSec(
         config?.scavengeRoundMaxSec,
@@ -313,7 +346,7 @@ async function saveConfigOnly(config) {
           : current.scavengeLoopEnabled === true,
       scavengeLoopIntervalSec: normalizeScavengeLoopIntervalSec(
         config?.scavengeLoopIntervalSec,
-        current.scavengeLoopIntervalSec || 600
+        current.scavengeLoopIntervalSec || 300
       ),
       scavengeRoundMaxSec: normalizeScavengeRoundMaxSec(
         config?.scavengeRoundMaxSec,
@@ -490,9 +523,9 @@ function normalizePreEnterSeconds(raw, fallback = 30) {
   return Math.min(300, Math.max(5, Math.round(n)));
 }
 
-function normalizeScavengeLoopIntervalSec(raw, fallback = 600) {
+function normalizeScavengeLoopIntervalSec(raw, fallback = 300) {
   const n = Number(raw);
-  if (!Number.isFinite(n)) return Math.min(3600, Math.max(15, Number(fallback) || 600));
+  if (!Number.isFinite(n)) return Math.min(3600, Math.max(15, Number(fallback) || 300));
   return Math.min(3600, Math.max(15, Math.round(n)));
 }
 
@@ -2451,7 +2484,7 @@ chrome.runtime.onInstalled.addListener(async () => {
         reserveClickStartMode: "edge_once",
         sliderAutoDragSecretEnabled: false,
         scavengeLoopEnabled: false,
-        scavengeLoopIntervalSec: 600,
+        scavengeLoopIntervalSec: 300,
         scavengeRoundMaxSec: 480,
         countryCode: "86",
         phoneNumber: "",
@@ -2849,6 +2882,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         Number.isInteger(frameId) ? frameId : undefined,
         enabled
       );
+      if (enabled && Number.isInteger(Number(tabId)) && Number(tabId) > 0) {
+        await ensureNativeDialogDebugger(tabId).catch(() => ({}));
+        await tryAcceptNativeDialogByDebugger(tabId).catch(() => ({}));
+      }
       if (!enabled && Number.isInteger(Number(tabId)) && Number(tabId) > 0) {
         await detachNativeDialogDebugger(tabId).catch(() => {});
       }
@@ -2860,6 +2897,81 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       const tabId = _sender?.tab?.id;
       const result = await clickConfirmDialogInMainWorld(tabId);
       sendResponse({ ok: Boolean(result?.ok), result });
+      return;
+    }
+
+    if (message?.type === "NAVIGATE_CURRENT_TAB_URL") {
+      const tabId = Number(_sender?.tab?.id);
+      const url = String(message?.url || "").trim();
+      const reloadIfSameUrl = message?.reloadIfSameUrl === true;
+      if (!Number.isInteger(tabId) || tabId <= 0) {
+        sendResponse({ ok: false, error: "invalid_tab_id" });
+        return;
+      }
+      if (!url) {
+        sendResponse({ ok: false, error: "empty_url" });
+        return;
+      }
+      try {
+        await ensureNativeDialogDebugger(tabId).catch(() => ({}));
+        await tryAcceptNativeDialogByDebugger(tabId).catch(() => ({}));
+        pumpAcceptNativeDialogByDebugger(tabId, 2200, 100).catch(() => ({}));
+
+        let currentTab = null;
+        try {
+          currentTab = await chrome.tabs.get(tabId);
+        } catch (_) {
+          currentTab = null;
+        }
+        const currentUrl = String(currentTab?.url || "").trim().split("#")[0];
+        const targetUrl = url.split("#")[0];
+        if (reloadIfSameUrl && currentUrl && currentUrl === targetUrl) {
+          await sleep(80);
+          await tryAcceptNativeDialogByDebugger(tabId).catch(() => ({}));
+          pumpAcceptNativeDialogByDebugger(tabId, 2200, 100).catch(() => ({}));
+          await chrome.tabs.reload(tabId, { bypassCache: true });
+          scheduleNativeDialogAcceptTail(tabId, 280, 4200, 100);
+          sendResponse({ ok: true, tabId, url, mode: "reload" });
+          return;
+        }
+
+        await sleep(80);
+        await tryAcceptNativeDialogByDebugger(tabId).catch(() => ({}));
+        pumpAcceptNativeDialogByDebugger(tabId, 2200, 100).catch(() => ({}));
+        await chrome.tabs.update(tabId, { url });
+        await sleep(220);
+        await tryAcceptNativeDialogByDebugger(tabId).catch(() => ({}));
+        let updatedTab = null;
+        try {
+          updatedTab = await chrome.tabs.get(tabId);
+        } catch (_) {
+          updatedTab = null;
+        }
+        const updatedUrl = String(updatedTab?.url || "").trim();
+        if (updatedUrl === url || updatedUrl.startsWith(url)) {
+          scheduleNativeDialogAcceptTail(tabId, 280, 4200, 100);
+          sendResponse({ ok: true, tabId, url, mode: "update" });
+          return;
+        }
+
+        const newTab = await chrome.tabs.create({ url, active: true });
+        scheduleNativeDialogAcceptTail(newTab?.id, 280, 3200, 100);
+        try {
+          await ensureNativeDialogDebugger(tabId).catch(() => ({}));
+          await tryAcceptNativeDialogByDebugger(tabId).catch(() => ({}));
+          pumpAcceptNativeDialogByDebugger(tabId, 2200, 100).catch(() => ({}));
+          await sleep(80);
+          await chrome.tabs.remove(tabId);
+        } catch (_) {}
+        sendResponse({
+          ok: true,
+          tabId: Number(newTab?.id) || tabId,
+          url,
+          mode: "create_remove_fallback"
+        });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message || err) });
+      }
       return;
     }
 

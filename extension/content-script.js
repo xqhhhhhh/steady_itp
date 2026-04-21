@@ -30,7 +30,7 @@ const state = {
     reserveClickBurstCount: 1,
     reserveClickStartMode: "edge_once",
     scavengeLoopEnabled: false,
-    scavengeLoopIntervalSec: 600,
+    scavengeLoopIntervalSec: 300,
     scavengeRoundMaxSec: 480,
     quantity: 1,
     dateMonth: "",
@@ -244,6 +244,7 @@ const STEP_TEXT = {
     "立即购买",
     "立即購買",
     "buy now",
+    "buy presale tickets",
     "book now",
     "先行订购",
     "先行訂購",
@@ -273,7 +274,7 @@ const STEP_TEXT = {
     "일반예매"
   ],
   nextStep: ["下一步", "下一步", "next", "다음"],
-  completeSeat: ["完成选择", "完成選擇", "done", "confirm seat", "좌석선택완료"],
+  completeSeat: ["完成选择", "完成選擇", "done", "submit", "confirm seat", "좌석선택완료"],
   priceStep: ["选择价格", "選擇價格", "price selection", "가격 선택"],
   preorder: ["预购", "預購", "订购", "訂購"],
   agreement: ["同意条款", "同意條款", "同意", "약관", "agree"]
@@ -366,6 +367,7 @@ function buildQueueNotifyThresholdState(thresholds) {
 }
 
 function buildNewAreaOrderMap() {
+  if (normalizeNewAreaOrderMode(state.config.newAreaOrderMode) !== "custom") return null;
   const codes = normalizeNewAreaCustomCodes(state.config.newAreaCustomCodes || []);
   if (!codes.length) return null;
   return new Map(codes.map((code, idx) => [code, idx]));
@@ -655,9 +657,9 @@ function normalizeReserveClickStartMode(raw, fallback = "edge_once") {
   return mode === "always" ? "always" : "edge_once";
 }
 
-function normalizeScavengeLoopIntervalSec(raw, fallback = 600) {
+function normalizeScavengeLoopIntervalSec(raw, fallback = 300) {
   const n = Number(raw);
-  if (!Number.isFinite(n)) return Math.min(3600, Math.max(15, Math.round(Number(fallback) || 600)));
+  if (!Number.isFinite(n)) return Math.min(3600, Math.max(15, Math.round(Number(fallback) || 300)));
   return Math.min(3600, Math.max(15, Math.round(n)));
 }
 
@@ -1556,7 +1558,7 @@ async function maybeNotifyLegacySeatCompletedOnTransition() {
 function getScavengeLoopIntervalMs() {
   const sec = normalizeScavengeLoopIntervalSec(
     state.config.scavengeLoopIntervalSec,
-    600
+    300
   );
   return sec * 1000;
 }
@@ -1645,10 +1647,17 @@ async function maybeRunScavengeLoopRestart() {
   try {
     const nowUrl = String(location.href || "").split("#")[0];
     const targetNoHash = targetUrl.split("#")[0];
-    if (nowUrl === targetNoHash) {
-      window.location.reload();
-    } else {
-      window.location.assign(targetUrl);
+    const nav = await chrome.runtime.sendMessage({
+      type: "NAVIGATE_CURRENT_TAB_URL",
+      url: targetUrl,
+      reloadIfSameUrl: nowUrl === targetNoHash
+    });
+    if (!nav?.ok) {
+      if (nowUrl === targetNoHash) {
+        window.location.reload();
+      } else {
+        window.location.assign(targetUrl);
+      }
     }
   } catch (_) {
     window.location.href = targetUrl;
@@ -1714,9 +1723,24 @@ async function maybeAbortScavengeRoundByTimeout() {
 
   const waitUrl = "https://world.nol.com/";
   try {
-    window.location.assign(waitUrl);
+    await chrome.runtime.sendMessage({
+      type: "SET_NATIVE_DIALOG_AUTOCONFIRM_MAIN",
+      enabled: true
+    });
+    await sleep(120);
+  } catch (_) {}
+  try {
+    const nav = await chrome.runtime.sendMessage({
+      type: "NAVIGATE_CURRENT_TAB_URL",
+      url: waitUrl
+    });
+    if (!nav?.ok) window.location.assign(waitUrl);
   } catch (_) {
-    window.location.href = waitUrl;
+    try {
+      window.location.assign(waitUrl);
+    } catch (_) {
+      window.location.href = waitUrl;
+    }
   }
   return true;
 }
@@ -2015,6 +2039,11 @@ async function runSliderCaptchaPauseGuard() {
   const active = isSliderCaptchaWidgetPresent();
   if (!active) {
     if (state.sliderCaptchaPaused) {
+      const now = Date.now();
+      state.legacySeatAreaSettleUntil = Math.max(
+        Number(state.legacySeatAreaSettleUntil || 0),
+        now + 1000
+      );
       state.sliderCaptchaPaused = false;
       state.sliderCaptchaLastLogAt = 0;
       state.sliderCaptchaAutoDragLastAt = 0;
@@ -2023,7 +2052,7 @@ async function runSliderCaptchaPauseGuard() {
       state.sliderCaptchaTargetDistanceAt = 0;
       state.sliderCaptchaTargetDistanceSource = "";
       state.sliderCaptchaResampleLastAt = 0;
-      log("滑块验证码已完成，恢复自动流程");
+      log("滑块验证码已完成，恢复自动流程；旧版切区额外等待1000ms");
     }
     return false;
   }
@@ -3862,7 +3891,7 @@ function closeSeatUnlockNoticeIfPresent(context = "new") {
   const lockDialog = findSeatDialog(isSeatLockedText);
   const needSeatDialog = lockDialog ? null : findSeatDialog(isNeedSelectSeatText);
   const lockHit = Boolean(lockDialog) || isSeatLockedText(whole);
-  const needSeatHit = !lockHit && (Boolean(needSeatDialog) || isNeedSelectSeatText(whole));
+  const needSeatHit = !lockHit && Boolean(needSeatDialog);
   if (!lockHit && !needSeatHit) return false;
   const dialog = lockDialog || needSeatDialog || null;
 
@@ -4414,7 +4443,11 @@ function getDateDayCandidates() {
   ).filter((el) => isDomElement(el) && visible(el));
 
   if (entCalendarButtons.length) {
-    const entCandidates = entCalendarButtons
+    const activeSlideButtons = entCalendarButtons.filter((btn) =>
+      btn.closest(".swiper-slide.swiper-slide-active")
+    );
+    const buttonPool = activeSlideButtons.length ? activeSlideButtons : entCalendarButtons;
+    const entCandidates = buttonPool
       .map((btn) => {
         const text = String(
           btn.querySelector("[class*='EntCalendar_number']")?.textContent || btn.textContent || ""
@@ -4430,6 +4463,8 @@ function getDateDayCandidates() {
         if (disabled) return null;
 
         const selected = btn.getAttribute("aria-pressed") === "true";
+        const slide = btn.closest(".swiper-slide");
+        const slideClass = normalizeText(slide?.className || "");
         const r = btn.getBoundingClientRect();
         if (r.left > window.innerWidth * 0.68) return null;
         if (r.top < 90 || r.top > window.innerHeight * 0.9) return null;
@@ -4437,6 +4472,11 @@ function getDateDayCandidates() {
 
         let score = 20;
         if (selected) score += 6;
+        if (slideClass.includes("swiper-slide-active")) {
+          score += 20;
+        } else if (slideClass.includes("swiper-slide-next") || slideClass.includes("swiper-slide-prev")) {
+          score -= 6;
+        }
         return { el: btn, day, selected, score, r };
       })
       .filter(Boolean)
@@ -5610,26 +5650,48 @@ function findProductBottomSheetCloseButton() {
   const normalizedCloseWords = closeWords.map((w) => normalizeText(w));
   const candidates = Array.from(
     document.querySelectorAll(
-      ".joint-modal-bottom-sheet__footer button.joint-modal-bottom-sheet__actionButton, .joint-modal-bottom-sheet__footer button"
+      [
+        ".joint-modal-bottom-sheet__footer button.joint-modal-bottom-sheet__actionButton",
+        ".joint-modal-bottom-sheet__footer button",
+        ".nds-e-modal-bottom-sheet__footer button.nds-e-modal-bottom-sheet__actionButton",
+        ".nds-e-modal-bottom-sheet__footer button",
+        ".nds-e-modal-bottom-sheet__closeButton"
+      ].join(", ")
     )
   )
     .filter(visible)
     .map((btn) => {
-      const txt = normalizeText(btn.textContent || "");
-      if (!txt || !normalizedCloseWords.some((w) => txt.includes(w))) return null;
       const cls = normalizeText(btn.className || "");
+      const txt = normalizeText(
+        [
+          btn.textContent || "",
+          btn.getAttribute("aria-label") || "",
+          btn.getAttribute("title") || ""
+        ].join(" ")
+      );
+      if (!txt || !normalizedCloseWords.some((w) => txt.includes(w))) return null;
       const disabled =
         btn.disabled ||
         cls.includes("disabled") ||
         btn.getAttribute("aria-disabled") === "true";
       if (disabled) return null;
       const r = btn.getBoundingClientRect();
+      const dialog =
+        btn.closest(".joint-modal-bottom-sheet__container, .nds-e-modal-bottom-sheet__container") ||
+        btn.closest("[data-modal-bottom-sheet-container='true']") ||
+        btn.closest("[role='dialog']");
+      const dialogText = normalizeText(dialog?.textContent || "");
       let score = 0;
       if (cls.includes("joint-modal-bottom-sheet__actionbutton")) score += 6;
+      if (cls.includes("nds-e-modal-bottom-sheet__actionbutton")) score += 6;
       if (cls.includes("joint-rectangle-button")) score += 4;
+      if (cls.includes("nds-e-rectangle-button")) score += 4;
+      if (cls.includes("nds-e-modal-bottom-sheet__closebutton")) score += 3;
       if (r.width >= 200) score += 2;
       if (r.height >= 40) score += 2;
       if (r.top > window.innerHeight * 0.6) score += 3;
+      if (dialogText.includes("公告") || dialogText.includes("notice")) score += 3;
+      if (dialogText.includes("according to the terms on the notice")) score += 2;
       return { btn, score };
     })
     .filter(Boolean)
@@ -5681,7 +5743,13 @@ function findBizCodeGateRootUniqueButton() {
   // 次优先: 历史兼容文案（Membership / Membership Member）。
   const fallbackByText = allButtons.find((btn) => {
     const text = getSpanText(btn);
-    return text === "Membership" || text === "membership" || text === "Membership Member";
+      return (
+        text === "Membership" ||
+        text === "membership" ||
+        text === "Membership Member" ||
+        text === "Fanclub Pre-order" ||
+        text === "Book Now"
+      );
   });
   if (fallbackByText) return fallbackByText;
 
@@ -5718,7 +5786,9 @@ function isReserveEntrySpanTextReady(spanTextOrTexts) {
       text === "預定" ||
       text === "Membership" ||
       text === "membership" ||
-      text === "Membership Member"
+      text === "Membership Member" ||
+      text === "Fanclub Pre-order" ||
+      text === "Book Now"
     );
   });
 }
@@ -6850,8 +6920,7 @@ function hasEmbeddedPricePanelInSeatPage() {
   const hasPriceTitle =
     text.includes("选择价格") ||
     text.includes("選擇價格") ||
-    text.includes("price selection") ||
-    text.includes("selected seat");
+    text.includes("price selection");
   if (!hasPriceTitle) return false;
 
   const hasQuantityControls = Boolean(findPlusButton() || findMinusButton());
@@ -6933,7 +7002,7 @@ function isDatePage() {
 
 function isPricePage() {
   const href = String(location.href || "").toLowerCase();
-  return href.includes("price") || hasEmbeddedPricePanelInSeatPage();
+  return href.includes("step=price") || href.includes("/price") || hasEmbeddedPricePanelInSeatPage();
 }
 
 function isLegacyCompetitionPricePage() {
@@ -9505,10 +9574,8 @@ async function switchLegacySeatArea(area) {
   if (!area?.el) return false;
   const now = Date.now();
   const areaIdentity = String(area.code || area.key || area.label || "").trim();
-  const seatDoc = getLegacySeatFrameDocument();
-  const localView = seatDoc?.defaultView || null;
   if (
-    now - state.legacySeatLastAreaSwitchAt < 220 &&
+    now - state.legacySeatLastAreaSwitchAt < 1000 &&
     state.legacySeatCurrentAreaCode === areaIdentity
   ) {
     return true;
@@ -9516,8 +9583,6 @@ async function switchLegacySeatArea(area) {
 
   let hit = false;
   let mainResult = null;
-  let mainLastResult = null;
-  let localScriptHit = false;
   const areaLabel = String(area.code || area.label || area.key || "").trim();
   const mainScripts = (Array.isArray(area.scripts) ? area.scripts : []).slice().sort((a, b) => {
     const aa = /fnblockseatupdate\s*\(/i.test(String(a || "")) ? 1 : 0;
@@ -9526,21 +9591,10 @@ async function switchLegacySeatArea(area) {
   });
   for (const script of mainScripts) {
     const main = await triggerLegacyScriptMainWorld(script, areaLabel);
-    mainLastResult = main;
     if (main?.ok) {
       hit = true;
       mainResult = main;
       break;
-    }
-  }
-  if (!hit && localView) {
-    for (const script of mainScripts) {
-      if (!normalizeLegacyScriptCode(script)) continue;
-      if (runLegacyScriptCode(localView, script, area.el)) {
-        hit = true;
-        localScriptHit = true;
-        break;
-      }
     }
   }
   if (!hit) return false;
@@ -9551,25 +9605,9 @@ async function switchLegacySeatArea(area) {
   state.legacySeatAreaSettleUntil = now + getLegacyAreaSettleMs();
   const srcChanged =
     mainResult && mainResult.beforeSeatSrc !== mainResult.afterSeatSrc ? "Y" : "N";
-  const mainExec = (() => {
-    if (mainResult) {
-      return `, main=Y, fn=${mainResult.fnBlockSeatUpdateDefined ? "Y" : "N"}, host=${
-        mainResult.fnHost || "-"
-      }, srcChanged=${srcChanged}, frame=${mainResult.frameId ?? "-"}, mode=${
-        mainResult.mode || "-"
-      }`;
-    }
-    if (mainLastResult) {
-      return `, main=N, fn=${mainLastResult.fnBlockSeatUpdateDefined ? "Y" : "N"}, host=${
-        mainLastResult.fnHost || "-"
-      }, frame=${mainLastResult.frameId ?? "-"}, err=${String(mainLastResult.error || "-")}`;
-    }
-    if (localScriptHit) {
-      return ", main=N, local=frame_script";
-    }
-    return "";
-  })();
-  log(`旧版选座切换区域: ${area.label}${area.code ? `(${area.code})` : ""}${mainExec}`);
+  log(
+    `旧版选座切换区域: ${area.label}${area.code ? `(${area.code})` : ""}, trigger=main_world, fn=${mainResult?.fnBlockSeatUpdateDefined ? "Y" : "N"}, host=${mainResult?.fnHost || "-"}, srcChanged=${srcChanged}, frame=${mainResult?.frameId ?? "-"}, mode=${mainResult?.mode || "-"}`
+  );
   return true;
 }
 
@@ -10292,7 +10330,7 @@ async function loadConfig() {
       "edge_once"
     ),
     scavengeLoopEnabled: config.scavengeLoopEnabled === true,
-    scavengeLoopIntervalSec: normalizeScavengeLoopIntervalSec(config.scavengeLoopIntervalSec, 600),
+    scavengeLoopIntervalSec: normalizeScavengeLoopIntervalSec(config.scavengeLoopIntervalSec, 300),
     scavengeRoundMaxSec: normalizeScavengeRoundMaxSec(config.scavengeRoundMaxSec, 480),
     quantity: normalizeQuantity(config.quantity, 1),
     dateMonth: String(config.dateMonth || "").trim(),

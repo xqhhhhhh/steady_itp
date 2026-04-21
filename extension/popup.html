@@ -107,11 +107,11 @@
         <div id="scavengeModeFields" class="subpanel hidden">
           <h3 data-i18n="scavengeOnly">捡漏专用</h3>
           <label id="scavengeLoopIntervalWrap" class="field">
-            <span data-i18n="scavengeLoopIntervalMin">捡漏重跑间隔（分钟）(建议10分钟以上)</span>
-            <input id="scavengeLoopIntervalMin" type="number" min="1" max="120" step="1" value="10" />
+            <span data-i18n="scavengeLoopIntervalMin">捡漏重跑间隔（分钟）</span>
+            <input id="scavengeLoopIntervalMin" type="number" min="1" max="120" step="1" value="5" />
           </label>
           <label class="field">
-            <span data-i18n="scavengeRoundMaxMin">单次循环时长上限（分钟，0=不限制，建议1-3分钟，过长请求过多可能短暂封号）</span>
+            <span data-i18n="scavengeRoundMaxMin">单次循环时长上限（分钟，0=不限制，建议8）</span>
             <input id="scavengeRoundMaxMin" type="number" min="0" max="180" step="1" value="8" />
           </label>
         </div>
@@ -184,7 +184,7 @@
         </div>
 
         <label class="toggle-row" for="legacyCompetitionUiEnabled">
-          <span data-i18n="legacyCompetitionUiEnabled">旧版比赛场界面</span>
+          <span data-i18n="legacyCompetitionUiEnabled">旧版比赛场界面（只有比赛场需要勾选，否则不要勾选，具体什么是比赛场可以看教程）</span>
           <input id="legacyCompetitionUiEnabled" type="checkbox" />
         </label>
 

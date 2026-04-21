@@ -40,8 +40,8 @@ const I18N = {
     "reserveMode.always": "到点后持续点击",
     reserveClickBurstCount: "每轮预定点击次数",
     scavengeOnly: "捡漏专用",
-    scavengeLoopIntervalMin: "捡漏重跑间隔（分钟）(建议10分钟以上)",
-    scavengeRoundMaxMin: "单次循环时长上限（分钟，0=不限制，建议1-3分钟，过长请求过多可能短暂封号）",
+    scavengeLoopIntervalMin: "捡漏重跑间隔（分钟）",
+    scavengeRoundMaxMin: "单次循环时长上限（分钟，0=不限制，建议8）",
     "section.general": "通用配置",
     quantity: "票数",
     dateMonth: "日期-月 (可选)",
@@ -142,7 +142,7 @@ const I18N = {
     "reserveMode.always": "Keep clicking after start",
     reserveClickBurstCount: "Clicks per burst",
     scavengeOnly: "Scavenger Settings",
-    scavengeLoopIntervalMin: "Scavenge rerun interval (min, 10+ recommended)",
+    scavengeLoopIntervalMin: "Scavenge rerun interval (min)",
     scavengeRoundMaxMin: "Max single round (min, 0 = unlimited, 1-3 recommended)",
     "section.general": "General Settings",
     quantity: "Quantity",
@@ -713,7 +713,7 @@ function getFormConfig() {
     reserveClickStartMode,
     scavengeLoopEnabled: runMode === "scavenge",
     scavengeLoopIntervalSec:
-      normalizeScavengeLoopIntervalMin($("scavengeLoopIntervalMin").value || 10) * 60,
+      normalizeScavengeLoopIntervalMin($("scavengeLoopIntervalMin").value || 5) * 60,
     scavengeRoundMaxSec:
       normalizeScavengeRoundMaxMin($("scavengeRoundMaxMin").value || 8) * 60,
     quantity: Number($("quantity").value || 1),
@@ -721,7 +721,7 @@ function getFormConfig() {
     dateDay: $("dateDay").value.trim(),
     dateTime: $("dateTime").value.trim(),
     newAreaOrderMode:
-      $("newAreaOrderMode").value === "custom" || newCodes.length ? "custom" : "default",
+      $("newAreaOrderMode").value === "custom" ? "custom" : "default",
     newAreaCustomCodes: newCodes,
     legacyAreaOrderMode: $("legacyAreaOrderMode").value === "custom" ? "custom" : "default",
     legacyAreaCustomCodes: getLegacyAreaCodes(),
@@ -879,7 +879,7 @@ async function loadState() {
     setRunMode(config.scavengeLoopEnabled === true ? "scavenge" : "timed");
     $("scavengeLoopIntervalMin").value = String(
       normalizeScavengeLoopIntervalMin(
-        normalizeScavengeLoopIntervalSec(config.scavengeLoopIntervalSec ?? 600) / 60
+        normalizeScavengeLoopIntervalSec(config.scavengeLoopIntervalSec ?? 300) / 60
       )
     );
     $("scavengeRoundMaxMin").value = String(
