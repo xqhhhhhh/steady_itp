@@ -15,9 +15,9 @@ from pathlib import Path
 from typing import Any
 
 import ddddocr
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="Captcha OCR API", version="3.0.0")
@@ -29,6 +29,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 ocr = ddddocr.DdddOcr()
+_CONSOLE_SESSION_COOKIE = "ocr_console_session"
+_CONSOLE_SESSION_TTL_SEC = int(os.getenv("OCR_CONSOLE_SESSION_TTL_SEC", str(7 * 24 * 60 * 60)))
+_CONSOLE_SESSION_SECRET = (
+    os.getenv("OCR_CONSOLE_SESSION_SECRET", "").strip()
+    or os.getenv("OCR_CONSOLE_KEY", "").strip()
+    or os.getenv("OCR_ADMIN_TOKEN", "").strip()
+)
+_DEFAULT_TUTORIAL_URL = (
+    os.getenv("NOL_OCR_CONSOLE_TUTORIAL_URL", "").strip()
+    or os.getenv("OCR_CONSOLE_TUTORIAL_URL", "").strip()
+)
 
 
 class Base64Request(BaseModel):
@@ -79,6 +90,14 @@ class LicenseConsoleLookupRequest(BaseModel):
 
 class LicenseConsoleRevokeRequest(BaseModel):
     activation_code: str
+
+
+class ConsoleLoginRequest(BaseModel):
+    password: str
+
+
+class ConsoleSettingsRequest(BaseModel):
+    tutorial_url: str = ""
 
 
 _DIGIT_TO_LETTER_MAP: dict[str, str] = {
@@ -248,6 +267,14 @@ def _init_license_db() -> None:
     with _connect_db() as conn:
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS app_config (
+                config_key TEXT PRIMARY KEY,
+                config_value TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS activation_codes (
                 code_hash TEXT PRIMARY KEY,
                 code_last4 TEXT NOT NULL,
@@ -264,6 +291,14 @@ def _init_license_db() -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_activation_codes_status ON activation_codes(status)"
+        )
+        conn.execute(
+            """
+            INSERT INTO app_config (config_key, config_value)
+            VALUES (?, ?)
+            ON CONFLICT(config_key) DO NOTHING
+            """,
+            ("tutorial_url", _DEFAULT_TUTORIAL_URL),
         )
 
 
@@ -350,10 +385,57 @@ def _get_console_key() -> str:
     )
 
 
+def _issue_console_session() -> str:
+    payload = {
+        "v": 1,
+        "exp": int(time.time()) + max(300, _CONSOLE_SESSION_TTL_SEC),
+    }
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    body = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    signature = hmac.new(_CONSOLE_SESSION_SECRET.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{body}.{signature}"
+
+
+def _has_valid_console_session(request: Request) -> bool:
+    token = str(request.cookies.get(_CONSOLE_SESSION_COOKIE) or "").strip()
+    if not token or "." not in token or not _CONSOLE_SESSION_SECRET:
+        return False
+    body, signature = token.rsplit(".", 1)
+    expected = hmac.new(_CONSOLE_SESSION_SECRET.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return False
+    padded = body + "=" * (-len(body) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+    except Exception:
+        return False
+    return int(payload.get("exp", 0)) >= int(time.time())
+
+
+def _set_console_session_cookie(response: JSONResponse, request: Request) -> None:
+    secure = str(request.url.hostname or "").strip().lower() not in {"", "127.0.0.1", "localhost"}
+    response.set_cookie(
+        key=_CONSOLE_SESSION_COOKIE,
+        value=_issue_console_session(),
+        max_age=max(300, _CONSOLE_SESSION_TTL_SEC),
+        httponly=True,
+        samesite="strict",
+        secure=secure,
+        path="/",
+    )
+
+
+def _clear_console_session_cookie(response: JSONResponse) -> None:
+    response.delete_cookie(_CONSOLE_SESSION_COOKIE, path="/")
+
+
 def _require_console_auth(
+    request: Request,
     authorization: str | None = Header(default=None),
     x_console_key: str | None = Header(default=None),
 ) -> None:
+    if _has_valid_console_session(request):
+        return
     expected = _get_console_key()
     if not expected:
         raise HTTPException(status_code=503, detail="OCR_CONSOLE_KEY is not configured")
@@ -387,6 +469,28 @@ def _validate_license_session(payload: dict[str, Any]) -> bool:
     if expires_at <= _now_ms():
         return False
     return True
+
+
+def _normalize_tutorial_url(raw: str) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    if not value.lower().startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="invalid_tutorial_url")
+    return value
+
+
+def _get_config_value(conn: sqlite3.Connection, key: str, fallback: str = "") -> str:
+    row = conn.execute("SELECT config_value FROM app_config WHERE config_key = ?", (key,)).fetchone()
+    if row is None:
+        return fallback
+    return str(row["config_value"] or fallback).strip()
+
+
+def _get_console_settings(conn: sqlite3.Connection) -> dict[str, str]:
+    return {
+        "tutorial_url": _get_config_value(conn, "tutorial_url", _DEFAULT_TUTORIAL_URL),
+    }
 
 
 def _require_ocr_auth(
@@ -976,6 +1080,16 @@ def console_page() -> str:
       </section>
 
       <section class="card">
+        <h2>复制文案配置</h2>
+        <div class="row" style="grid-template-columns: 1fr auto;">
+          <input id="settingsTutorialUrl" type="url" placeholder="教程与资源链接，例如 https://my.feishu.cn/wiki/..." />
+          <button id="settingsSaveBtn" type="button">保存链接</button>
+        </div>
+        <div id="settingsStatus" class="status warn">未加载</div>
+        <div class="hint">列表里的“复制”按钮会复制固定文案，只有教程链接使用这里配置的值。</div>
+      </section>
+
+      <section class="card">
         <h2>激活码列表</h2>
         <div class="row" style="grid-template-columns: 130px 130px 1fr auto;">
           <select id="availStatusFilter">
@@ -1022,7 +1136,6 @@ def console_page() -> str:
     </div>
 
     <script>
-      const KEY_STORE = "ocr_console_key";
       const $ = (id) => document.getElementById(id);
       const AVAIL_PAGE_SIZE = 20;
       let availPage = 1;
@@ -1034,13 +1147,7 @@ def console_page() -> str:
         return new Date(n).toLocaleString();
       };
 
-      const key = () => String(sessionStorage.getItem(KEY_STORE) || "").trim();
-
-      const headers = () => {
-        const k = key();
-        if (!k) return {};
-        return { "X-Console-Key": k };
-      };
+      const headers = () => ({});
 
       function setAuthStatus(text, cls = "warn") {
         const el = $("authStatus");
@@ -1058,6 +1165,17 @@ def console_page() -> str:
         const el = $("availStatus");
         el.textContent = text;
         el.className = `status ${cls}`;
+      }
+
+      function setSettingsStatus(text, cls = "warn") {
+        const el = $("settingsStatus");
+        el.textContent = text;
+        el.className = `status ${cls}`;
+      }
+
+      function isAuthError(err) {
+        const text = String(err?.message || err || "").toLowerCase();
+        return text.includes("401") || text.includes("unauthorized") || text.includes("invalid");
       }
 
       async function fetchSummary() {
@@ -1107,6 +1225,48 @@ def console_page() -> str:
         });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         return resp.json();
+      }
+
+      async function fetchSettings() {
+        const resp = await fetch("./console/api/settings", { headers: headers() });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        return resp.json();
+      }
+
+      async function saveSettings(payload) {
+        const resp = await fetch("./console/api/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...headers() },
+          body: JSON.stringify(payload)
+        });
+        if (!resp.ok) {
+          const txt = await resp.text();
+          throw new Error(txt || `HTTP ${resp.status}`);
+        }
+        return resp.json();
+      }
+
+      function renderSettings(data) {
+        $("settingsTutorialUrl").value = String(data?.tutorial_url || "");
+      }
+
+      async function refreshSettings() {
+        try {
+          const data = await fetchSettings();
+          renderSettings(data);
+          setSettingsStatus("已加载复制文案配置", "ok");
+        } catch (err) {
+          setSettingsStatus(`加载配置失败: ${String(err.message || err)}`, "err");
+        }
+      }
+
+      function buildCopyMessage(code) {
+        const tutorialUrl = $("settingsTutorialUrl").value.trim();
+        if (!tutorialUrl) {
+          setAvailStatus("请先配置教程与资源链接", "warn");
+          return "";
+        }
+        return `激活码：${code}\n\n激活码绑定单一设备\n\n教程与资源链接：\n\n${tutorialUrl}`;
       }
 
       async function refreshSummary() {
@@ -1212,7 +1372,9 @@ def console_page() -> str:
               const action = btn.getAttribute("data-action") || "copy";
               if (!code) return;
               if (action === "copy") {
-                const ok = await copyText(code);
+                const text = buildCopyMessage(code);
+                if (!text) return;
+                const ok = await copyText(text);
                 setAvailStatus(ok ? "已复制激活码" : "复制失败，请手动复制", ok ? "ok" : "err");
                 return;
               }
@@ -1240,18 +1402,35 @@ def console_page() -> str:
           setAuthStatus("请输入登录密钥", "warn");
           return;
         }
-        sessionStorage.setItem(KEY_STORE, v);
         try {
-          await Promise.all([refreshSummary(), refreshAvailableCodes(true)]);
+          const resp = await fetch("./console/api/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ password: v })
+          });
+          if (!resp.ok) {
+            const txt = await resp.text();
+            throw new Error(txt || `HTTP ${resp.status}`);
+          }
+          await Promise.all([refreshSummary(), refreshAvailableCodes(true), refreshSettings()]);
+          $("consoleKey").value = "";
           setAuthStatus("已登录", "ok");
         } catch (err) {
-          sessionStorage.removeItem(KEY_STORE);
           setAuthStatus(`登录失败: ${String(err.message || err)}`, "err");
         }
       }
 
-      function doLogout() {
-        sessionStorage.removeItem(KEY_STORE);
+      async function doLogout() {
+        try {
+          const resp = await fetch("./console/api/logout", { method: "POST" });
+          if (!resp.ok) {
+            const txt = await resp.text();
+            throw new Error(txt || `HTTP ${resp.status}`);
+          }
+        } catch (err) {
+          setAuthStatus(`退出失败: ${String(err.message || err)}`, "err");
+          return;
+        }
         setAuthStatus("已退出", "warn");
         $("availBody").innerHTML = "";
         setAvailStatus("未查询", "warn");
@@ -1310,6 +1489,16 @@ def console_page() -> str:
         await refreshAvailableCodes(true);
       }
 
+      async function doSaveSettings() {
+        try {
+          const data = await saveSettings({ tutorial_url: $("settingsTutorialUrl").value.trim() });
+          renderSettings(data);
+          setSettingsStatus("复制文案配置已保存", "ok");
+        } catch (err) {
+          setSettingsStatus(`保存配置失败: ${String(err.message || err)}`, "err");
+        }
+      }
+
       $("loginBtn").addEventListener("click", doLogin);
       $("logoutBtn").addEventListener("click", doLogout);
       $("lookupBtn").addEventListener("click", doLookup);
@@ -1337,19 +1526,65 @@ def console_page() -> str:
         availPage += 1;
         refreshAvailableCodes(false);
       });
+      $("settingsSaveBtn").addEventListener("click", doSaveSettings);
 
-      if (key()) {
-        Promise.all([refreshSummary(), refreshAvailableCodes(true)])
-          .then(() => setAuthStatus("已登录", "ok"))
-          .catch((err) => {
-            sessionStorage.removeItem(KEY_STORE);
-            setAuthStatus(`登录失效: ${String(err.message || err)}`, "err");
-          });
-      }
+      Promise.all([refreshSummary(), refreshAvailableCodes(true), refreshSettings()])
+        .then(() => setAuthStatus("已登录", "ok"))
+        .catch((err) => {
+          if (isAuthError(err)) {
+            setAuthStatus("未登录", "warn");
+            return;
+          }
+          setAuthStatus(`登录状态检查失败: ${String(err.message || err)}`, "err");
+        });
     </script>
   </body>
 </html>
 """
+
+
+@app.post("/console/api/login")
+def console_login(payload: ConsoleLoginRequest, request: Request) -> JSONResponse:
+    supplied = str(payload.password or "").strip()
+    expected = _get_console_key()
+    if not expected:
+        raise HTTPException(status_code=503, detail="OCR_CONSOLE_KEY is not configured")
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    response = JSONResponse({"ok": True, "message": "console_logged_in", "expires_in_sec": max(300, _CONSOLE_SESSION_TTL_SEC)})
+    _set_console_session_cookie(response, request)
+    return response
+
+
+@app.post("/console/api/logout")
+def console_logout() -> JSONResponse:
+    response = JSONResponse({"ok": True, "message": "console_logged_out"})
+    _clear_console_session_cookie(response)
+    return response
+
+
+@app.get("/console/api/settings")
+def console_get_settings(_auth: None = Depends(_require_console_auth)) -> dict[str, Any]:
+    with _connect_db() as conn:
+        return _get_console_settings(conn)
+
+
+@app.post("/console/api/settings")
+def console_save_settings(
+    payload: ConsoleSettingsRequest,
+    _auth: None = Depends(_require_console_auth),
+) -> dict[str, Any]:
+    tutorial_url = _normalize_tutorial_url(payload.tutorial_url)
+    with _connect_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO app_config (config_key, config_value)
+            VALUES (?, ?)
+            ON CONFLICT(config_key) DO UPDATE SET config_value = excluded.config_value
+            """,
+            ("tutorial_url", tutorial_url),
+        )
+        return {"ok": True, **_get_console_settings(conn)}
 
 
 @app.get("/console/api/summary")
